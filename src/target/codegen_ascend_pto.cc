@@ -1485,7 +1485,13 @@ void CodeGenTileLangAscendPto::CopyL1ToL0Codegen(const CallNode *call,
   std::string op_name = Downcast<StringImm>(call->args[0])->value;
   bool transpose = (op_name.find(", true>") != std::string::npos);
 
-  int32_t tile_col = src_shape_info.col;
+  // For a sliced L1 source, tile_col must be the CURRENT SLICE's column width
+  // (== dst L0 tile width), not the full buffer's physical column count.
+  // Otherwise tile_size is over-sized, outer_tile_idx under-counts, and the
+  // generated L1 base address fails to advance across chunks (e.g. the second
+  // chunk of T.copy(v_l1[0, dd*cube_k], v_l0) produced an OOB TEXTRACT offset).
+  int32_t tile_col = src_shape_info.is_slice ? dst_shape_info.slice_col
+                                             : src_shape_info.col;
   // For sliced L1 buffers (e.g. a 3D buffer sliced into chunks), use the
   // valid row count of the current slice instead of the physical row count
   // declared by the buffer. Otherwise FindBestTileRowB may return a tile_row
