@@ -987,13 +987,18 @@ def binary_op(
     if isinstance(src1, BufferLoad):
         buffer_1 = src1.buffer
         indices_1 = src1.indices
+        # 多维标量访问必须展开为线性偏移：直接取 indices_1[0] 会丢掉后续维度
+        # （如 n[i, j] 被错误降为 GetValue(i)，正确为 GetValue(i*N+j)）。
+        scalar_offset = indices_1[0]
+        for _k in range(1, len(indices_1)):
+            scalar_offset = scalar_offset * buffer_1.shape[_k] + indices_1[_k]
         return T.call_intrin(
             "handle",
             tir.op.Op.get(f"tl.ascend_{op}s"),
             dst_ptr,
             src0_ptr,
             buffer_1.access_ptr("r"),
-            indices_1[0],
+            scalar_offset,
             size_0,
         )
 
