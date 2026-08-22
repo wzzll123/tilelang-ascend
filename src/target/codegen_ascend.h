@@ -204,6 +204,8 @@ private:
 
   void SigmoidCodegen(const CallNode *op, const std::string &op_name);
 
+  void SiluCodegen(const CallNode *op);
+
   void ClampMaxMinCodegen(const CallNode *op);
 
   void ClampCodegen(const CallNode *op);
