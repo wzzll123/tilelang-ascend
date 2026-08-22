@@ -937,6 +937,25 @@ void CodeGenTileLangAscend::VisitExpr_(const FloatImmNode *op,
   PrintConst(op, os, this);
 }
 
+void CodeGenTileLangAscend::VisitExpr_(const CastNode *op,
+                                       std::ostream &os) { // NOLINT(*)
+  // bisheng dav-2201 后端不支持 bf16 标量 cast 指令
+  // （"fatal error: error in backend: not support bf16 type cast"）。
+  // bf16 -> fp32 标量转换走 AscendC::ToFloat（catlass 反量化 epilogue 同款，
+  // 见 catlass/epilogue/block/block_epilogue_dequant.hpp）。典型来源：
+  // T.float32(gm_bf16_scalar) 的 GM 标量读（GDN 门控等标量链惯用法）。
+  DataType from = op->value.dtype();
+  DataType to = op->dtype;
+  if (from.is_bfloat16() && to.is_float() && to.bits() == 32 &&
+      from.lanes() == 1 && to.lanes() == 1) {
+    os << "AscendC::ToFloat(";
+    PrintExpr(op->value, os);
+    os << ")";
+    return;
+  }
+  CodeGenC::VisitExpr_(op, os);
+}
+
 void CodeGenTileLangAscend::VisitExpr_(const MulNode *op,
                                        std::ostream &os) { // NOLINT(*)
   // Detect pattern: inf * (-1) -> -inf
