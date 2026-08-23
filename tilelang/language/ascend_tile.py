@@ -3198,6 +3198,18 @@ def im2col(
           （fp16/bf16: 4/8/16/N*16+4/N*16+8；fp32: 4/N*8/N*8+4）
         - pos_k/valid_k 一般需 C0 对齐；pos_m/valid_m 一般需 16 对齐
           （恰好覆盖最右/最下分形时可放宽）
+        - **pos_m/pos_k 必须传 0**（A2 实测：非零 kStartPt/mStartPt 触发
+          "K_M_START_POS is illegal" aicore 异常 507015，即使 16 对齐）。
+          多 cin1 块（cin > C0）的惯用法 = catlass 同款：逐块 GM->L1->im2col
+          -> mma 累加（init 仅首块置位），dst/src 靠 buffer 指针偏移而非
+          kStartPt。参见 test_tilelang_ascend_language_im2col_conv2d.py。
+        - L0A 容量：dst tile M_ROUND*K*elem 须 < 64KB（如 kh=kw=5, cin=16
+          时 K=400，M_ROUND 上限 96 即 76.8KB 已溢出——大 kernel 需切 M）。
+
+    host 侧 NC1HWC0 转换陷阱：C1>1 时必须 x.view(N,C1,C0,H,W).permute
+    (0,1,3,4,2)，直接 NHWC.view(C1*H*W,C0) 得到 [H,W,C1,C0] 交错序（错）；
+    C1=1 时两种等价，bug 只在多 cin1 块暴露。filter 同理须按 cin1 块分块
+    堆叠 [c1,kh,kw,c0,co]，不可一次性 permute(2,3,1,0)（ci 跨块交错）。
 
     Returns:
         tvm.tir.Call: im2col 指令的 intrinsic call。

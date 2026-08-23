@@ -1589,6 +1589,9 @@ CATLASS_DEVICE void gemmL1(LocalTensor<T1> A, LocalTensor<T1> B,
 // （fp16/bf16: 4/8/16/N*16+4/N*16+8；fp32: 4/N*8/N*8+4）；posK/validK 一般需
 // C0 对齐，posM/validM 一般 16 对齐（覆盖最右/最下分形时可放宽，详见
 // LoadData3DParamsV2 文档）。padding 顺序 [left, right, top, bottom]。
+// 注意（A2 实测）：posM/posK 必须传 0，非零 kStartPt/mStartPt 触发
+// "K_M_START_POS is illegal"（507015）；多 cin1 块用指针偏移 + 多次 mma
+// 累加（catlass 同样恒 0）。
 template <typename T>
 CATLASS_DEVICE void im2col(LocalTensor<T> const &dst, LocalTensor<T> const &src,
                            uint32_t hi, uint32_t wi, uint32_t kh, uint32_t kw,
