@@ -1940,6 +1940,11 @@ Sum_experiment(const LocalTensor<T> &dst, const LocalTensor<T> &src,
 template <typename T, uint32_t H, uint32_t W>
 CATLASS_DEVICE void transpose_block(LocalTensor<T> const &dst,
                                     LocalTensor<T> const &src) {
+  // TransDataTo5HD 为位模式搬运（与数值格式无关）；CANN 未实例化
+  // TransDataTo5HDImpl<bfloat16_t>，bf16 按 uint16_t 位宽发射（官方
+  // transpose_v2 同款 bitwise 技巧：bf16 走 half 实例化）。
+  using MovT =
+      std::conditional_t<std::is_same_v<T, bfloat16_t>, uint16_t, T>;
   constexpr uint32_t blockSize = 32 / sizeof(T);
   constexpr uint32_t highBlock = H / 16;
   constexpr uint32_t repeat = W / blockSize;
@@ -1951,25 +1956,26 @@ CATLASS_DEVICE void transpose_block(LocalTensor<T> const &dst,
   params.dstRepStride = repeat > 1 ? H : 0;
   params.srcRepStride = repeat > 1 ? 1 : 0;
 
-  __ubuf__ T *dstList[16];
-  __ubuf__ T *srcList[16];
+  __ubuf__ MovT *dstList[16];
+  __ubuf__ MovT *srcList[16];
 
   for (uint32_t i = 0; i < highBlock; i++) {
     if constexpr (sizeof(T) == 2) {
       for (int32_t m = 0; m < 16; m++)
-        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * m].GetPhyAddr();
+        dstList[m] = (__ubuf__ MovT *)dst[i * 16 + H * m].GetPhyAddr();
       for (int32_t n = 0; n < 16; n++)
-        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
-      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
+        srcList[n] = (__ubuf__ MovT *)src[i * W * 16 + W * n].GetPhyAddr();
+      AscendC::TransDataTo5HDImpl<MovT>(dstList, srcList, params);
     } else if constexpr (sizeof(T) == 4) {
       for (int32_t m = 0; m < 16; m = m + 2) {
-        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * (m / 2)].GetPhyAddr();
+        dstList[m] = (__ubuf__ MovT *)dst[i * 16 + H * (m / 2)].GetPhyAddr();
         dstList[m + 1] =
-            (__ubuf__ T *)dst[i * 16 + H * (m / 2) + blockSize].GetPhyAddr();
+            (__ubuf__ MovT *)dst[i * 16 + H * (m / 2) + blockSize]
+                .GetPhyAddr();
       }
       for (int32_t n = 0; n < 16; n++)
-        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
-      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
+        srcList[n] = (__ubuf__ MovT *)src[i * W * 16 + W * n].GetPhyAddr();
+      AscendC::TransDataTo5HDImpl<MovT>(dstList, srcList, params);
     }
   }
   AscendC::PipeBarrier<PIPE_V>();
@@ -1984,9 +1990,10 @@ CATLASS_DEVICE void transpose(LocalTensor<T> const &dst,
     return;
   }
 
+  // AscendC::Transpose 不收 bfloat16_t（CANN 高层 API dtype 覆盖），
+  // 16x16 快路径保持排除；transpose_block 内部已按位宽处理 bf16。
   if constexpr (FullM % 16 == 0 && FullN % 16 == 0 &&
-                (sizeof(T) == 2 || sizeof(T) == 4) &&
-                !std::is_same_v<T, bfloat16_t>) {
+                (sizeof(T) == 2 || sizeof(T) == 4)) {
     transpose_block<T, FullM, FullN>(dst, src);
   } else {
     for (uint32_t i = 0; i < FullM; i++)
