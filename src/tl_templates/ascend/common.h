@@ -71,6 +71,21 @@ copy_gm_to_l1(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
         {1, static_cast<uint16_t>(dstM * dstN * sizeof(T) / 32), 0, 0});
     AscendC::PipeBarrier<PIPE_MTE2>();
   }
+  // 快路径：双侧全内维（realSrcN == dstN，GM 行连续）且 2 字节类型
+  // C0=16（zN 分形与线性布局逐字节等价）时——单块 DataCopy 整块传输，
+  // 替代 tla 逐 32B 行传输（NC1HWC0 行带类拷贝的实测病灶：32B 行
+  // ~54GB/s vs 合并 ~200GB/s+）。对齐 catlass conv 的 CopyGmToL1 整图
+  // 像行传输语义（catlass/conv/tile/atlasa2/copy_gm_to_l1.hpp 的
+  // DataCopy{hi, wi*C0*size/32, srcStride, 0}）。fp32 的 C0=8 分形与
+  // 线性不等价（case5 精度实录），不在此路径。
+  if (realSrcN == dstN && dstN * sizeof(T) == 32 && sizeof(T) == 2) {
+    AscendC::DataCopy(dstTensor, srcTensor,
+                      AscendC::DataCopyParams(
+                          static_cast<uint16_t>(1),
+                          static_cast<uint16_t>(tailM * dstN * sizeof(T) / 32),
+                          0, 0));
+    return;
+  }
   auto layout = MakeLayoutFromTag(LayoutGM{tailM, realSrcN});
   auto src_LAYOUT = GetTileLayout(layout, tla::MakeShape(tailM, tailN),
                                   tla::MakeShape(uint32_t(0), uint32_t(0)));
