@@ -33,6 +33,8 @@
 #include "./common/collector.h"
 
 #define ASCEND_SHARED_MEM_SIZE 196352
+// BT (bias table) capacity on A2/A3 (catlass Arch::AtlasA2::BIAS_SIZE)
+#define ASCEND_BT_MEM_SIZE 1024
 #define ASCEND_SHARED_DYN_MEM_SIZE 524032
 #define ASCEND_WMMA_MATRIX_A_MEM_SIZE 65536
 #define ASCEND_WMMA_MATRIX_B_MEM_SIZE 65536
@@ -115,7 +117,8 @@ private:
                         {"wmma.matrix_a", ASCEND_WMMA_MATRIX_A_MEM_SIZE},
                         {"wmma.matrix_b", ASCEND_WMMA_MATRIX_B_MEM_SIZE},
                         {"wmma.accumulator", ASCEND_WMMA_ACCUMULATOR_MEM_SIZE},
-                        {"shared.ub", ASCEND_SHARED_MEM_SIZE}};
+                        {"shared.ub", ASCEND_SHARED_MEM_SIZE},
+                        {"shared.bt", ASCEND_BT_MEM_SIZE}};
 
       SetPreAllocBuffer(external_address_map);
       SetTmpBuffers(external_shape_map);
@@ -926,7 +929,9 @@ private:
         const auto &shape = (*shape_it).second;
         const IntImmNode *row = shape[0].as<IntImmNode>();
         const IntImmNode *col = shape[1].as<IntImmNode>();
-        ICHECK(row && col) << "PTO physical buffer shape must be constant";
+        ICHECK(row && col) << "PTO physical buffer shape must be constant, buffer="
+                           << alloc->buffer_var->name_hint
+                           << " shape=" << shape;
         size_elements = row->value * col->value;
       } else {
         for (const auto &extent : alloc->extents) {

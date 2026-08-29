@@ -171,6 +171,57 @@ CATLASS_DEVICE void mma(LocalTensor<T1> const A, LocalTensor<T1> const B,
   // }
 }
 
+// 线性(非分形)GM->L1 拷贝: 供显式 RowMajor 注释的 L1 buffer(bias 等)
+// 使用。逐行 DataCopy,行内连续;行宽须 32B 对齐(与 DataCopy 约束一致)。
+template <typename T, uint32_t dstM, uint32_t dstN>
+CATLASS_DEVICE void
+copy_gm_to_l1_linear(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
+                     uint32_t realSrcN = 1, uint32_t realTailM = 0,
+                     uint32_t realTailN = 0, bool need_clear = true) {
+  uint32_t tailM = realTailM == 0 ? dstM : realTailM;
+  uint32_t tailN = realTailN == 0 ? dstN : realTailN;
+  AscendC::DataCopyParams params;
+  params.blockCount = static_cast<uint16_t>(tailM);
+  params.blockLen = static_cast<uint16_t>(tailN * sizeof(T) / 32);
+  params.srcStride =
+      static_cast<uint16_t>((realSrcN - tailN) * sizeof(T) / 32);
+  params.dstStride = 0;
+  AscendC::DataCopy(dstTensor, srcTensor, params);
+}
+
+// BT bias variant: the 4-operand Mmad initialises L0C from the bias table
+// (BT/C2) instead of zero, broadcasting bias along M -- this is the official
+// conv bias path (Catlass TileMmad bias overload, ops-nn conv2d_v2 BT flow).
+// cmatrixInitVal is always false: the hardware sources the C init from BT.
+template <typename T1, typename T2, uint32_t M, uint32_t N>
+CATLASS_DEVICE void mma_bias(LocalTensor<T1> const A, LocalTensor<T1> const B,
+                             LocalTensor<T2> const C,
+                             LocalTensor<T2> const BiasBT, bool init, uint32_t K,
+                             uint32_t n_actual = N, uint8_t unitFlag = 0) {
+  MmadParams mmadParams;
+  mmadParams.m = M;
+  mmadParams.n = n_actual;
+  mmadParams.k = K;
+  mmadParams.cmatrixInitVal = false;
+  mmadParams.cmatrixSource = false;
+  mmadParams.unitFlag = unitFlag;
+  Mmad(C, A, B, BiasBT, mmadParams);
+}
+
+// bias L1 -> BT(bias table): 单块 DataCopy(64B 块粒度,对齐 catlass
+// CopyL1ToBT: blockLen = ceil(N * sizeof(T) / 64))。
+template <typename T1, typename T2>
+CATLASS_DEVICE void copy_l1_to_bt(LocalTensor<T1> const dstTensor,
+                                  LocalTensor<T2> const srcTensor,
+                                  uint32_t len) {
+  AscendC::DataCopyParams params;
+  params.blockCount = 1;
+  params.blockLen = (len * sizeof(T2) + 63) / 64;  // 块长按源元素计(catlass CopyL1ToBT)
+  params.srcStride = 0;
+  params.dstStride = 0;
+  AscendC::DataCopy(dstTensor, srcTensor, params);
+}
+
 template <typename T1, typename T2, typename LayoutGM, uint32_t srcM,
           uint32_t srcN, bool enRelu = false>
 CATLASS_DEVICE void

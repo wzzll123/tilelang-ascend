@@ -112,7 +112,7 @@ def view(src: Buffer, shape: list[PrimExpr] | None = None, dtype: str | None = N
     return T.Buffer(shape, dtype, src.data)
 
 
-def npu_gemm(A, B, C, init=False, n_actual=None, unit_flag=None, k_actual=None):
+def npu_gemm(A, B, C, init=False, n_actual=None, unit_flag=None, k_actual=None, bias=None):
     """NPU GEMM intrinsic. A, B, C can be 2D or higher-order (leading dims must be 1).
 
     n_actual / unit_flag (both default ``None``): optional trailing args mapping to
@@ -219,7 +219,14 @@ def npu_gemm(A, B, C, init=False, n_actual=None, unit_flag=None, k_actual=None):
     # params are unaffected.
     K_runtime = K if k_actual is None else k_actual
 
-    mma_args = [f"mma<{_dtype(A)}, {_dtype(C)}, {M}, {N}>", Aptr, Bptr, Cptr, init, K_runtime]
+    if bias is not None:
+        # BT bias: 4-operand Mmad,L0C 从 bias table 初始化(cmatrixInitVal=false
+        # 在 C++ 模板内固定)。bias 必须是 shared.bt scope 的 buffer。
+        BiasPtr = retrieve_ptr(bias, "r")
+        mma_args = [f"mma_bias<{_dtype(A)}, {_dtype(C)}, {M}, {N}>",
+                    Aptr, Bptr, Cptr, BiasPtr, init, K_runtime]
+    else:
+        mma_args = [f"mma<{_dtype(A)}, {_dtype(C)}, {M}, {N}>", Aptr, Bptr, Cptr, init, K_runtime]
     # Trailing args are positional, so n_actual must be materialised (as its no-op
     # default N) whenever unit_flag is set.
     if n_actual is not None or unit_flag is not None:

@@ -134,6 +134,7 @@ Here is the correspondence between TIR scopes and Ascend memory scopes:
 - wmma.matrix_a -> L0A
 - wmma.matrix_b -> L0B
 - wmma.accumulator -> L0C
+- shared.bt -> BT (bias table, C2)
 """
 
 
@@ -155,3 +156,7 @@ def alloc_L0C(shape, dtype):
 
 def alloc_ub(shape, dtype):
     return T.alloc_buffer(shape, dtype, scope="shared.ub")
+
+
+def alloc_BT(shape, dtype):
+    return T.alloc_buffer(shape, dtype, scope="shared.bt")

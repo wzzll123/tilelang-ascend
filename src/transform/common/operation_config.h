@@ -45,10 +45,12 @@ inline const std::unordered_map<std::string, OperationConfig> &
 GetOperationConfig() {
   static std::unordered_map<std::string, OperationConfig> operation_config_ = {
       {"copy_gm_to_l1", {{{0, "read"}, {1, "write"}}, "PIPE_MTE2"}},
+      {"copy_gm_to_l1_linear", {{{0, "read"}, {1, "write"}}, "PIPE_MTE2"}},
       {"copy_gm_to_l0a", {{{0, "read"}, {1, "write"}}, "PIPE_MTE2"}},
       {"copy_gm_to_l0b", {{{0, "read"}, {1, "write"}}, "PIPE_MTE2"}},
       {"copy_gm_to_ub", {{{0, "read"}, {1, "write"}}, "PIPE_MTE2"}},
       {"copy_l1_to_l0a", {{{0, "read"}, {1, "write"}}, "PIPE_MTE1"}},
+      {"copy_l1_to_bt", {{{0, "read"}, {1, "write"}}, "PIPE_MTE1"}},
       {"copy_l1_to_l0b", {{{0, "read"}, {1, "write"}}, "PIPE_MTE1"}},
       {"im2col", {{{0, "read"}, {1, "write"}}, "PIPE_MTE1"}},
       {"copy_ub_to_gm", {{{0, "read"}, {1, "write"}}, "PIPE_MTE3"}},
@@ -66,6 +68,8 @@ GetOperationConfig() {
       {"copy_pipe_to_ub", {{{0, "write"}, {1, "write"}}, "PIPE_MTE2"}},
       {"copy_pipe_to_ub_V", {{{0, "write"}, {1, "write"}}, "PIPE_V"}},
       {"mma", {{{0, "read"}, {1, "read"}, {2, "write"}}, "PIPE_M"}},
+      {"mma_bias",
+       {{{0, "read"}, {1, "read"}, {2, "write"}, {3, "read"}}, "PIPE_M"}},
       {"gemm_v0", {{{0, "read"}, {1, "read"}, {2, "write"}}, "PIPE_M"}},
       {"gemm_v1", {{{0, "read"}, {1, "read"}, {2, "write"}}, "PIPE_M"}},
       {"AscendC::Add", {{{0, "write"}, {1, "read"}, {2, "read"}}, "PIPE_V"}},

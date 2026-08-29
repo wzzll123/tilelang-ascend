@@ -846,6 +846,8 @@ void CodeGenTileLangAscend::VisitStmt_(const AllocateNode *op) {
     print_buffer("ascend_l0c");
   } else if (scope == "shared.l1") {
     print_buffer("ascend_l1");
+  } else if (scope == "shared.bt") {
+    print_buffer("ascend_bt");
   } else if (scope == "shared.ub") {
     print_buffer("ascend_ub");
   } else if (scope == "shared") {
@@ -1055,6 +1057,10 @@ void CodeGenTileLangAscend::PreFunctionBody(const PrimFunc &f) {
   stream << "AscendC::TBuf<AscendC::TPosition::VECCALC> ascend_ub; "
             "pipe.InitBuffer(ascend_ub, "
          << ub_size << ");\n";
+  // BT (bias table, C2): 1KB on A2/A3 (catlass AtlasA2::BIAS_SIZE)
+  this->PrintIndent();
+  stream << "AscendC::TBuf<AscendC::TPosition::C2> ascend_bt; "
+            "pipe.InitBuffer(ascend_bt, 1024);\n";
 
   this->PrintIndent();
   stream << "pipe.Destroy();\n";
@@ -2859,13 +2865,34 @@ void CodeGenTileLangAscend::MmaCodegen(const CallNode *op) {
   auto b_name = var_idmap_[b_var];
   auto c_name = var_idmap_[c_var];
 
+  // args[4] may be a BT bias access_ptr (4-operand Mmad with L0C initialized
+  // from the bias table, mirroring Catlass TileMmad's bias overload). The
+  // legacy form has init (a bool expr, never an access_ptr Call) in that
+  // slot, so the two are told apart structurally.
+  size_t value_arg_begin = 4;
+  std::string bias_name, bias_offset;
+  bool has_bias = false;
+  if (auto bias_call = op->args[4].as<CallNode>()) {
+    if (bias_call->args.size() >= 3 &&
+        bias_call->args[1].as<VarNode>() != nullptr) {
+      has_bias = true;
+      bias_name = var_idmap_[bias_call->args[1].as<VarNode>()];
+      bias_offset = PrintExpr(bias_call->args[2]);
+      value_arg_begin = 5;
+    }
+  }
+
   this->PrintIndent();
   this->stream << op_name << "(" << a_name << "[" << a_offset << "]," << b_name
-               << "[" << b_offset << "]," << c_name << "[" << c_offset << "], "
-               << PrintExpr(op->args[4]) << ", " << PrintExpr(op->args[5]);
+               << "[" << b_offset << "]," << c_name << "[" << c_offset << "], ";
+  if (has_bias) {
+    this->stream << bias_name << "[" << bias_offset << "], ";
+  }
+  this->stream << PrintExpr(op->args[value_arg_begin]) << ", "
+               << PrintExpr(op->args[value_arg_begin + 1]);
   // Optional trailing args (n_actual, unitFlag). Absent for the legacy 6-arg
   // form, where the template supplies n_actual = N and unitFlag = 0.
-  for (size_t i = 6; i < op->args.size(); ++i) {
+  for (size_t i = value_arg_begin + 2; i < op->args.size(); ++i) {
     this->stream << ", " << PrintExpr(op->args[i]);
   }
   this->stream << ");\n";
@@ -2892,6 +2919,7 @@ void CodeGenTileLangAscend::CopyCodegen(const CallNode *op) {
 
   static const std::unordered_map<std::string, int> kCopyOpExtraArgs = {
       {"copy_l0c_to_gm", 3},      {"copy_gm_to_l1", 3},
+      {"copy_l1_to_bt", 1},       {"copy_gm_to_l1_linear", 3},
       {"copy_l1_to_l0a", 2},      {"copy_l1_to_l0b", 2},
       {"copy_gm_to_ub", 4},       {"copy_ub_to_gm", 3},
       {"atomic_add_ub_to_gm", 3}, {"atomic_add_l0c_to_gm", 3},

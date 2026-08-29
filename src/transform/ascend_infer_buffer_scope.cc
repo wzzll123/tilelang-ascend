@@ -772,6 +772,26 @@ private:
           Downcast<Map<Var, tl::Layout>>(annotations.Get(tl::attr::kLayoutMap));
     }
 
+    // Var 重建(shared.l1 强制替换 handle)会让用户显式 layout 注解的 key
+    // 变成旧 Var 而失效——把注解 rekey 到新 Var,保住用户布局(如 bias 的
+    // RowMajor);否则默认 zN 会重新注入并覆盖用户意图。
+    if (!var_replacements_.empty()) {
+      Map<Var, tl::Layout> rekeyed;
+      bool rekeyed_any = false;
+      for (const auto &kv : layout_map) {
+        auto it = var_replacements_.find(kv.first.get());
+        if (it != var_replacements_.end()) {
+          rekeyed.Set(it->second, kv.second);
+          rekeyed_any = true;
+        } else {
+          rekeyed.Set(kv.first, kv.second);
+        }
+      }
+      if (rekeyed_any) {
+        layout_map = rekeyed;
+      }
+    }
+
     bool layout_map_changed = false;
 
     for (const Buffer &buf : alloc_buffers) {

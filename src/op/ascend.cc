@@ -209,8 +209,31 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   PrimExpr strideN;
 
   if (src.scope() == "global" && dst.scope() == "shared.l1") {
-    ss << "copy_gm_to_l1";
+    // 显式 RowMajor 注释的 L1 buffer(如 bias)走线性拷贝——默认 zN 分形
+    // 会把 [1,N] 按 16 列块错位,后续线性消费方(copy_l1_to_bt)会读错。
+    if (T.layout_map.count(dst) &&
+        T.layout_map[dst]->AscendLayoutStr() == "layout::RowMajor") {
+      ss << "copy_gm_to_l1_linear";
+    } else {
+      ss << "copy_gm_to_l1";
+    }
     config.gm2l1 = true;
+  } else if (src.scope() == "shared.l1" && dst.scope() == "shared.bt") {
+    // bias L1 -> BT(bias table): 单块 DataCopy,长度=目的元素数。
+    // 独立成 new_args 形式,与函数末尾的统一发射约定一致。
+    PrimExpr bt_len = 1;
+    for (const auto &ext : dst->shape) {
+      bt_len *= ext;
+    }
+    auto bt_src_ptr = src.access_ptr(1, src->dtype, 1,
+                                     IntImm(DataType::Int(32), 0), bt_len);
+    auto bt_dst_ptr = dst.access_ptr(2, dst->dtype, 1,
+                                     IntImm(DataType::Int(32), 0), bt_len);
+    return Evaluate(
+        Call(DataType::Handle(), builtin::call_extern(),
+             {StringImm("tl::ascend::copy_l1_to_bt<" + get_dtype(dst) + ", " +
+                        get_dtype(src) + ">"),
+              bt_src_ptr, bt_dst_ptr, bt_len}));
   } else if (src.scope() == "shared.l1" && dst.scope() == "wmma.matrix_a") {
     ss << "copy_l1_to_l0a";
     // config.print_src_layout = true;

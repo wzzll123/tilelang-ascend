@@ -46,6 +46,7 @@ from .allocate import (
     alloc_var,  # noqa: F401
     alloc_L0A,  # noqa: F401
     alloc_L0B,  # noqa: F401
+    alloc_BT,  # noqa: F401
     alloc_L0C,  # noqa: F401
     alloc_L1,  # noqa: F401
     alloc_ub,  # noqa: F401
