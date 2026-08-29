@@ -348,22 +348,79 @@ private:
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) override {
-    std::vector<Stmt> stmts;
-    InsertSynchronization("PipeBarrier_ALL", stmts);
+    // 流敏感化(原为前后各插一次 PIPE_ALL + 清空历史——T.Pipelined 展开
+    // 产生的 stage 守卫 if 会被各插 2 个全停屏障,是 conv strip 循环
+    // Pipelined 负收益的机制根因):
+    // 1. 不插屏障进分支,分支内照常依赖分析插桩;
+    // 2. touched 集合(UpdateLatestAccessHistory 处记录)区分"分支内真
+    //    访问过"与"沿用旧 entry"——entry 值相等不等于没动过(其
+    //    pipe_barriers/sync_graph 同步状态可能是旧的,直接用会丢同步);
+    // 3. 两分支历史按 buffer 合并(touched 方覆盖);仅当 then/else 对
+    //    同一 buffer 的收尾访问真歧义(读写方向/pipeline/地址不同)才在
+    //    if 后补一次 PIPE_ALL。
+    auto SameAccess = [](const BufferAccess &a, const BufferAccess &b) {
+      return a.is_write == b.is_write && a.pipeline == b.pipeline &&
+             a.physical_address == b.physical_address;
+    };
 
-    current_access_history_.clear();
+    auto history_before = current_access_history_;
+    auto saved_touched = std::move(branch_touched_);
+    branch_touched_.clear();
+
     Stmt then_case = VisitStmt(op->then_case);
+    auto then_hist = current_access_history_;
+    auto touched_then = branch_touched_;
 
     Optional<Stmt> else_case;
-    if (op->else_case.defined()) {
-      current_access_history_.clear();
+    bool has_else = op->else_case.defined();
+    std::unordered_set<std::string> touched_else;
+    if (has_else) {
+      current_access_history_ = history_before;
+      branch_touched_.clear();
       else_case = VisitStmt(op->else_case.value());
+      touched_else = branch_touched_;
     }
+    auto else_hist = current_access_history_;
+    // 嵌套的 touched 向上并集(本 if 的访问也算外层分支的访问)
+    branch_touched_ = std::move(saved_touched);
+    branch_touched_.insert(touched_then.begin(), touched_then.end());
+    branch_touched_.insert(touched_else.begin(), touched_else.end());
 
+    auto merged = history_before;
+    bool conflict = false;
+    std::unordered_set<std::string> keys;
+    keys.insert(touched_then.begin(), touched_then.end());
+    keys.insert(touched_else.begin(), touched_else.end());
+    for (const auto &buf : keys) {
+      bool t = touched_then.count(buf) > 0;
+      bool e = touched_else.count(buf) > 0;
+      if (t && e) {
+        const auto &ta = then_hist.at(buf);
+        const auto &ea = else_hist.at(buf);
+        if (SameAccess(ta, ea)) {
+          merged[buf] = ta;
+        } else {
+          merged[buf] = ta;
+          conflict = true;
+        }
+      } else if (t) {
+        merged[buf] = then_hist.at(buf);
+      } else if (e) {
+        merged[buf] = else_hist.at(buf);
+      }
+    }
+    current_access_history_ = merged;
+
+    std::vector<Stmt> stmts;
     stmts.push_back(IfThenElse(op->condition, then_case, else_case));
-
+    // 当前安全形态: 后置屏障恒插(merge 只影响历史延续,不改变屏障)。
+    // TODO(#70 下轮): merge 的 SameAccess 判等在"同值不同程序点"场景
+    // 丢同步(实测 507015/nan),须按 touched+program-order 精化后再放开。
     InsertSynchronization("PipeBarrier_ALL", stmts);
     current_access_history_.clear();
+    if (stmts.size() == 1) {
+      return stmts[0];
+    }
     return SeqStmt(stmts);
   }
 
@@ -1651,6 +1708,9 @@ private:
   std::unordered_map<std::string, std::string> event_mapping_;
   std::unordered_map<std::string, OperationConfig> operation_config_;
   std::unordered_map<std::string, BufferAccess> current_access_history_;
+  // IfThenElse 流敏感合并用: 当前分支帧内被真实访问过的 buffer 名集合
+  // (嵌套 if 的访问向上并集)
+  std::unordered_set<std::string> branch_touched_;
   Map<Var, PrimExpr> address_map_;
   Map<Var, PrimExpr> size_map_;
   std::string platform_;
