@@ -222,6 +222,22 @@ CATLASS_DEVICE void copy_l1_to_bt(LocalTensor<T1> const dstTensor,
   AscendC::DataCopy(dstTensor, srcTensor, params);
 }
 
+// floor 语义除/模: C 的 / % 是截断(向零),负数下与 floor 不符——conv
+// strip 闭式 s0 的 floordiv(负数, KS*DH) 在 pad 边界 band 错位实录(首/末
+// band strip 0 被跳)。codegen 的 FloorDiv/FloorMod 降到这两个辅助。
+template <typename T, typename U>
+CATLASS_DEVICE __forceinline__ auto tl_floordiv(T a, U b) -> decltype(a / b) {
+  auto q = a / b;
+  auto r = a % b;
+  return (r != 0 && ((r < 0) != (b < 0))) ? q - 1 : q;
+}
+
+template <typename T, typename U>
+CATLASS_DEVICE __forceinline__ auto tl_floormod(T a, U b) -> decltype(a % b) {
+  auto r = a % b;
+  return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r;
+}
+
 template <typename T1, typename T2, typename LayoutGM, uint32_t srcM,
           uint32_t srcN, bool enRelu = false>
 CATLASS_DEVICE void
