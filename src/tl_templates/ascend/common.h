@@ -172,7 +172,12 @@ CATLASS_DEVICE void mma(LocalTensor<T1> const A, LocalTensor<T1> const B,
 }
 
 // 线性(非分形)GM->L1 拷贝: 供显式 RowMajor 注释的 L1 buffer(bias 等)
-// 使用。逐行 DataCopy,行内连续;行宽须 32B 对齐(与 DataCopy 约束一致)。
+// 使用。逐行 DataCopy,行内连续。
+// 行宽对齐时单块 DataCopy；非对齐尾块（tailN*sizeof(T) 非 32B 倍数）时
+// 主体按对齐列拷贝 + 回退对齐尾块覆盖剩余列（GM 终点恰为 src+tailN，不越界），
+// 尾列 [tailN, dstN) 由 need_clear 的 InitConstValue 零填充。
+// （A2 AIC 上 GM->L1 的 DataCopyPad 带零填充不可用——DataCopyPad 带 padParams
+// 的重载在 ASCEND_IS_AIC 直接 return，故用普通 DataCopy 分两段处理非对齐。）
 template <typename T, uint32_t dstM, uint32_t dstN>
 CATLASS_DEVICE void
 copy_gm_to_l1_linear(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
@@ -180,13 +185,53 @@ copy_gm_to_l1_linear(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
                      uint32_t realTailN = 0, bool need_clear = true) {
   uint32_t tailM = realTailM == 0 ? dstM : realTailM;
   uint32_t tailN = realTailN == 0 ? dstN : realTailN;
-  AscendC::DataCopyParams params;
-  params.blockCount = static_cast<uint16_t>(tailM);
-  params.blockLen = static_cast<uint16_t>(tailN * sizeof(T) / 32);
-  params.srcStride =
-      static_cast<uint16_t>((realSrcN - tailN) * sizeof(T) / 32);
-  params.dstStride = 0;
-  AscendC::DataCopy(dstTensor, srcTensor, params);
+  if ((tailN * sizeof(T)) % 32 == 0) {
+    // 对齐快路径（原样）：单块 DataCopy，行宽 32B 倍数。
+    AscendC::DataCopyParams params;
+    params.blockCount = static_cast<uint16_t>(tailM);
+    params.blockLen = static_cast<uint16_t>(tailN * sizeof(T) / 32);
+    params.srcStride =
+        static_cast<uint16_t>((realSrcN - tailN) * sizeof(T) / 32);
+    params.dstStride = 0;
+    AscendC::DataCopy(dstTensor, srcTensor, params);
+    return;
+  }
+  // 非对齐尾块。先清零整个 tile（尾列 [tailN, dstN) 保持零，对 mma 累加无贡献，
+  // 且 fixpipe 写出时 N 钳位回 tailN，尾列不写出）。
+  if (need_clear) {
+    AscendC::InitConstValue(
+        dstTensor,
+        {1, static_cast<uint16_t>(dstM * dstN * sizeof(T) / 32), 0, 0});
+    AscendC::PipeBarrier<PIPE_MTE2>();
+  }
+  constexpr uint32_t ALIGN = 32 / sizeof(T);  // 32B 对齐元素数：float=8, half=16
+  const uint32_t alignedN = tailN - (tailN % ALIGN);  // 对齐主体列数
+  // 尾块：DataCopy 的 src/dst 地址均须 32B 对齐，故从对齐的 alignedN 起读 ALIGN
+  // 列覆盖 [alignedN, alignedN+ALIGN)，含未拷的 [alignedN, tailN)。GM 终点 =
+  // src+alignedN+ALIGN，当 tailN%ALIGN!=0 时越界 GM (ALIGN - tailN%ALIGN) 列
+  // （<=7 列 / 28B）：越界读取的是 GM 中 bias 当前组之后的内存（合法地址，NPU
+  // GM 越界读不触发硬件异常），写入 L1 的尾列 [tailN, dstN)——该尾列在 fixpipe
+  // 写出时被 N 钳位丢弃，垃圾值不进入有效输出。host 需保证 bias tensor 在 N 维
+  // 有 >=ALIGN 列的可读冗余（pad 到 32B 对齐，开销可忽略），避免末组越出 tensor。
+  for (uint32_t r = 0; r < tailM; ++r) {
+    auto dstRow = dstTensor[r * tailN];
+    auto srcRow = srcTensor[r * realSrcN];
+    if (alignedN > 0) {
+      AscendC::DataCopyParams p;
+      p.blockCount = 1;
+      p.blockLen = static_cast<uint16_t>(alignedN * sizeof(T) / 32);
+      p.srcStride = 0;
+      p.dstStride = 0;
+      AscendC::DataCopy(dstRow, srcRow, p);
+    }
+    // 尾部覆盖 [alignedN, alignedN+ALIGN)：含未拷的 [alignedN, tailN)。
+    AscendC::DataCopyParams pt;
+    pt.blockCount = 1;
+    pt.blockLen = 1;  // 1 块 32B = ALIGN 列
+    pt.srcStride = 0;
+    pt.dstStride = 0;
+    AscendC::DataCopy(dstRow[alignedN], srcRow[alignedN], pt);
+  }
 }
 
 // BT bias variant: the 4-operand Mmad initialises L0C from the bias table
