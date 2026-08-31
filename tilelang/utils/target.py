@@ -157,3 +157,60 @@ def determine_platform(platform: str = "auto") -> str:
 
     # Default fallback if detection fails
     return "A3"
+
+# 编译期设备核数: jit build 在目标机 host 上跑,此时读设备属性并作为
+# python int 进 trace —— 生成码里是编译期常量,跨芯片(910B3 20/40,
+# 910C 等)零硬编码。fork 安全: 仅在 npu 已初始化时直读,否则按芯片名
+# 查表;查不到回退 910B3(20/40)并打 warning。
+_CORE_NUM_TABLE = {
+    # (cube, vector)
+    "910B": (20, 40),
+    "910_93": (20, 40),   # A3 系列按 910B 同档,实测后修订
+    "910C": (20, 40),
+    "910_95": (20, 40),   # A5/950: 以实测为准
+}
+_core_num_cache = {}
+
+
+def get_core_num(kind: str = "cube") -> int:
+    """返回当前编译目标芯片的核数(编译期常量化用)。
+
+    kind: "cube"/"aic" 或 "vector"/"aiv"。
+    """
+    kind = kind.lower()
+    if kind in ("cube", "aic"):
+        idx = 0
+    elif kind in ("vector", "aiv"):
+        idx = 1
+    else:
+        raise ValueError(f"unknown core kind: {kind}")
+    if idx in _core_num_cache:
+        return _core_num_cache[idx]
+    n = None
+    try:
+        import torch
+        # 已初始化才直读(避免 import 期 _lazy_init 的 fork 僵死,见
+        # determine_platform 注释)
+        if hasattr(torch, "npu") and torch.npu.is_available() and                 torch.npu.is_initialized():
+            props = torch.npu.get_device_properties(torch.npu.current_device())
+            n = props.cube_core_num if idx == 0 else props.vector_core_num
+    except Exception:
+        n = None
+    if n is None:
+        try:
+            import torch
+            name = torch.npu.get_device_name().upper() if hasattr(torch, "npu") else ""
+        except Exception:
+            name = ""
+        for key, pair in _CORE_NUM_TABLE.items():
+            if key in name:
+                n = pair[idx]
+                break
+        if n is None:
+            import warnings
+            warnings.warn(
+                f"get_core_num: 无法读取设备核数,回退 910B3 默认 "
+                f"{'20 AIC' if idx == 0 else '40 AIV'}")
+            n = 20 if idx == 0 else 40
+    _core_num_cache[idx] = n
+    return n
