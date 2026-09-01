@@ -9,7 +9,7 @@ import json
 import shutil
 from pathlib import Path
 from hashlib import sha256
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 from tvm.target import Target
 from tvm.tir import PrimFunc
 from tilelang.jit import JITKernel
@@ -132,6 +132,8 @@ class KernelCache:
         verbose: bool = False,
         pass_configs: dict = None,
         compile_flags: list[str] | str | None = None,
+        simulator: bool = False,
+        sim_config: Any | None = None,
     ) -> JITKernel:
         """
         Caches and reuses compiled kernels to avoid redundant compilation.
@@ -150,6 +152,25 @@ class KernelCache:
             JITKernel: The compiled kernel, either freshly compiled or from cache
         """
         platform = determine_platform(platform)
+
+        # Simulator programs are interpreted artifacts, not loadable device
+        # binaries. Keep them out of the existing binary cache until a dedicated
+        # simulator cache format exists.
+        if simulator:
+            return JITKernel(
+                func,
+                out_idx=out_idx,
+                workspace_idx=workspace_idx,
+                execution_backend=execution_backend,
+                target=target,
+                target_host=target_host,
+                platform=platform,
+                verbose=verbose,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+                simulator=True,
+                sim_config=sim_config,
+            )
 
         if not is_cache_enabled():
             return JITKernel(

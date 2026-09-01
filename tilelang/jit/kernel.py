@@ -2,21 +2,17 @@
 # Licensed under the MIT License.
 from __future__ import annotations
 
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 from tvm.target import Target
 import tilelang
 from tilelang import tvm as tvm
 from tvm.tir import PrimFunc
 
-from tilelang.jit.adapter import (
-    TorchDLPackKernelAdapter,
-    BaseKernelAdapter,
-    CtypesKernelAdapter,
-    CythonKernelAdapter,
-)
-
 from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.engine.param import KernelParam, CompiledArtifact
+
+if TYPE_CHECKING:
+    from tilelang.jit.adapter.base import BaseKernelAdapter
 
 
 class JITKernel:
@@ -55,6 +51,8 @@ class JITKernel:
         verbose: bool = False,
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | str | None = None,
+        simulator: bool = False,
+        sim_config: Any | None = None,
         from_database: bool = False,
     ):
         """
@@ -99,6 +97,8 @@ class JITKernel:
             pass_configs = {}
         self.pass_configs = pass_configs
         self.compile_flags = compile_flags
+        self.simulator = simulator
+        self.sim_config = sim_config
 
         # Validate the execution backend.
         assert execution_backend in [
@@ -106,7 +106,7 @@ class JITKernel:
             "ctypes",
             "cython",
         ], f"Invalid execution backend. {execution_backend}"
-        if execution_backend == "cython":
+        if execution_backend == "cython" and not simulator:
             from tilelang.contrib.cc import get_cplus_compiler
 
             assert get_cplus_compiler() is not None, "Cython backend requires a C++ compiler, please install or use other backends."
@@ -115,11 +115,40 @@ class JITKernel:
             return
 
         # Compile the TileLang function and create a kernel adapter for execution.
-        adapter = self._compile_and_create_adapter(func, out_idx, workspace_idx)
+        if simulator:
+            adapter = self._create_simulator_adapter(func, out_idx, workspace_idx)
+            self.artifact = getattr(adapter, "artifact", None)
+        else:
+            adapter = self._compile_and_create_adapter(func, out_idx, workspace_idx)
 
         # The adapter's function is assigned as the callable function for this instance.
         self.adapter = adapter
+        if simulator:
+            self.params = adapter.params
+            self.out_idx = adapter.result_idx
+            self.workspace_idx = adapter.workspace_idx
         self.torch_function = adapter.func
+
+    def _create_simulator_adapter(
+        self,
+        tilelang_func: PrimFunc,
+        out_idx: list[int] | int | None,
+        workspace_idx: list[int] | int | None,
+    ) -> BaseKernelAdapter:
+        """Create the optional simulator adapter without importing it on normal JIT paths."""
+        from tilelang.simulator.adapter import create_simulator_adapter
+
+        return create_simulator_adapter(
+            func=tilelang_func,
+            out_idx=out_idx,
+            workspace_idx=workspace_idx,
+            target=self.target,
+            target_host=self.target_host,
+            platform=self.platform,
+            pass_configs=self.pass_configs,
+            sim_config=self.sim_config,
+            verbose=self.verbose,
+        )
 
     @classmethod
     def from_database(
@@ -251,12 +280,16 @@ class JITKernel:
 
         # Create an adapter based on the specified execution backend.
         if execution_backend == "dlpack":
+            from tilelang.jit.adapter.dlpack import TorchDLPackKernelAdapter
+
             # Use TorchDLPackKernelAdapter for interoperability with PyTorch via DLPack.
             # But we need to ensure that the runtime is enabled and the runtime module is not None.
             assert tvm.runtime.enabled("llvm"), "DLPack backend requires LLVM runtime."
             assert artifact.rt_mod is not None, "DLPack backend requires a runtime module."
             adapter = TorchDLPackKernelAdapter(artifact.rt_mod, params=artifact.params, result_idx=out_idx)
         elif execution_backend == "ctypes":
+            from tilelang.jit.adapter.ctypes import CtypesKernelAdapter
+
             adapter = CtypesKernelAdapter(
                 params=artifact.params,
                 result_idx=out_idx,
@@ -269,6 +302,8 @@ class JITKernel:
                 pass_configs=pass_configs,
             )
         elif execution_backend == "cython":
+            from tilelang.jit.adapter.cython import CythonKernelAdapter
+
             adapter = CythonKernelAdapter(
                 params=artifact.params,
                 result_idx=out_idx,
@@ -311,6 +346,8 @@ class JITKernel:
         if execution_backend == "dlpack":
             raise ValueError("DLPack backend is not supported for TileLang JIT.")
         elif execution_backend == "ctypes":
+            from tilelang.jit.adapter.ctypes import CtypesKernelAdapter
+
             adapter = CtypesKernelAdapter.from_database(
                 params=params,
                 result_idx=result_idx,
@@ -321,6 +358,8 @@ class JITKernel:
                 pass_configs=pass_configs,
             )
         elif execution_backend == "cython":
+            from tilelang.jit.adapter.cython import CythonKernelAdapter
+
             adapter = CythonKernelAdapter.from_database(
                 params=params,
                 result_idx=result_idx,
@@ -373,7 +412,16 @@ class JITKernel:
         Profiler
             A Profiler instance for benchmarking the runtime module.
         """
-        return Profiler(self.params, self.out_idx, self.workspace_idx, tensor_supply_type).with_default_adapter(self.adapter)
+        if self.simulator:
+            from tilelang.simulator.errors import UnsupportedSimOpError
+
+            raise UnsupportedSimOpError(
+                "hardware profiler/autotuner APIs are unavailable for simulator kernels; "
+                "use kernel.adapter.schedule() and last_stats instead"
+            )
+        return Profiler(
+            self.params, self.out_idx, self.workspace_idx, tensor_supply_type
+        ).with_default_adapter(self.adapter)
 
     def get_kernel_source(self) -> str:
         """
@@ -384,14 +432,28 @@ class JITKernel:
         str
             The source code of the compiled kernel function.
         """
-        if self.execution_backend in {"ctypes", "cython"}:
+        if self.simulator or self.execution_backend in {"ctypes", "cython"}:
             return self.adapter.get_kernel_source()
         return self.artifact.kernel_source
+
+    def get_simulator_ir(self):
+        """Return SimIR for a simulator kernel."""
+        if not self.simulator:
+            raise ValueError("get_simulator_ir is only available for simulator kernels")
+        return self.adapter.get_simulator_ir()
+
+    def schedule_simulator(self):
+        """Schedule a simulator kernel and emit trace when configured."""
+        if not self.simulator:
+            raise ValueError("schedule_simulator is only available for simulator kernels")
+        return self.adapter.schedule()
 
     def get_host_source(self) -> str:
         """
         Returns the source code of the host function.
         """
+        if self.simulator:
+            raise ValueError("simulator kernels do not generate host source")
         return str(self.artifact.host_mod)
 
     def run_once(self, func: Callable | None = None) -> None:

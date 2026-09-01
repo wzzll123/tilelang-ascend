@@ -40,6 +40,8 @@ def compile(
     verbose: bool = False,
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
+    simulator: bool = False,
+    sim_config: Any | None = None,
 ) -> JITKernel:
     """
     Compile the given TileLang PrimFunc with TVM and build a JITKernel.
@@ -80,12 +82,39 @@ def compile(
         ``TL_PTO_DEBUG`` environment variables, and therefore win (bisheng is
         last-wins for repeated flags). Resolved per kernel; the process
         environment is never mutated.
+    simulator : bool, optional
+        Execute the lowered kernel with the CPU simulator instead of compiling a
+        device binary. Simulator kernels intentionally bypass the binary cache.
+    sim_config : Any, optional
+        Simulator configuration forwarded unchanged to the simulator adapter.
     """
 
     from tilelang.transform.pass_config import process_default_pass_config
+    pass_configs = process_default_pass_config(target, pass_configs)
+
+    if simulator:
+        # Simulator artifacts are not device binaries and cannot be represented by
+        # the existing on-disk JIT cache. Constructing JITKernel directly also keeps
+        # compiler/toolchain imports out of the CPU-only simulator path.
+        from tilelang.utils.target import determine_platform
+
+        return JITKernel(
+            func=func,
+            out_idx=out_idx,
+            workspace_idx=workspace_idx,
+            execution_backend=execution_backend,
+            target=target,
+            target_host=target_host,
+            platform=determine_platform(platform),
+            verbose=verbose,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            simulator=True,
+            sim_config=sim_config,
+        )
+
     from tilelang.jit.adapter.libgen import resolve_compile_flags
 
-    pass_configs = process_default_pass_config(target, pass_configs)
     # Resolve once here so the same flag list feeds both the cache key and codegen.
     compile_flags = resolve_compile_flags(target, pass_configs, compile_flags)
 
@@ -113,6 +142,8 @@ class _JitImplementation:
     verbose: bool
     pass_configs: dict[str, Any] | None
     compile_flags: list[str] | str | None
+    simulator: bool
+    sim_config: Any | None
     debug_root_path: str | None
     func: Callable | None = None  # Store the original function
     signature: Any | None = None  # Store the signature
@@ -130,6 +161,8 @@ class _JitImplementation:
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | str | None = None,
         debug_root_path: str | None = None,
+        simulator: bool = False,
+        sim_config: Any | None = None,
     ):
         """
         Initializes the JIT compiler decorator.
@@ -177,6 +210,8 @@ class _JitImplementation:
         self.verbose = verbose
         self.pass_configs = pass_configs
         self.compile_flags = compile_flags
+        self.simulator = simulator
+        self.sim_config = sim_config
         self.func = None
         self.signature = None
 
@@ -238,6 +273,8 @@ class _JitImplementation:
                     verbose=self.verbose,
                     pass_configs=self.pass_configs,
                     compile_flags=self.compile_flags,
+                    simulator=self.simulator,
+                    sim_config=self.sim_config,
                 )
 
                 if self.debug_root_path:
@@ -275,6 +312,8 @@ def jit(  # This is the new public interface
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
     debug_root_path: str | None = None,
+    simulator: bool = False,
+    sim_config: Any | None = None,
 ):
     """
     Just-In-Time (JIT) compiler decorator for TileLang functions.
@@ -308,6 +347,10 @@ def jit(  # This is the new public interface
         flags and folded into the cache key; see :func:`compile`. Defaults to None.
     debug_root_path : Optional[str], optional
         Directory to save compiled kernel source for debugging. Defaults to None.
+    simulator : bool, optional
+        Use the CPU simulator execution path. Defaults to False.
+    sim_config : Any, optional
+        Simulator configuration forwarded unchanged to the simulator adapter.
 
     Returns
     -------
@@ -329,6 +372,8 @@ def jit(  # This is the new public interface
             pass_configs=pass_configs,
             compile_flags=compile_flags,
             debug_root_path=debug_root_path,
+            simulator=simulator,
+            sim_config=sim_config,
         )
         return default_decorator(func)
     elif isinstance(func, PrimFunc):
@@ -348,5 +393,7 @@ def jit(  # This is the new public interface
             pass_configs=pass_configs,
             compile_flags=compile_flags,
             debug_root_path=debug_root_path,
+            simulator=simulator,
+            sim_config=sim_config,
         )
         return configured_decorator

@@ -157,8 +157,6 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target, platform: str) -> tvm.IRModule:
-    device_mod = tir.transform.Simplify()(device_mod)
-
     if target.model == "ascendc" or target.model == "auto":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_ascend")(device_mod, target, platform)
     elif target.model == "pto":
@@ -168,6 +166,51 @@ def device_codegen(device_mod: tvm.IRModule, target: Target, platform: str) -> t
         raise ValueError(f"Target {target.kind.name} is not supported")
 
     return device_mod
+
+
+def _normalize_ascend_target(target: str | Target) -> Target:
+    """Return the target representation expected by the Ascend lowering passes."""
+    if isinstance(target, Target):
+        return target
+    return tvm.target.Target({"kind": "llvm", "model": target})
+
+
+def _as_ir_module(func_or_mod: tir.PrimFunc | tvm.IRModule) -> tvm.IRModule:
+    """Wrap a PrimFunc in an IRModule while preserving an existing module."""
+    if isinstance(func_or_mod, tir.PrimFunc):
+        global_symbol = func_or_mod.attrs["global_symbol"]
+        return tvm.IRModule({global_symbol: func_or_mod})
+    return func_or_mod
+
+
+def lower_ascend_ir(
+    func_or_mod: tir.PrimFunc | tvm.IRModule,
+    target: str | Target = "auto",
+    platform: str = "auto",
+) -> tuple[tvm.IRModule, list[KernelParam]]:
+    """Lower an Ascend program to the final, simplified pre-codegen TIR.
+
+    This is the authoritative lowering boundary shared by native compilation and
+    alternate execution backends such as the CPU simulator.  Callers consuming
+    this TIR therefore observe the same legalization, target optimization,
+    memory planning, synchronization insertion, and final simplification.
+    """
+    from tilelang.utils.target import determine_platform
+
+    platform = determine_platform(platform)
+    target = _normalize_ascend_target(target)
+    mod = _as_ir_module(func_or_mod)
+
+    # Make the selected platform available to TIR passes.
+    for gvar, func in mod.functions_items():
+        mod[gvar] = func.with_attr("npu_platform", platform)
+
+    mod = LowerAndLegalize(mod, target)
+    mod = OptimizeForTarget(mod, target, platform)
+    mod = tir.transform.Simplify()(mod)
+
+    func = mod.functions_items()[0][1]
+    return mod, extrac_params(func)
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
@@ -209,29 +252,9 @@ def lower(
     from tilelang.utils.target import determine_platform
 
     platform = determine_platform(platform)
-
-    mod = func_or_mod
-    params = None
-    if isinstance(func_or_mod, tir.PrimFunc):
-        func = func_or_mod
-        params = extrac_params(func) if not runtime_only else None
-        mod = tvm.IRModule({func.attrs["global_symbol"]: func})
-
-    # Inject platform into PrimFunc attrs for TIR pass access
-    for gvar, f in mod.functions_items():
-        mod[gvar] = f.with_attr("npu_platform", platform)
-
-    target = tvm.target.Target({"kind": "llvm", "model": target})
-
-    # Phase 1: Lower and legalize the IR
-    mod = LowerAndLegalize(mod, target)
-
-    # Phase 2: Optimize the IR for the target
-    mod = OptimizeForTarget(mod, target, platform)
+    target = _normalize_ascend_target(target)
+    mod, params = lower_ascend_ir(func_or_mod, target=target, platform=platform)
 
     codegen_mod = device_codegen(mod, target, platform)
-
-    func = mod.functions_items()[0][1]
-    params = extrac_params(func)
 
     return CompiledArtifact(None, mod, params, codegen_mod.get_source())
