@@ -10,7 +10,16 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .errors import ProgramValidationError, UnsupportedSimOpError
 from .profile import TimingProfile, default_timing_profile, normalize_platform
-from .program import BufferSpec, CoreProgram, KernelProgram, Lane, MemoryScope, Pipe, Task
+from .program import (
+    BufferRegion,
+    BufferSpec,
+    CoreProgram,
+    KernelProgram,
+    Lane,
+    MemoryScope,
+    Pipe,
+    Task,
+)
 
 
 _VECTOR_OPS = frozenset({
@@ -111,7 +120,7 @@ def build_kernel_program(
     foundations remain importable in CPU-only environments that do not have TileLang built.
     """
     try:
-        from tilelang import tvm
+        import tvm
         from tvm import arith, tir
     except (ImportError, OSError) as error:
         raise UnsupportedSimOpError(
@@ -150,6 +159,7 @@ class _TirBridge:
         self.max_unrolled_iterations = max_unrolled_iterations
         self.tasks: Dict[int, list[Task]] = defaultdict(list)
         self.buffers: Dict[str, BufferSpec] = {}
+        self.buffer_name_by_data_var: Dict[str, str] = {}
         self.storage_scope_by_var: Dict[str, MemoryScope] = {}
         self.task_counter = 0
         self.kernel_name = "main"
@@ -197,6 +207,7 @@ class _TirBridge:
                 name,
                 BufferSpec(name, MemoryScope.GM, shape, str(buffer.dtype)),
             )
+            self.buffer_name_by_data_var[self._var_name(buffer.data)] = name
 
     def _visit(self, stmt: Any, context: _Context) -> None:
         tir = self.tir
@@ -246,6 +257,8 @@ class _TirBridge:
             self._visit(stmt.block, context)
             return
         if isinstance(stmt, tir.Block):
+            for buffer in stmt.alloc_buffers:
+                self._collect_block_buffer(buffer, context)
             self._visit(stmt.init, context)
             self._visit(stmt.body, context)
             return
@@ -330,17 +343,57 @@ class _TirBridge:
         )
         self.buffers.setdefault(name, BufferSpec(name, scope, shape, str(stmt.dtype)))
 
+    def _collect_block_buffer(self, buffer: Any, context: _Context) -> None:
+        name = str(buffer.name)
+        shape = tuple(
+            self._extent_or_symbol(extent, context.environment) for extent in buffer.shape
+        )
+        self.buffers.setdefault(
+            name,
+            BufferSpec(name, MemoryScope.parse(str(buffer.scope())), shape, str(buffer.dtype)),
+        )
+        self.buffer_name_by_data_var[self._var_name(buffer.data)] = name
+
     def _emit_call(self, call: Any, context: _Context) -> None:
         operation, arguments = self._call_operation(call)
         metadata = {
             "arguments": tuple(self._literal(arg) for arg in arguments),
             "tir": str(call),
         }
+        metadata.update(self._functional_metadata(operation, arguments, context))
         metadata.update(self._sync_metadata(operation, arguments))
         span = getattr(call, "span", None)
         if span is not None:
             metadata["span"] = str(span)
         self._emit_task(operation, context, metadata=metadata)
+
+    def _functional_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        """Extract operands for copy forms whose pointer/extent contract is unambiguous."""
+        normalized = operation.lower()
+        if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
+            return {}
+        if len(arguments) != 3:
+            return {}
+        length = self._const_int(arguments[2], context.environment)
+        if length is None or length < 0:
+            return {}
+        source = self._direct_buffer_region(arguments[0], length)
+        destination = self._direct_buffer_region(arguments[1], length)
+        if source is None or destination is None:
+            return {}
+        return {"src": source, "dst": destination}
+
+    def _direct_buffer_region(self, pointer: Any, length: int) -> Optional[BufferRegion]:
+        name = self.buffer_name_by_data_var.get(self._var_name(pointer))
+        if name is None:
+            return None
+        spec = self.buffers[name]
+        return BufferRegion(name, spec.scope, (length,), spec.dtype)
 
     def _emit_task(
         self, operation: str, context: _Context, *, metadata: Mapping[str, Any]

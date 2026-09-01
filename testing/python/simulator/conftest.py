@@ -2,23 +2,22 @@
 # Licensed under the MIT License.
 """Allow CPU-only simulator tests to run before the native TileLang build exists."""
 
-import importlib.util
+import os
 from pathlib import Path
 import sys
 import types
 
 
-def _native_tvm_is_available() -> bool:
-    try:
-        return importlib.util.find_spec("tvm") is not None
-    except (ImportError, OSError, RuntimeError):
-        return False
+repository_root = Path(__file__).resolve().parents[3]
+os.environ.setdefault(
+    "TEST_DATA_ROOT_PATH",
+    str(repository_root / ".pytest_cache" / "tvm-test-data"),
+)
 
 
-if not _native_tvm_is_available() and "tilelang" not in sys.modules:
+if "tilelang" not in sys.modules:
     # Importing tilelang normally loads TVM and libtilelang.  The simulator core is
     # intentionally backend-neutral, so expose only the package path for these tests.
-    repository_root = Path(__file__).resolve().parents[3]
     package = types.ModuleType("tilelang")
     package.__path__ = [str(repository_root / "tilelang")]
     package.__package__ = "tilelang"
