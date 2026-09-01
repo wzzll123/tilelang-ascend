@@ -128,6 +128,8 @@ PrimFunc 的 `address_map/size_map`；dependency 与 FunctionalSimulator backing
 scope、core 和绝对 byte range 处理跨 buffer 的部分或完全 alias。
 cast 已贯通 `dst/src/round_mode/count` contract；当前仅执行 `CAST_NONE` 和
 `CAST_RINT`，其它 round mode 明确拒绝。
+tail reduction 已贯通仓库当前验证的 float32、axis 0、clear=true contract，支持
+sum/max/min 对二维 valid rectangle 按列归约；workspace、axis 1 和 accumulate 仍待实现。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、Cube/MMA/fixpipe，以及后续 P3–P8 operation。
@@ -148,13 +150,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `98 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `104 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 98 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 104 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -221,7 +223,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [ ] 实现 fill、duplicate、silu、sigmoid、sin、cos、pow、clamp 和 axpy；补齐其它 cast
   round mode，并为已有 unary/cast 补齐 dtype/异常值语义。
 - [ ] 实现 broadcast、compare、compare_scalar、select 和 tail/mask 语义。
-- [ ] 实现基础 sum/max/min reduction 和 whole/block reduction。
+- [x] ~~实现真实 `tail_reduce` 的 float32 axis-0 clear=true sum/max/min，并覆盖
+  valid rectangle、dependency 和非法 dim/clear contract。~~
+- [ ] 实现普通 reduce、axis 1、accumulate/workspace，以及 whole/block reduction。
 - [ ] 覆盖 float16、bfloat16、float32、int/uint 常用 dtype 的舍入、溢出和饱和语义。
 - [ ] 增加动态 shape、动态 tail、misalignment、partial write 和非法 copy path 测试。
 
@@ -313,7 +317,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：98 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：104 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

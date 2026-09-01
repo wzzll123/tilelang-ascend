@@ -434,6 +434,65 @@ def _planned_alias_primfunc():
     })
 
 
+def _tail_reduce_primfunc(kind, dimension=0, clear=1, dtype="float32"):
+    source = tvm.tir.decl_buffer((3, 5), dtype, name="source", scope="global")
+    output = tvm.tir.decl_buffer((5,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (4, 8), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_output", scope="shared.ub"
+    )
+    load = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_gm_to_ub<float32, 8, 4>",
+        source.access_ptr("r"),
+        ub_source.access_ptr("w"),
+        5,
+        3,
+        5,
+        0,
+        4,
+        8,
+    )
+    reduce = tvm.tir.call_extern(
+        "handle",
+        "tl.ascend_tail_reduce",
+        kind,
+        ub_output.access_ptr("w"),
+        ub_source.access_ptr("r"),
+        dimension,
+        3,
+        5,
+        8,
+        clear,
+    )
+    store = tvm.tir.call_extern(
+        "handle",
+        "copy_ub_to_gm",
+        ub_output.access_ptr("r"),
+        output.access_ptr("w"),
+        5,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.SeqStmt([
+            tvm.tir.Evaluate(load),
+            tvm.tir.Evaluate(reduce),
+            tvm.tir.Evaluate(store),
+        ]),
+        alloc_buffers=[ub_source, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -760,6 +819,62 @@ def test_planned_physical_alias_drives_dependencies_and_shared_bytes() -> None:
         simulator.read(BufferRegion("output", MemoryScope.GM, (4,), "float32")),
         np.concatenate((x[:2], y[:2])),
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "reducer"),
+    [
+        ("reduce_sum", lambda value: np.sum(value, axis=0)),
+        ("reduce_max", lambda value: np.max(value, axis=0)),
+        ("reduce_min", lambda value: np.min(value, axis=0)),
+    ],
+)
+def test_tail_reduce_axis_zero_executes_valid_rectangle(kind, reducer) -> None:
+    program = build_kernel_program(_tail_reduce_primfunc(kind), platform="A2")
+    load, reduce, store = program.tasks
+    assert reduce.operation == kind
+    assert reduce.metadata["tail_kind"] == "tail_reduce"
+    assert reduce.metadata["reduce"] == {
+        "dimension": 0,
+        "clear": True,
+        "valid_rows": 3,
+        "valid_cols": 5,
+        "physical_cols": 8,
+    }
+    assert reduce.dependencies == (load.task_id,)
+    assert store.dependencies == (reduce.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    values = np.arange(15, dtype=np.float32).reshape(3, 5) - 4
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (3, 5), "float32"), values
+    )
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(BufferRegion("output", MemoryScope.GM, (5,), "float32")),
+        reducer(values),
+    )
+
+
+@pytest.mark.parametrize(
+    ("dimension", "clear"),
+    [(1, 1), (0, 0)],
+)
+def test_tail_reduce_unvalidated_contract_fails_closed(dimension, clear) -> None:
+    with pytest.raises(
+        UnsupportedSimOpError, match="supports only dim=0 and clear=true"
+    ):
+        build_kernel_program(
+            _tail_reduce_primfunc("reduce_sum", dimension, clear), platform="A3"
+        )
+
+
+def test_tail_reduce_unvalidated_dtype_fails_closed() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="only float32"):
+        build_kernel_program(
+            _tail_reduce_primfunc("reduce_sum", dtype="float16"), platform="A2"
+        )
 
 
 def test_real_tir_shmem_call_fails_closed() -> None:

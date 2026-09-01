@@ -33,7 +33,8 @@ _VECTOR_OPS = frozenset({
     "compare", "compare_scalar", "cos", "createvecindex", "div", "divs", "duplicate",
     "exp", "fill", "gather", "gather_mask", "gather_mask_experiment", "gatherb",
     "init_sort_buf", "leaky_relu", "ln", "max", "maxs", "merge_sort", "min", "mins",
-    "mul", "muls", "pow", "reciprocal", "reduce", "relu", "round", "rsqrt", "select",
+    "mul", "muls", "pow", "reciprocal", "reduce", "reduce_max", "reduce_min",
+    "reduce_sum", "relu", "round", "rsqrt", "select",
     "sigmoid", "sin", "sort", "sort32", "sqrt", "sub", "subs", "tail_binary",
     "tail_broadcast", "tail_compare", "tail_compare_scalar", "tail_reduce", "tail_scalar",
     "tail_select", "tail_unary", "topk", "transpose", "wholereducemax",
@@ -52,6 +53,8 @@ _TAIL_OPERATIONS = {
         "abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt",
     }),
 }
+
+_TAIL_REDUCE_OPERATIONS = frozenset({"reduce_max", "reduce_min", "reduce_sum"})
 
 
 @dataclass(frozen=True)
@@ -439,11 +442,21 @@ class _TirBridge:
                     f"operation tag {operation_tag!r} is not valid for {tail_kind}"
                 )
             arguments = arguments[1:]
+        elif tail_kind == "tail_reduce":
+            if not arguments:
+                raise ProgramValidationError("tail_reduce requires a reduction kind")
+            operation_tag = self._literal(arguments[0])
+            operation = _short_operation(str(operation_tag))
+            if operation not in _TAIL_REDUCE_OPERATIONS:
+                raise UnsupportedSimOpError(
+                    f"unsupported tail_reduce kind {operation_tag!r}"
+                )
+            arguments = arguments[1:]
         metadata = {
             "arguments": tuple(self._literal(arg) for arg in arguments),
             "tir": str(call),
         }
-        if tail_kind in _TAIL_OPERATIONS:
+        if tail_kind in _TAIL_OPERATIONS or tail_kind == "tail_reduce":
             metadata.update({
                 "lowered_operation": lowered_operation,
                 "tail_kind": tail_kind,
@@ -478,6 +491,8 @@ class _TirBridge:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
         if short == "cast":
             return self._cast_metadata(arguments, context)
+        if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
+            return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
             return {}
         if len(arguments) < 3:
@@ -651,6 +666,67 @@ class _TirBridge:
             "dst": destination,
             "src": source,
             "round_mode": round_mode.upper(),
+        }
+
+    def _tail_reduce_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 7:
+            raise UnsupportedSimOpError(
+                "functional tail_reduce currently requires the no-workspace 8-argument form"
+            )
+        dimension = self._const_int(arguments[2], context.environment)
+        clear = self._const_int(arguments[6], context.environment)
+        if dimension != 0 or clear != 1:
+            raise UnsupportedSimOpError(
+                "functional tail_reduce supports only dim=0 and clear=true"
+            )
+        valid_rows = self._runtime_int(arguments[3], context.environment)
+        valid_cols = self._runtime_int(arguments[4], context.environment)
+        physical_cols = self._runtime_int(arguments[5], context.environment)
+        if valid_rows is None or valid_cols is None or physical_cols is None:
+            raise UnsupportedSimOpError(
+                "tail_reduce extents must be executable runtime integer expressions"
+            )
+        if all(isinstance(value, int) for value in (
+            valid_rows, valid_cols, physical_cols
+        )) and valid_cols > physical_cols:
+            raise ProgramValidationError(
+                "tail_reduce valid columns must not exceed physical columns"
+            )
+        source = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        destination = self._access_buffer_region(arguments[0], (valid_cols,), context)
+        if source is None or destination is None:
+            raise UnsupportedSimOpError(
+                "tail_reduce source and destination pointers must resolve to buffers"
+            )
+        if source.dtype != "float32" or destination.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional tail_reduce currently supports only float32"
+            )
+        if (
+            isinstance(physical_cols, int)
+            and source.strides_bytes is not None
+            and isinstance(source.strides_bytes[0], int)
+            and source.strides_bytes[0] != physical_cols * dtype_size_bytes(source.dtype)
+        ):
+            raise ProgramValidationError(
+                "tail_reduce physical columns disagree with source row stride"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "reduce": {
+                "dimension": dimension,
+                "clear": True,
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "physical_cols": physical_cols,
+            },
         }
 
     def _vector_shape(

@@ -50,6 +50,12 @@ _UNARY_OPERATIONS = {
     "sqrt": np.sqrt,
 }
 
+_REDUCE_OPERATIONS = {
+    "reduce_max": lambda value: np.max(value, axis=0),
+    "reduce_min": lambda value: np.min(value, axis=0),
+    "reduce_sum": lambda value: np.sum(value, axis=0),
+}
+
 
 @dataclass(frozen=True)
 class FunctionalExecutionResult:
@@ -129,6 +135,9 @@ class FunctionalSimulator:
         if operation == "cast":
             self._cast(task)
             return
+        if operation in _REDUCE_OPERATIONS:
+            self._reduce(task, operation)
+            return
         if operation in {"set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
                          "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
                          "auto_wait_cross_flag", "barrier_all", "pipe_barrier",
@@ -202,6 +211,15 @@ class FunctionalSimulator:
             raise UnsupportedSimOpError(
                 f"functional cast does not support round mode {round_mode!r}"
             )
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _reduce(self, task: Task, operation: str) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        if values.shape[0] == 0 or values.shape[1] == 0:
+            return
+        result = _REDUCE_OPERATIONS[operation](values)
         self.write(destination, result, task_core_id=task.core_id)
 
     def _resolve(self, region: BufferRegion, task_core_id: int) -> MemoryView:
