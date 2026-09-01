@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .errors import ProgramValidationError, UnsupportedSimOpError
+from .memory import dtype_size_bytes
 from .profile import TimingProfile, default_timing_profile, normalize_platform
 from .program import (
     BufferRegion,
@@ -377,23 +378,74 @@ class _TirBridge:
         normalized = operation.lower()
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
             return {}
-        if len(arguments) != 3:
+        if len(arguments) < 3:
             return {}
-        length = self._const_int(arguments[2], context.environment)
-        if length is None or length < 0:
-            return {}
-        source = self._direct_buffer_region(arguments[0], length)
-        destination = self._direct_buffer_region(arguments[1], length)
+        if len(arguments) >= 5:
+            valid_rows = self._const_int(arguments[3], context.environment)
+            valid_cols = self._const_int(arguments[4], context.environment)
+            if valid_rows is None or valid_cols is None:
+                return {}
+            if valid_rows < 0 or valid_cols < 0:
+                raise ProgramValidationError("copy valid rows/columns must not be negative")
+            shape = (valid_rows, valid_cols)
+            source = self._access_buffer_region(arguments[0], shape, context)
+            destination = self._access_buffer_region(arguments[1], shape, context)
+            details: Dict[str, Any] = {
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "stride_n": self._literal(arguments[2]),
+            }
+            if len(arguments) > 5:
+                details["pad_value"] = self._literal(arguments[5])
+            if len(arguments) > 7:
+                details["physical_rows"] = self._literal(arguments[6])
+                details["physical_cols"] = self._literal(arguments[7])
+        else:
+            length = self._const_int(arguments[2], context.environment)
+            if length is None or length < 0:
+                return {}
+            source = self._access_buffer_region(arguments[0], (length,), context)
+            destination = self._access_buffer_region(arguments[1], (length,), context)
+            details = {"valid_elements": length}
         if source is None or destination is None:
             return {}
-        return {"src": source, "dst": destination}
+        return {"src": source, "dst": destination, "copy": details}
 
-    def _direct_buffer_region(self, pointer: Any, length: int) -> Optional[BufferRegion]:
-        name = self.buffer_name_by_data_var.get(self._var_name(pointer))
+    def _access_buffer_region(
+        self,
+        pointer: Any,
+        shape: Tuple[int, ...],
+        context: _Context,
+    ) -> Optional[BufferRegion]:
+        data_var = pointer
+        element_offset = 0
+        if isinstance(pointer, self.tir.Call) and str(pointer.op.name) == "tir.tvm_access_ptr":
+            if len(pointer.args) < 4:
+                return None
+            data_var = pointer.args[1]
+            offset = self._const_int(pointer.args[2], context.environment)
+            if offset is None:
+                return None
+            element_offset = offset
+        name = self.buffer_name_by_data_var.get(self._var_name(data_var))
         if name is None:
             return None
         spec = self.buffers[name]
-        return BufferRegion(name, spec.scope, (length,), spec.dtype)
+        itemsize = dtype_size_bytes(spec.dtype)
+        strides = None
+        if len(shape) == 2:
+            physical_cols = self._const_int(spec.shape[-1], context.environment)
+            if physical_cols is None:
+                return None
+            strides = (physical_cols * itemsize, itemsize)
+        return BufferRegion(
+            name,
+            spec.scope,
+            shape,
+            spec.dtype,
+            byte_offset=element_offset * itemsize,
+            strides_bytes=strides,
+        )
 
     def _emit_task(
         self, operation: str, context: _Context, *, metadata: Mapping[str, Any]

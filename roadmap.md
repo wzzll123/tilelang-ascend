@@ -39,10 +39,11 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 - [x] ~~实现显式 SimIR 的 GM→UB→vector add→UB→GM 数值链路。~~
 - [x] ~~验证双 AIV core 和非整块 tail（19 元素拆分为 10+9）。~~
 - [x] ~~从真实 TIR 自动提取简单三参数 `copy_gm_to_ub` 的 src/dst/extent 并执行。~~
+- [x] ~~解析 GM↔UB `tvm_access_ptr` 的常量 element offset、二维 valid rectangle、
+  physical stride、mask/pad 元数据，并执行 strided copy。~~
 - [x] ~~实现基本二元执行器：add、sub、mul、div、min、max。~~
 - [ ] 自动提取真实 TIR 的 vector add/sub/mul/div/min/max 操作数。
-- [ ] 自动提取并执行完整 GM↔UB copy 签名，包括 offset、二维 shape、runtime extent、
-  mask 和 pad value。
+- [ ] 补齐 GM↔UB copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
 - [ ] 实现 fill、duplicate、cast、abs、exp、relu、silu、sqrt、rsqrt、reciprocal、
   sigmoid、sin、cos、ln、pow、clamp 和 axpy。
 - [ ] 实现 broadcast、compare、compare_scalar、select 和 tail/mask 语义。
@@ -146,8 +147,8 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 下一批工作
 
-1. 自动解析真实 TIR 中带 offset/shape/mask 的 GM↔UB copy。
-2. 自动解析真实 TIR vector add，并打通完整
+1. 自动解析真实 TIR vector add，并打通完整
    `PrimFunc → SimIR → GM→UB→add→UB→GM → NumPy result`。
+2. 支持 copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
 3. 从 TIR buffer access 建立数据依赖和 memory hazard。
 4. 完成 P1 unary、cast、broadcast、compare/select 和基础 reduction。
