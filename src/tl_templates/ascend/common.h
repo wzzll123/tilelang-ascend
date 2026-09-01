@@ -351,12 +351,20 @@ copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
   // dst[0]); the left halo is filled by hardware, so the software Duplicate
   // clear is skipped (it would redundantly re-clear the halo, and the window
   // width dstN == leftPad + maskShapeN leaves no right tail to clear).
-  bool isPad = true;
-  uint32_t rightPadding = 1;
-  if (maskShapeN == dstN || (maskShapeN * sizeof(T)) % 32 == 0) {
-    isPad = false;
-    rightPadding = 0;
-  }
+  // isPad routing: pad whenever the row's byte count is NOT a 32-Byte multiple.
+  // The legacy ``maskShapeN == dstN`` arm assumed "reading the full row means no
+  // padding", ignoring that a full row can still be byte-misaligned (e.g. 31
+  // fp32 = 124 B). DataCopyPad moves whole 32-Byte blocks; routing such a row
+  // down the unpadded path makes the DMA read/write past the row into the
+  // 32-Byte alignment residue with a dummy fill (the first element's value)
+  // instead of padValue. Route purely on byte alignment so a full-row-but-odd-
+  // byte copy is padded correctly, with rightPadding covering the residue up to
+  // the 32-Byte boundary. Aligned rows (byte % 32 == 0) keep isPad=false /
+  // rightPadding=0 -- byte-identical to the legacy behaviour.
+  uint32_t rowBytes = maskShapeN * sizeof(T);
+  bool isPad = (rowBytes % 32) != 0;
+  uint32_t rightPadding =
+      isPad ? ((32 - (rowBytes % 32)) / sizeof(T)) : 0;
   if (leftPad > 0) {
     // Shift-window: left halo via leftPadding, so padding is required.
     isPad = true;
