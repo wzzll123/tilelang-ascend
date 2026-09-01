@@ -333,7 +333,8 @@ template <typename T, uint32_t dstN, uint32_t dstM = 1>
 CATLASS_DEVICE void
 copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
               uint32_t realSrcN = 1, uint32_t maskShapeM = dstM,
-              uint32_t maskShapeN = dstN, T padValue = T(0)) {
+              uint32_t maskShapeN = dstN, T padValue = T(0),
+              uint32_t leftPad = 0) {
   // Hybrid scheme: the UB gap ([maskShapeN, dstN) / [maskShapeM, dstM)) is
   // filled with ``padValue`` via Duplicate so that downstream reduce /
   // broadcast / compare / select ops (which still read the full tile) observe a
@@ -341,13 +342,26 @@ copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
   // binary / scalar ops to tail_* helpers that compute only over the valid
   // region, so the pad value in the gap is preserved (not corrupted by
   // elementwise ops) and reaches the unreduced readers intact.
+  //
+  // leftPad (stencil shift-window semantics, opt-in): when > 0 the W valid
+  // samples are written to dst[leftPad : leftPad+maskShapeN) and the left halo
+  // dst[0:leftPad) is filled with padValue via DataCopyPad's leftPadding --
+  // the zero-padded sliding-window load a stencil kernel (depthwise conv /
+  // pooling) needs. The destination is the buffer base (the codegen emits
+  // dst[0]); the left halo is filled by hardware, so the software Duplicate
+  // clear is skipped (it would redundantly re-clear the halo, and the window
+  // width dstN == leftPad + maskShapeN leaves no right tail to clear).
   bool isPad = true;
   uint32_t rightPadding = 1;
   if (maskShapeN == dstN || (maskShapeN * sizeof(T)) % 32 == 0) {
     isPad = false;
     rightPadding = 0;
   }
-  if (maskShapeM != dstM || maskShapeN != dstN) {
+  if (leftPad > 0) {
+    // Shift-window: left halo via leftPadding, so padding is required.
+    isPad = true;
+  }
+  if (leftPad == 0 && (maskShapeM != dstM || maskShapeN != dstN)) {
     if constexpr (IsDuplicateSupported_v<T>) {
       SetFlag<HardEvent::MTE2_V>(0);
       WaitFlag<HardEvent::MTE2_V>(0);
@@ -358,10 +372,21 @@ copy_gm_to_ub(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
       WaitFlag<HardEvent::V_MTE2>(0);
     }
   }
+  // srcStride: only meaningful across blocks (maskShapeM > 1). For the 1D
+  // shift-window load (maskShapeM == 1) the raw (realSrcN - maskShapeN) can
+  // underflow to a huge uint32; it is unused for a single block, but pin it to
+  // 0 when leftPad is active so the new path never relies on an out-of-range
+  // stride. The plain path (leftPad == 0) keeps the original expression
+  // byte-for-byte.
+  uint32_t srcStride =
+      (leftPad > 0 && maskShapeM <= 1)
+          ? 0
+          : (realSrcN - maskShapeN) * sizeof(T);
   AscendC::DataCopyExtParams dataCopyParams(
-      maskShapeM, maskShapeN * sizeof(T), (realSrcN - maskShapeN) * sizeof(T),
+      maskShapeM, maskShapeN * sizeof(T), srcStride,
       (dstN - maskShapeN) * sizeof(T) / 32, 0);
-  AscendC::DataCopyPadExtParams<T> padParams(isPad, 0, rightPadding, padValue);
+  AscendC::DataCopyPadExtParams<T> padParams(isPad, (uint8_t)leftPad,
+                                             (uint8_t)rightPadding, padValue);
   AscendC::DataCopyPad(dstTensor, srcTensor, dataCopyParams, padParams);
 }
 

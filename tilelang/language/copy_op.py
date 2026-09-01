@@ -264,6 +264,7 @@ def npu_copy_v2(
     unit_flag: int | None = None,
     real_k: int | tir.PrimExpr | None = None,
     real_n: int | tir.PrimExpr | None = None,
+    left_pad: int | None = None,
 ):
     """Copy data between memory regions.
 
@@ -300,6 +301,13 @@ def npu_copy_v2(
             stride from the column count, so a full-width load followed by a
             shorter ``T.mma(n_actual=...)`` addresses the wrong K-blocks. Applies
             to matrix_b only, since matrix_a is ``[M, K]`` and has no N.
+        left_pad (int | None): GM->UB stencil shift-window left halo width.
+            Defaults to None -> byte-identical to a plain load (valid region at
+            the destination base).  Set it so the W valid samples land at
+            destination column offset ``left_pad`` and the left halo
+            ``dst[0:left_pad]`` is zero-filled via DataCopyPad's leftPadding --
+            the zero-padded sliding-window load a stencil kernel (depthwise
+            conv / pooling) needs.  Opt-in: only emitted when explicitly given.
 
     Raises:
         TypeError: If copy extents cannot be deduced from arguments
@@ -396,6 +404,17 @@ def npu_copy_v2(
             copy_args.append(_as_expr(real_k) if real_k is not None else tir.IntImm("int32", 0))
             if real_n is not None:
                 copy_args.append(_as_expr(real_n))
+
+    # left_pad (args[9], opt-in): stencil shift-window GM->UB load.  When given,
+    # the W valid samples land at dst column offset ``left_pad`` and the left
+    # halo dst[0:left_pad] is zero-filled via DataCopyPad's leftPadding.  It is
+    # positional after unit_flag/real_k/real_n, so those three are materialised
+    # as their no-op defaults (0) when only left_pad is set.  Omitting left_pad
+    # emits the exact same call as before (byte-identical codegen).
+    if left_pad is not None:
+        while len(copy_args) < 9:  # src,dst,relu,transpose,pad,tmp,unit,real_k,real_n
+            copy_args.append(tir.IntImm("int32", 0))
+        copy_args.append(_as_expr(left_pad))
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.ascend_copy"), *copy_args)
 

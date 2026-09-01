@@ -14,6 +14,7 @@
 
 #include <tvm/tir/expr.h>
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <string>
@@ -2962,6 +2963,34 @@ void CodeGenTileLangAscend::CopyCodegen(const CallNode *op) {
 
     for (int i = 0; i < extra_args; ++i) {
       this->stream << ", " << var_names[i];
+    }
+
+    // copy_gm_to_ub left_pad (stencil shift-window halo, opt-in): the DSL only
+    // appends leftPad to the ascend_copy arg list when the caller passes it
+    // explicitly, and AscendCopy::Lower rides it LAST (after the physical tile
+    // dims). Detect it by comparing the actual arg count against the no-leftPad
+    // expectation for this template's dim count, and emit it as the trailing
+    // copy_gm_to_ub argument only when present -- a copy without left_pad emits
+    // byte-identical codegen to before this feature existed.
+    //
+    //   template args 2 (copy_gm_to_ub<T, dstN>)      -> 1D -> phys dims = 1
+    //   template args 3 (copy_gm_to_ub<T, dstN, dstM>)-> 2D -> phys dims = 2
+    //   no-leftPad arg count = 7 (name,src,dst,strideN,validRow,validCol,pad)
+    //                          + phys_dims
+    if (op_name.find("copy_gm_to_ub") != std::string::npos) {
+      auto lt = op_name.find('<');
+      auto gt = op_name.rfind('>');
+      int tmpl_argc = 0;
+      if (lt != std::string::npos && gt != std::string::npos && gt > lt) {
+        std::string targs = op_name.substr(lt + 1, gt - lt - 1);
+        tmpl_argc =
+            1 + static_cast<int>(std::count(targs.begin(), targs.end(), ','));
+      }
+      int phys_dims = (tmpl_argc >= 3) ? 2 : 1;
+      int expected_no_leftpad = 7 + phys_dims;
+      if (static_cast<int>(op->args.size()) == expected_no_leftpad + 1) {
+        this->stream << ", " << PrintExpr(op->args.back());
+      }
     }
 
     // copy_gm_to_l1: append a `need_clear` flag so the helper only zero-inits

@@ -85,6 +85,12 @@ AscendCopy::AscendCopy(Array<PrimExpr> args, BufferMap vmap) : args_(args) {
   if (args.size() >= 9) {
     realN = args[8];
   }
+  // GM->UB stencil shift-window left halo (opt-in, args[9]). Default 0 = plain
+  // load; only present when the DSL caller passes left_pad explicitly.
+  leftPad = Integer(0);
+  if (args.size() >= 10) {
+    leftPad = args[9];
+  }
   std::tie(this->src, this->dst) = std::tie(bf[0], bf[1]);
   std::tie(this->src_range, this->dst_range) = std::tie(rgs[0], rgs[1]);
   std::tie(this->src_extents, this->dst_extents) = std::tie(ets[0], ets[1]);
@@ -588,6 +594,15 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       new_args.push_back(dst->shape[dst->shape.size() - 2]);
     }
     new_args.push_back(dst->shape[dst->shape.size() - 1]);
+    // leftPad (stencil shift-window halo) rides LAST so every positional index
+    // above (and AscendTailMaskPropagation's args[4..8] reads) is unchanged when
+    // it is absent. CopyCodegen detects it by comparing args.size() against the
+    // no-leftPad expectation (derived from the template's dim count) and emits
+    // it as the trailing copy_gm_to_ub argument only when present.
+    const auto *lp_imm = leftPad.as<IntImmNode>();
+    if (!(lp_imm && lp_imm->value == 0)) {
+      new_args.push_back(leftPad);
+    }
   }
 
   if (config.ub2gm) {
