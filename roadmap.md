@@ -117,6 +117,8 @@ bridge 必须 fail-closed：无法确定 operation、scope、shape、offset、la
 
 copy 已支持常量或 runtime affine `tvm_access_ptr` element offset、二维 valid rectangle
 和 physical row stride；运行时 symbol 通过 `FunctionalSimulator(bindings=...)` 绑定。
+GM→UB copy 在完整物理 destination view 可证明不越界时，会先用 literal `pad_value`
+初始化物理 tile，再覆盖 valid rectangle；对越界 slice 禁用 pad 并保留诊断原因。
 vector binary 的普通形式当前支持一维显式 count；tail unary/scalar/binary 支持二维
 valid rectangle，并保留原始 tail intrinsic 类型供 trace/debug。dependency 当前基于同名
 重叠 `BufferRegion`，尚未覆盖不同 buffer 名映射到同一 storage-rewrite 物理地址的 alias。
@@ -142,18 +144,18 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `91 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `92 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 91 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 92 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
 1. 通用 mask、剩余 cast round mode 和 vector forms；
-2. copy pad 写入和非仿射动态表达式；
+2. 非仿射动态表达式和动态 allocation；
 3. address-based alias dependency；
 4. reduction；
 5. Cube copy、MMA 和 fixpipe；
@@ -202,7 +204,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 scalar vector forms：adds、subs、muls、divs、mins、maxs。~~
 - [ ] 实现普通二维 vector、通用 mask 和其它 tail variants。
 - [x] ~~补齐 GM↔UB copy 的 symbolic affine runtime extent 和动态 element offset。~~
-- [ ] 实现 copy pad 写入语义和非仿射 runtime region。
+- [x] ~~实现完整物理 destination view 的 GM→UB literal pad 写入，并对越界 slice
+  禁用 pad。~~
+- [ ] 实现非仿射 runtime region。
 - [x] ~~实现 abs、exp、relu、sqrt、rsqrt、reciprocal 和 ln 的基础 NumPy 功能语义。~~
 - [x] ~~按真实 `dst/src/round_mode/count` contract 实现 `CAST_NONE` 与 `CAST_RINT`，
   覆盖 float32→float16 和 float32→int32。~~
@@ -300,7 +304,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：91 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：92 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

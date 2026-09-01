@@ -277,6 +277,44 @@ def _cast_primfunc(round_mode="CAST_RINT", destination_dtype="int32"):
     )
 
 
+def _padded_copy_primfunc(pad_value=-3.5):
+    source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
+    output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
+    ub = tvm.tir.decl_buffer((3, 8), "float32", name="ub", scope="shared.ub")
+    load = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_gm_to_ub<float32, 8, 3>",
+        source.access_ptr("r"),
+        ub.access_ptr("w"),
+        5,
+        2,
+        5,
+        tvm.tir.FloatImm("float32", pad_value),
+        3,
+        8,
+    )
+    store = tvm.tir.call_extern(
+        "handle",
+        "copy_ub_to_gm",
+        ub.access_ptr("r"),
+        output.access_ptr("w"),
+        24,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.SeqStmt([tvm.tir.Evaluate(load), tvm.tir.Evaluate(store)]),
+        alloc_buffers=[ub],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -512,6 +550,28 @@ def test_real_tir_cast_none_converts_float32_to_float16() -> None:
     np.testing.assert_array_equal(
         simulator.read(program.tasks[-1].metadata["dst"]),
         values[:5].astype(np.float16),
+    )
+
+
+def test_gm_to_ub_copy_fills_physical_tail_with_literal_pad_value() -> None:
+    program = build_kernel_program(_padded_copy_primfunc(), platform="A2")
+    load, store = program.tasks
+    assert load.metadata["pad_dst"].shape == (3, 8)
+    assert load.metadata["copy"]["pad_value"] == -3.5
+    assert store.dependencies == (load.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    values = np.arange(10, dtype=np.float32).reshape(2, 5)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (2, 5), "float32"), values
+    )
+    simulator.run()
+
+    expected = np.full((3, 8), -3.5, dtype=np.float32)
+    expected[:2, :5] = values
+    np.testing.assert_array_equal(
+        simulator.read(BufferRegion("output", MemoryScope.GM, (3, 8), "float32")),
+        expected,
     )
 
 

@@ -451,10 +451,28 @@ class _TirBridge:
                 "stride_n": self._literal(arguments[2]),
             }
             if len(arguments) > 5:
-                details["pad_value"] = self._literal(arguments[5])
-            if len(arguments) > 7:
-                details["physical_rows"] = self._literal(arguments[6])
-                details["physical_cols"] = self._literal(arguments[7])
+                details["pad_value"] = self._literal(
+                    self.analyzer.simplify(arguments[5])
+                )
+            if len(arguments) > 6:
+                physical_rows_arg = arguments[6] if len(arguments) > 7 else 1
+                physical_cols_arg = arguments[7] if len(arguments) > 7 else arguments[6]
+                physical_rows = self._affine_int(
+                    physical_rows_arg, context.environment
+                )
+                physical_cols = self._affine_int(
+                    physical_cols_arg, context.environment
+                )
+                if physical_rows is None or physical_cols is None:
+                    return {}
+                if all(isinstance(value, int) for value in (
+                    valid_rows, valid_cols, physical_rows, physical_cols
+                )) and (valid_rows > physical_rows or valid_cols > physical_cols):
+                    raise ProgramValidationError(
+                        "copy valid rectangle must fit its physical destination tile"
+                    )
+                details["physical_rows"] = physical_rows
+                details["physical_cols"] = physical_cols
         else:
             length = self._affine_int(arguments[2], context.environment)
             if length is None or (isinstance(length, int) and length < 0):
@@ -464,7 +482,36 @@ class _TirBridge:
             details = {"valid_elements": length}
         if source is None or destination is None:
             return {}
-        return {"src": source, "dst": destination, "copy": details}
+        metadata = {"src": source, "dst": destination, "copy": details}
+        if (
+            "copy_gm_to_ub" in normalized
+            and "pad_value" in details
+            and "physical_rows" in details
+        ):
+            pad_destination = self._access_buffer_region(
+                arguments[1],
+                (details["physical_rows"], details["physical_cols"]),
+                context,
+            )
+            if pad_destination is not None and self._region_fits_buffer(pad_destination):
+                metadata["pad_dst"] = pad_destination
+            else:
+                metadata["pad_disabled_reason"] = "physical tile exceeds buffer view"
+        return metadata
+
+    def _region_fits_buffer(self, region: BufferRegion) -> bool:
+        bounds = _region_bounds(region)
+        spec = self.buffers[region.buffer]
+        if bounds is None:
+            return region.byte_offset == 0
+        if any(not isinstance(extent, int) for extent in spec.shape):
+            return True
+        size_bytes = spec.size_bytes
+        if size_bytes is None:
+            size_bytes = dtype_size_bytes(spec.dtype)
+            for extent in spec.shape:
+                size_bytes *= extent
+        return bounds[0] >= 0 and bounds[1] <= size_bytes
 
     def _binary_metadata(
         self,
@@ -683,7 +730,7 @@ class _TirBridge:
         core_id: int,
     ) -> Tuple[str, ...]:
         reads = self._operand_regions(metadata, ("src", "lhs", "rhs"))
-        writes = self._operand_regions(metadata, ("dst",))
+        writes = self._operand_regions(metadata, ("dst", "pad_dst"))
         dependencies = {
             task_id
             for region in reads
@@ -700,7 +747,7 @@ class _TirBridge:
 
     def _record_memory_accesses(self, task: Task, core_id: int) -> None:
         reads = self._operand_regions(task.metadata, ("src", "lhs", "rhs"))
-        writes = self._operand_regions(task.metadata, ("dst",))
+        writes = self._operand_regions(task.metadata, ("dst", "pad_dst"))
         for region in writes:
             self.last_writes = [
                 entry for entry in self.last_writes

@@ -133,6 +133,22 @@ class FunctionalSimulator:
     def _copy(self, task: Task) -> None:
         source = _operand(task, "src")
         destination = _operand(task, "dst")
+        pad_destination = task.metadata.get("pad_dst")
+        copy_details = task.metadata.get("copy", {})
+        if isinstance(pad_destination, BufferRegion):
+            pad_value = copy_details.get("pad_value")
+            if not isinstance(pad_value, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"copy task {task.task_id!r} has non-literal pad value {pad_value!r}"
+                )
+            pad_shape = tuple(
+                _resolve_int(value, self.bindings) for value in pad_destination.shape
+            )
+            self.write(
+                pad_destination,
+                np.full(pad_shape, pad_value, dtype=_numpy_dtype(pad_destination.dtype)),
+                task_core_id=task.core_id,
+            )
         values = self.read(source, task_core_id=task.core_id)
         self.write(destination, values, task_core_id=task.core_id)
 
