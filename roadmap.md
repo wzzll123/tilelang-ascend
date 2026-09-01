@@ -123,8 +123,9 @@ runtime integer 除仿射形式外，还支持 backend-neutral `SymbolicInt` 表
 `min/max/mul/floordiv/floormod/truncdiv/truncmod/select`、整数 cast、比较和布尔组合。
 动态 BufferSpec shape 会在 FunctionalSimulator 创建时根据 bindings 实例化。
 vector binary 的普通形式当前支持一维显式 count；tail unary/scalar/binary 支持二维
-valid rectangle，并保留原始 tail intrinsic 类型供 trace/debug。dependency 当前基于同名
-重叠 `BufferRegion`，尚未覆盖不同 buffer 名映射到同一 storage-rewrite 物理地址的 alias。
+valid rectangle，并保留原始 tail intrinsic 类型供 trace/debug。bridge 会读取最终
+PrimFunc 的 `address_map/size_map`；dependency 与 FunctionalSimulator backing 均按
+scope、core 和绝对 byte range 处理跨 buffer 的部分或完全 alias。
 cast 已贯通 `dst/src/round_mode/count` contract；当前仅执行 `CAST_NONE` 和
 `CAST_RINT`，其它 round mode 明确拒绝。
 
@@ -147,22 +148,20 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `97 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `98 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 97 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 98 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
 1. 通用 mask、剩余 cast round mode 和 vector forms；
-2. address-based alias dependency；
-3. address-based alias dependency；
-4. reduction；
-5. Cube copy、MMA 和 fixpipe；
-6. 后续 P3–P8。
+2. reduction；
+3. Cube copy、MMA 和 fixpipe；
+4. 后续 P3–P8。
 
 ## P0：Lowering、SimIR 与运行时骨架
 
@@ -196,6 +195,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 byte-addressed memory、连续/strided view、bounds、capacity、poison 和
   read-before-write 检查。~~
 - [x] ~~实现 storage-rewrite 地址、非重叠 lifetime 复用和显式 alias。~~
+- [x] ~~从真实 PrimFunc `address_map/size_map` 导入 planned storage，使不同 buffer 名的
+  部分/完全物理 alias 共享 backing 并产生 RAW/WAR/WAW dependency。~~
 - [x] ~~实现显式 SimIR 的 GM→UB→vector add→UB→GM 数值链路。~~
 - [x] ~~验证双 AIV core 和非整块 tail（19 元素拆分为 10+9）。~~
 - [x] ~~从真实 TIR 自动提取简单三参数 `copy_gm_to_ub` 的 src/dst/extent 并执行。~~
@@ -281,7 +282,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~将同步等待输出为显式 trace wait event。~~
 - [x] ~~实现 max cycles、wall timeout 和基础 deadlock 报告。~~
 - [x] ~~从真实 TIR 的同名重叠 `BufferRegion` 自动生成 RAW、WAR 和 WAW dependency。~~
-- [ ] 将 dependency/hazard 扩展到 storage alias、跨 buffer 物理地址和动态 region。
+- [x] ~~将 dependency 扩展到 storage alias、跨 buffer 物理地址和保守动态 region。~~
+- [ ] 将 hazard 诊断扩展到带 source span 的动态精确 address range。
 - [ ] 执行 software-pipeline prologue、steady state、epilogue、stage/ring index 和 wrap。
 - [ ] 检查 ring-slot reuse、in-flight memory hazard 和 flag 配对协议。
 - [ ] 将 deadlock 报告扩展到 outstanding producer、flag ID、memory region 和 source span。
@@ -311,7 +313,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：97 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：98 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

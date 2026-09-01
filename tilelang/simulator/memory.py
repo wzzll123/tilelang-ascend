@@ -398,6 +398,8 @@ def _buffer_size_bytes(spec: BufferSpec) -> int:
 
 def _overlap_is_declared_reuse(left: BufferSpec, right: BufferSpec) -> bool:
     """Return whether two overlapping planned allocations may share storage."""
+    if left.metadata.get("planned_address") and right.metadata.get("planned_address"):
+        return True
     left_alias = left.metadata.get("alias_of")
     right_alias = right.metadata.get("alias_of")
     if left_alias == right.name or right_alias == left.name:

@@ -391,6 +391,49 @@ def _dynamic_allocation_primfunc():
     )
 
 
+def _planned_alias_primfunc():
+    x = tvm.tir.decl_buffer((4,), "float32", name="x", scope="global")
+    y = tvm.tir.decl_buffer((4,), "float32", name="y", scope="global")
+    output = tvm.tir.decl_buffer((4,), "float32", name="output", scope="global")
+    ub_x = tvm.tir.decl_buffer((4,), "float32", name="ub_x", scope="shared.ub")
+    ub_y = tvm.tir.decl_buffer((4,), "float32", name="ub_y", scope="shared.ub")
+
+    def copy(operation, source, destination):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            operation,
+            source.access_ptr("r"),
+            destination.access_ptr("w"),
+            4,
+        ))
+
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.SeqStmt([
+            copy("copy_gm_to_ub", x, ub_x),
+            copy("copy_gm_to_ub", y, ub_y),
+            copy("copy_ub_to_gm", ub_x, output),
+        ]),
+        alloc_buffers=[ub_x, ub_y],
+    )
+    function = tvm.tir.PrimFunc(
+        [x.data, y.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={x.data: x, y.data: y, output.data: output},
+    )
+    function = function.with_attr("address_map", {
+        ub_x.data: tvm.tir.IntImm("int64", 0),
+        ub_y.data: tvm.tir.IntImm("int64", 8),
+    })
+    return function.with_attr("size_map", {
+        ub_x.data: tvm.tir.IntImm("int64", 16),
+        ub_y.data: tvm.tir.IntImm("int64", 16),
+    })
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -693,6 +736,29 @@ def test_real_tir_dynamic_parameter_buffer_allocates_from_binding() -> None:
             BufferRegion("destination", MemoryScope.UB, (8,), "float32")
         ),
         np.pad(values, (0, 2)),
+    )
+
+
+def test_planned_physical_alias_drives_dependencies_and_shared_bytes() -> None:
+    program = build_kernel_program(_planned_alias_primfunc(), platform="A3")
+    specs = {buffer.name: buffer for buffer in program.buffers}
+    assert specs["ub_x"].address == 0
+    assert specs["ub_y"].address == 8
+    assert specs["ub_x"].size_bytes == specs["ub_y"].size_bytes == 16
+    load_x, load_y, store = program.tasks
+    assert load_y.dependencies == (load_x.task_id,)
+    assert store.dependencies == (load_y.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    x = np.arange(4, dtype=np.float32)
+    y = np.arange(10, 14, dtype=np.float32)
+    simulator.write(BufferRegion("x", MemoryScope.GM, (4,), "float32"), x)
+    simulator.write(BufferRegion("y", MemoryScope.GM, (4,), "float32"), y)
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(BufferRegion("output", MemoryScope.GM, (4,), "float32")),
+        np.concatenate((x[:2], y[:2])),
     )
 
 

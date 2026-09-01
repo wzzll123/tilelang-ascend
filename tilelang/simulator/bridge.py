@@ -179,6 +179,8 @@ class _TirBridge:
         self.buffers: Dict[str, BufferSpec] = {}
         self.buffer_name_by_data_var: Dict[str, str] = {}
         self.storage_scope_by_var: Dict[str, MemoryScope] = {}
+        self.address_by_var: Dict[str, int] = {}
+        self.size_by_var: Dict[str, int] = {}
         self.last_writes: list[Tuple[BufferRegion, str]] = []
         self.last_reads: list[Tuple[BufferRegion, str]] = []
         self.task_counter = 0
@@ -188,6 +190,7 @@ class _TirBridge:
         func = self._select_prim_func(func_or_mod)
         if func.attrs is not None and "global_symbol" in func.attrs:
             self.kernel_name = str(func.attrs["global_symbol"])
+        self._collect_memory_plan(func)
         self._collect_parameter_buffers(func)
         self._visit(func.body, _Context())
         cores = tuple(
@@ -219,13 +222,50 @@ class _TirBridge:
             return functions[0]
         raise TypeError("simulator bridge input must be a PrimFunc or IRModule")
 
+    def _collect_memory_plan(self, func: Any) -> None:
+        if func.attrs is None:
+            return
+        for attribute, destination in (
+            ("address_map", self.address_by_var),
+            ("size_map", self.size_by_var),
+        ):
+            if attribute not in func.attrs:
+                continue
+            for variable, value in func.attrs[attribute].items():
+                number = self._const_int(value, {})
+                if number is None or number < 0:
+                    raise ProgramValidationError(
+                        f"PrimFunc {attribute} must contain non-negative integers"
+                    )
+                destination[self._var_name(variable)] = number
+
+    def _buffer_spec(
+        self,
+        name: str,
+        scope: MemoryScope,
+        shape: Tuple[Any, ...],
+        dtype: str,
+    ) -> BufferSpec:
+        address = self.address_by_var.get(name)
+        size_bytes = self.size_by_var.get(name)
+        metadata = {"planned_address": True} if address is not None else {}
+        return BufferSpec(
+            name,
+            scope,
+            shape,
+            dtype,
+            size_bytes=size_bytes,
+            address=address,
+            metadata=metadata,
+        )
+
     def _collect_parameter_buffers(self, func: Any) -> None:
         for _, buffer in func.buffer_map.items():
             name = str(buffer.name)
             shape = tuple(self._extent_or_symbol(extent, {}) for extent in buffer.shape)
             self.buffers.setdefault(
                 name,
-                BufferSpec(name, MemoryScope.GM, shape, str(buffer.dtype)),
+                self._buffer_spec(name, MemoryScope.GM, shape, str(buffer.dtype)),
             )
             self.buffer_name_by_data_var[self._var_name(buffer.data)] = name
 
@@ -361,7 +401,9 @@ class _TirBridge:
         shape = tuple(
             self._extent_or_symbol(extent, context.environment) for extent in stmt.extents
         )
-        self.buffers.setdefault(name, BufferSpec(name, scope, shape, str(stmt.dtype)))
+        self.buffers.setdefault(
+            name, self._buffer_spec(name, scope, shape, str(stmt.dtype))
+        )
 
     def _collect_block_buffer(self, buffer: Any, context: _Context) -> None:
         name = str(buffer.name)
@@ -370,7 +412,12 @@ class _TirBridge:
         )
         self.buffers.setdefault(
             name,
-            BufferSpec(name, MemoryScope.parse(str(buffer.scope())), shape, str(buffer.dtype)),
+            self._buffer_spec(
+                name,
+                MemoryScope.parse(str(buffer.scope())),
+                shape,
+                str(buffer.dtype),
+            ),
         )
         self.buffer_name_by_data_var[self._var_name(buffer.data)] = name
 
@@ -776,21 +823,42 @@ class _TirBridge:
             if isinstance((value := metadata.get(name)), BufferRegion)
         )
 
-    @staticmethod
-    def _regions_overlap(left: BufferRegion, right: BufferRegion, core_id: int) -> bool:
-        if left.buffer != right.buffer or left.scope != right.scope:
+    def _regions_overlap(
+        self, left: BufferRegion, right: BufferRegion, core_id: int
+    ) -> bool:
+        if left.scope != right.scope:
             return False
         left_owner = left.core_id if left.core_id is not None else core_id
         right_owner = right.core_id if right.core_id is not None else core_id
         if left.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}:
             if left_owner != right_owner:
                 return False
+        left_spec = self.buffers[left.buffer]
+        right_spec = self.buffers[right.buffer]
+        if left.buffer == right.buffer:
+            left_base = right_base = 0
+        else:
+            left_base = left_spec.address
+            right_base = right_spec.address
+            if left_base is None or right_base is None:
+                return False
         left_bounds = _region_bounds(left)
         right_bounds = _region_bounds(right)
         if left_bounds is None or right_bounds is None:
-            return True
-        left_start, left_end = left_bounds
-        right_start, right_end = right_bounds
+            left_size = _buffer_size_bytes(left_spec)
+            right_size = _buffer_size_bytes(right_spec)
+            if left_size is None or right_size is None:
+                return True
+            return (
+                left_base < right_base + right_size
+                and right_base < left_base + left_size
+            )
+        left_start, left_end = (
+            left_base + left_bounds[0], left_base + left_bounds[1]
+        )
+        right_start, right_end = (
+            right_base + right_bounds[0], right_base + right_bounds[1]
+        )
         return left_start < right_end and right_start < left_end
 
     def _call_operation(self, call: Any) -> Tuple[str, Tuple[Any, ...]]:
@@ -981,3 +1049,14 @@ def _region_bounds(region: BufferRegion) -> Optional[Tuple[int, int]]:
         (extent - 1) * stride for extent, stride in zip(region.shape, strides)
     )
     return region.byte_offset, region.byte_offset + last_offset + itemsize
+
+
+def _buffer_size_bytes(spec: BufferSpec) -> Optional[int]:
+    if spec.size_bytes is not None:
+        return spec.size_bytes
+    if any(not isinstance(extent, int) for extent in spec.shape):
+        return None
+    size = dtype_size_bytes(spec.dtype)
+    for extent in spec.shape:
+        size *= extent
+    return size
