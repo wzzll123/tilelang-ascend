@@ -9,6 +9,153 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 说明：只有已经实现并通过测试的事项才使用删除线。部分完成的阶段会拆成已完成和
 待完成条目，不能因为已有骨架就把整个阶段标记为完成。
 
+## 整体思路
+
+### 目标与边界
+
+模拟器同时提供两种能力，但共享同一份 SimIR：
+
+1. **功能仿真**：在 CPU 上执行 kernel，验证数值、地址、容量、初始化、alias、tail
+   和同步语义。
+2. **性能 trace**：通过离散事件调度模拟 AIC/AIV pipe overlap、依赖和等待，输出
+   Chrome/Perfetto trace 和统计数据。
+
+功能结果必须正确，性能模型必须可解释。当前 timing profile 是未校准单位成本，不能
+当作真机 latency。A2 与 A3 共用功能语义，但 timing profile 必须独立维护。
+
+权威输入是 `OptimizeForTarget` 和最终 `tir.transform.Simplify()` 之后、
+`device_codegen` 之前的 TIR。不要解析生成的 AscendC/PTO C++，也不要另建一条与原生
+编译漂移的 lowering pipeline。
+
+### 数据流
+
+```text
+TileLang PrimFunc / IRModule
+  │
+  ├─ LowerAndLegalize
+  ├─ OptimizeForTarget
+  └─ final Simplify
+          │
+          ▼
+   final pre-codegen TIR
+          │
+          ▼
+   TIR bridge（严格解析）
+          │
+          ▼
+   KernelProgram / Task / BufferRegion
+          │
+          ├───────────────┐
+          ▼               ▼
+  FunctionalSimulator   DiscreteEventScheduler
+  MemoryRuntime         flags/barriers/pipes
+          │               │
+          ▼               ▼
+  NumPy golden/result   stats + Perfetto trace
+```
+
+bridge 必须 fail-closed：无法确定 operation、scope、shape、offset、layout 或同步语义时，
+抛出带 operation、platform、lane/pipe 和 source span 的异常，不能跳过或猜测。
+
+### 分层职责
+
+| 文件 | 职责 | 接手注意事项 |
+|---|---|---|
+| `tilelang/engine/lower.py` | 共享最终 pre-codegen lowering | 原生编译与 simulator 必须共用 |
+| `tilelang/jit/`、`tilelang/cache/` | `simulator=True` API 与 cache bypass | simulator 不应要求设备 binary |
+| `tilelang/simulator/bridge.py` | final TIR → SimIR、operand 和 dependency 提取 | 未确认的签名必须 fail-closed |
+| `tilelang/simulator/program.py` | `BufferSpec/Region`、Task、lane/pipe、DAG | 保持 backend-neutral 和不可变 |
+| `tilelang/simulator/memory.py` | byte-addressed scope、view、capacity、poison | GM/workspace 共享，本地 scope 逐 core |
+| `tilelang/simulator/hazard.py` | alias、越界和未初始化诊断策略 | `off/warn/error` 行为要一致 |
+| `tilelang/simulator/executor.py` | NumPy 功能语义和 operation dispatch | 不支持的 variant 必须报错 |
+| `tilelang/simulator/scheduler.py` | dependency、pipe FIFO、overlap、timeout | 调度顺序必须确定性 |
+| `tilelang/simulator/sync.py` | local/cross flags 和 barriers | 等待必须成为显式 event |
+| `tilelang/simulator/trace.py`、`stats.py` | trace 导出和 overlap-aware 统计 | 禁止简单累加并行 duration |
+| `tilelang/simulator/profile.py` | A2/A3 topology 和 timing 参数 | 未校准值必须显式标注 |
+
+### 不可破坏的语义约束
+
+- `shmem` 永久不支持；不要实现空操作或近似替代。
+- GM/workspace 在 core 间共享；L1/L0/UB/BT/LOCAL 必须逐 core 隔离。
+- storage rewrite 后的 byte address、lifetime 和 alias 是内存真相，buffer 名只用于诊断。
+- 读取未写入 byte 必须触发 poison/hazard；值恰好为 `0xff` 不能代表未初始化。
+- scheduler 的依赖、pipe FIFO、flag/barrier 必须共同决定 start cycle。
+- 功能执行与 timing 调度使用同一 Task DAG，但数值语义和周期参数保持解耦。
+- AIC 与两个 AIV lane 共享部分资源但不是同一执行流；不能把所有 task 串行化。
+- trace 中的 simulated cycle 必须携带 calibration 状态，不能伪装成测量数据。
+- 不支持的 dtype、layout、mask、动态表达式或 intrinsic variant 必须明确报错。
+
+### 添加一个 operation 的标准流程
+
+每个 operation 按以下顺序落地，避免只写 NumPy 计算而漏掉地址、调度或 trace：
+
+1. 从 `src/op/`、`src/transform/`、`src/target/` 和现有测试确认最终 TIR contract；记录
+   参数顺序、读写方向、dtype、scope、layout、mask/tail 和同步要求。
+2. 在 `classify_operation()` 中确定 AIC/AIV lane 和 pipe。
+3. 在 bridge 中把 pointer/access_ptr、offset、shape、stride 和附加参数降成
+   `BufferRegion` 与结构化 metadata。
+4. 从读写 region 生成 RAW/WAR/WAW dependency；涉及 flag/barrier 时补同步 metadata。
+5. 在 executor 中实现功能语义，并通过 MemoryRuntime 访问数据，不能绕过 bounds、
+   poison 和 hazard。
+6. 为 timing profile 定义 operation key；未校准时继续使用明确标注的 fallback。
+7. 增加真实 TVM TIR bridge 测试、功能 golden、错误路径、tail/dtype/scope 测试和 trace
+   断言。
+8. 测试通过后再在本文件划掉对应条目；只完成一种签名时必须保留其它 variants。
+
+### 当前实现状态与已知限制
+
+当前已经存在一条可执行 vertical slice：
+
+```text
+真实 TVM PrimFunc
+  → GM→UB strided copy
+  → 一维 vector add
+  → UB→GM strided copy
+  → 自动 RAW dependency
+  → NumPy result + schedule stats
+```
+
+copy 已支持常量 `tvm_access_ptr` element offset、二维 valid rectangle 和 physical row
+stride。vector add 当前只支持一维、显式 count、三个可解析 buffer pointer。dependency
+当前基于同名重叠 `BufferRegion`，尚未覆盖不同 buffer 名映射到同一 storage-rewrite
+物理地址的 alias。
+
+尚未支持 symbolic runtime extent/offset、完整 pad 写入、二维 vector tail、完整
+software pipeline、Cube/MMA/fixpipe，以及后续 P3–P8 operation。JIT adapter 的静态
+schedule 可用，但普通 tensor 调用仍应 fail-closed，直到 bridge 能为实际 kernel 生成
+完整可执行 operands。
+
+### 开发和验证环境
+
+当前 macOS ARM 环境已在 `3rdparty/tvm/build` 构建 CPU-only TVM；构建产物不提交。
+它可以验证 Memory/SimIR/scheduler/真实 TVM TIR bridge，不能验证 CANN codegen、A2/A3
+真机功能或 timing calibration。
+
+运行 simulator 回归：
+
+```bash
+cd /Users/wzz/Desktop/Research/kernel-tool/cannbot-skills/tilelang-ascend
+PYTHONPATH=3rdparty/tvm/python \
+  /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
+```
+
+当前基线为 `71 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
+`libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
+
+### 接手顺序建议
+
+接手者先运行上述 71 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
+scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
+
+1. symbolic copy region 和动态参数绑定；
+2. vector tail/scalar/unary/cast；
+3. address-based alias dependency；
+4. reduction；
+5. Cube copy、MMA 和 fixpipe；
+6. 后续 P3–P8。
+
 ## P0：Lowering、SimIR 与运行时骨架
 
 - [x] ~~创建 `feat/a2-a3-simulator` 开发分支。~~
