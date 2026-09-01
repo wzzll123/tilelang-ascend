@@ -16,6 +16,7 @@ from tilelang.simulator import (  # noqa: E402
     MemoryScope,
     Pipe,
     ProgramValidationError,
+    SymbolicInt,
     UnsupportedSimOpError,
     build_kernel_program,
 )
@@ -315,6 +316,81 @@ def _padded_copy_primfunc(pad_value=-3.5):
     )
 
 
+def _non_affine_copy_primfunc():
+    source = tvm.tir.decl_buffer((32,), "float32", name="source", scope="global")
+    destination = tvm.tir.decl_buffer(
+        (32,), "float32", name="destination", scope="shared.ub"
+    )
+    extent = tvm.tir.Var("extent", "int32")
+    valid_cols = tvm.tir.min(extent, 8)
+    element_offset = tvm.tir.Select(
+        extent < 10,
+        tvm.tir.floormod(extent, 3),
+        tvm.tir.floordiv(extent, 4),
+    ) * 2
+    load = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_gm_to_ub<float32, 32>",
+        source.access_ptr("r", offset=element_offset, extent=valid_cols),
+        destination.access_ptr("w"),
+        32,
+        1,
+        valid_cols,
+        0,
+        1,
+        32,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.Evaluate(load),
+        alloc_buffers=[destination],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, extent],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source},
+    )
+
+
+def _dynamic_allocation_primfunc():
+    extent = tvm.tir.Var("extent", "int32")
+    source = tvm.tir.decl_buffer(
+        (extent,), "float32", name="source", scope="global"
+    )
+    destination = tvm.tir.decl_buffer(
+        (8,), "float32", name="destination", scope="shared.ub"
+    )
+    valid_cols = tvm.tir.min(extent, 8)
+    load = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_gm_to_ub<float32, 8>",
+        source.access_ptr("r", extent=valid_cols),
+        destination.access_ptr("w"),
+        extent,
+        1,
+        valid_cols,
+        0,
+        1,
+        8,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.Evaluate(load),
+        alloc_buffers=[destination],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, extent],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source},
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -572,6 +648,51 @@ def test_gm_to_ub_copy_fills_physical_tail_with_literal_pad_value() -> None:
     np.testing.assert_array_equal(
         simulator.read(BufferRegion("output", MemoryScope.GM, (3, 8), "float32")),
         expected,
+    )
+
+
+def test_non_affine_runtime_region_executes_min_mod_div_and_select() -> None:
+    program = build_kernel_program(_non_affine_copy_primfunc(), platform="A3")
+    task = program.tasks[0]
+    assert isinstance(task.metadata["src"].byte_offset, SymbolicInt)
+    assert isinstance(task.metadata["src"].shape[1], SymbolicInt)
+
+    simulator = FunctionalSimulator(program, bindings={"extent": 11})
+    values = np.arange(32, dtype=np.float32)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (32,), "float32"), values
+    )
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(task.metadata["dst"]),
+        values[4:12].reshape(1, 8),
+    )
+
+
+def test_real_tir_dynamic_parameter_buffer_allocates_from_binding() -> None:
+    program = build_kernel_program(_dynamic_allocation_primfunc(), platform="A2")
+    source_spec = next(buffer for buffer in program.buffers if buffer.name == "source")
+    assert source_spec.shape == (AffineInt.variable("extent"),)
+
+    simulator = FunctionalSimulator(program, bindings={"extent": 6})
+    values = np.arange(6, dtype=np.float32)
+    simulator.write(
+        BufferRegion(
+            "source",
+            MemoryScope.GM,
+            (AffineInt.variable("extent"),),
+            "float32",
+        ),
+        values,
+    )
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(
+            BufferRegion("destination", MemoryScope.UB, (8,), "float32")
+        ),
+        np.pad(values, (0, 2)),
     )
 
 

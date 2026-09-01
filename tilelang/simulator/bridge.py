@@ -20,6 +20,7 @@ from .program import (
     Lane,
     MemoryScope,
     Pipe,
+    SymbolicInt,
     Task,
 )
 
@@ -435,8 +436,8 @@ class _TirBridge:
         if len(arguments) < 3:
             return {}
         if len(arguments) >= 5:
-            valid_rows = self._affine_int(arguments[3], context.environment)
-            valid_cols = self._affine_int(arguments[4], context.environment)
+            valid_rows = self._runtime_int(arguments[3], context.environment)
+            valid_cols = self._runtime_int(arguments[4], context.environment)
             if valid_rows is None or valid_cols is None:
                 return {}
             if ((isinstance(valid_rows, int) and valid_rows < 0)
@@ -457,10 +458,10 @@ class _TirBridge:
             if len(arguments) > 6:
                 physical_rows_arg = arguments[6] if len(arguments) > 7 else 1
                 physical_cols_arg = arguments[7] if len(arguments) > 7 else arguments[6]
-                physical_rows = self._affine_int(
+                physical_rows = self._runtime_int(
                     physical_rows_arg, context.environment
                 )
-                physical_cols = self._affine_int(
+                physical_cols = self._runtime_int(
                     physical_cols_arg, context.environment
                 )
                 if physical_rows is None or physical_cols is None:
@@ -474,7 +475,7 @@ class _TirBridge:
                 details["physical_rows"] = physical_rows
                 details["physical_cols"] = physical_cols
         else:
-            length = self._affine_int(arguments[2], context.environment)
+            length = self._runtime_int(arguments[2], context.environment)
             if length is None or (isinstance(length, int) and length < 0):
                 return {}
             source = self._access_buffer_region(arguments[0], (length,), context)
@@ -619,7 +620,8 @@ class _TirBridge:
             else (count_index,)
         )
         values = tuple(
-            self._affine_int(arguments[index], context.environment) for index in indices
+            self._runtime_int(arguments[index], context.environment)
+            for index in indices
         )
         if any(value is None for value in values):
             return None
@@ -640,13 +642,13 @@ class _TirBridge:
         count_index: int,
     ) -> Dict[str, Any]:
         return {
-            "valid_rows": self._affine_int(
+            "valid_rows": self._runtime_int(
                 arguments[count_index], context.environment
             ),
-            "valid_cols": self._affine_int(
+            "valid_cols": self._runtime_int(
                 arguments[count_index + 1], context.environment
             ),
-            "physical_cols": self._affine_int(
+            "physical_cols": self._runtime_int(
                 arguments[count_index + 2], context.environment
             ),
         }
@@ -663,7 +665,7 @@ class _TirBridge:
             if len(pointer.args) < 4:
                 return None
             data_var = pointer.args[1]
-            offset = self._affine_int(pointer.args[2], context.environment)
+            offset = self._runtime_int(pointer.args[2], context.environment)
             if offset is None:
                 return None
             element_offset = offset
@@ -674,10 +676,15 @@ class _TirBridge:
         itemsize = dtype_size_bytes(spec.dtype)
         strides = None
         if len(shape) == 2:
-            physical_cols = self._const_int(spec.shape[-1], context.environment)
-            if physical_cols is None:
+            physical_cols = spec.shape[-1]
+            if not isinstance(physical_cols, (int, AffineInt, SymbolicInt)):
                 return None
-            strides = (physical_cols * itemsize, itemsize)
+            row_stride = (
+                physical_cols * itemsize
+                if isinstance(physical_cols, int)
+                else physical_cols.scaled(itemsize)
+            )
+            strides = (row_stride, itemsize)
         byte_offset = (
             element_offset * itemsize
             if isinstance(element_offset, int)
@@ -880,8 +887,71 @@ class _TirBridge:
         return None
 
     def _extent_or_symbol(self, value: Any, environment: Mapping[Any, int]) -> Any:
-        literal = self._const_int(value, environment)
-        return literal if literal is not None else str(value)
+        expression = self._runtime_int(value, environment)
+        if expression is None:
+            raise UnsupportedSimOpError(
+                f"unsupported dynamic integer expression in buffer extent: {value}"
+            )
+        return expression
+
+    def _runtime_int(
+        self, value: Any, environment: Mapping[Any, int]
+    ) -> Optional[Any]:
+        affine = self._affine_int(value, environment)
+        if affine is not None:
+            return affine
+        substituted = value
+        if environment:
+            replacements = {
+                var: self.tir.IntImm(getattr(var, "dtype", "int32"), number)
+                for var, number in environment.items()
+            }
+            substituted = self.tir.stmt_functor.substitute(value, replacements)
+        simplified = self.analyzer.simplify(substituted)
+        operation = type(simplified).__name__
+        binary_operations = {
+            "Add": "add",
+            "And": "and",
+            "Div": "truncdiv",
+            "EQ": "eq",
+            "FloorDiv": "floordiv",
+            "FloorMod": "floormod",
+            "GE": "ge",
+            "GT": "gt",
+            "LE": "le",
+            "LT": "lt",
+            "Max": "max",
+            "Min": "min",
+            "Mul": "mul",
+            "NE": "ne",
+            "Mod": "truncmod",
+            "Or": "or",
+            "Sub": "sub",
+        }
+        if operation in binary_operations:
+            left = self._runtime_int(simplified.a, {})
+            right = self._runtime_int(simplified.b, {})
+            if left is None or right is None:
+                return None
+            return SymbolicInt(binary_operations[operation], (left, right))
+        if operation == "Not":
+            operand = self._runtime_int(simplified.a, {})
+            return None if operand is None else SymbolicInt("not", (operand,))
+        if operation == "Cast":
+            dtype = str(simplified.dtype)
+            if not (dtype.startswith("int") or dtype.startswith("uint")):
+                return None
+            return self._runtime_int(simplified.value, {})
+        if operation == "Select":
+            arguments = (
+                self._runtime_int(simplified.condition, {}),
+                self._runtime_int(simplified.true_value, {}),
+                self._runtime_int(simplified.false_value, {}),
+            )
+            if any(argument is None for argument in arguments):
+                return None
+            return SymbolicInt("select", arguments)
+        return None
 
     def _is_zero(self, value: Any, environment: Mapping[Any, int]) -> bool:
         literal = self._const_int(value, environment)
@@ -901,7 +971,7 @@ class _TirBridge:
 
 def _region_bounds(region: BufferRegion) -> Optional[Tuple[int, int]]:
     values = (region.byte_offset,) + region.shape + (region.strides_bytes or ())
-    if any(isinstance(value, AffineInt) for value in values):
+    if any(isinstance(value, (AffineInt, SymbolicInt)) for value in values):
         return None
     if any(extent == 0 for extent in region.shape):
         return region.byte_offset, region.byte_offset

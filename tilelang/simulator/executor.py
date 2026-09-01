@@ -10,7 +10,14 @@ import numpy as np
 from .config import SimulatorConfig
 from .errors import ProgramValidationError, UnsupportedSimOpError
 from .memory import MemoryRuntime, MemoryView
-from .program import AffineInt, BufferRegion, KernelProgram, MemoryScope, Task
+from .program import (
+    AffineInt,
+    BufferRegion,
+    KernelProgram,
+    MemoryScope,
+    SymbolicInt,
+    Task,
+)
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .sync import FlagBarrierSynchronizationModel
 
@@ -67,10 +74,12 @@ class FunctionalSimulator:
             raise ProgramValidationError(
                 "functional simulator config platform does not match the program"
             )
-        self.memory = MemoryRuntime.from_program(
-            program, hazard_check=self.config.hazard_check
-        )
         self.bindings = dict(bindings or {})
+        self.memory = MemoryRuntime.from_program(
+            program,
+            hazard_check=self.config.hazard_check,
+            bindings=self.bindings,
+        )
 
     def write(self, region: BufferRegion, values: Any, *, task_core_id: int = 0) -> None:
         """Initialize a concrete region from an array-like CPU value."""
@@ -239,7 +248,7 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
 
 
 def _resolve_int(value: Any, bindings: Mapping[str, int]) -> int:
-    if isinstance(value, AffineInt):
+    if isinstance(value, (AffineInt, SymbolicInt)):
         return value.evaluate(bindings)
     if isinstance(value, int) and not isinstance(value, bool):
         return value

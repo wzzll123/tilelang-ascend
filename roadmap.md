@@ -119,14 +119,17 @@ copy 已支持常量或 runtime affine `tvm_access_ptr` element offset、二维 
 和 physical row stride；运行时 symbol 通过 `FunctionalSimulator(bindings=...)` 绑定。
 GM→UB copy 在完整物理 destination view 可证明不越界时，会先用 literal `pad_value`
 初始化物理 tile，再覆盖 valid rectangle；对越界 slice 禁用 pad 并保留诊断原因。
+runtime integer 除仿射形式外，还支持 backend-neutral `SymbolicInt` 表达式树：
+`min/max/mul/floordiv/floormod/truncdiv/truncmod/select`、整数 cast、比较和布尔组合。
+动态 BufferSpec shape 会在 FunctionalSimulator 创建时根据 bindings 实例化。
 vector binary 的普通形式当前支持一维显式 count；tail unary/scalar/binary 支持二维
 valid rectangle，并保留原始 tail intrinsic 类型供 trace/debug。dependency 当前基于同名
 重叠 `BufferRegion`，尚未覆盖不同 buffer 名映射到同一 storage-rewrite 物理地址的 alias。
 cast 已贯通 `dst/src/round_mode/count` contract；当前仅执行 `CAST_NONE` 和
 `CAST_RINT`，其它 round mode 明确拒绝。
 
-尚未支持非仿射 runtime 表达式、动态 BufferSpec allocation、完整 pad 写入、通用 mask、
-完整 software pipeline、Cube/MMA/fixpipe，以及后续 P3–P8 operation。
+尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
+pipeline、Cube/MMA/fixpipe，以及后续 P3–P8 operation。
 JIT adapter 的静态 schedule 可用，但普通 tensor 调用仍应 fail-closed，直到 bridge
 能为实际 kernel 生成完整可执行 operands。
 
@@ -144,18 +147,18 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `92 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `97 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 92 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 97 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
 1. 通用 mask、剩余 cast round mode 和 vector forms；
-2. 非仿射动态表达式和动态 allocation；
+2. address-based alias dependency；
 3. address-based alias dependency；
 4. reduction；
 5. Cube copy、MMA 和 fixpipe；
@@ -177,7 +180,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~构建 macOS CPU-only TVM，并用真实 `tvm.tir.PrimFunc` 验证 bridge。~~
 - [x] ~~以 backend-neutral `AffineInt` 表示 runtime symbol、常量加减和常量倍乘，并在
   FunctionalSimulator 中绑定 region shape/offset/stride。~~
-- [ ] 支持非仿射动态表达式和动态 BufferSpec allocation。
+- [x] ~~以 backend-neutral `SymbolicInt` 支持 min/max、非仿射乘法、floor/trunc
+  div/mod、select、整数 cast、比较和布尔表达式，并按 runtime bindings 实例化动态
+  BufferSpec。~~
+- [ ] 覆盖其它最终 TIR 中实际出现的动态表达式，未知节点继续 fail-closed。
 - [ ] 将 `BufferStore`、pointer arithmetic、`address_of`、`tvm_access_ptr` 和切片统一
   降为可执行 `BufferRegion`。
 - [ ] 为最终 pre-codegen TIR 增加稳定的 IR snapshot 测试。
@@ -206,7 +212,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~补齐 GM↔UB copy 的 symbolic affine runtime extent 和动态 element offset。~~
 - [x] ~~实现完整物理 destination view 的 GM→UB literal pad 写入，并对越界 slice
   禁用 pad。~~
-- [ ] 实现非仿射 runtime region。
+- [x] ~~实现上述白名单内的非仿射 runtime region，并用真实 TIR 覆盖
+  `min + floormod/floordiv + Select`。~~
 - [x] ~~实现 abs、exp、relu、sqrt、rsqrt、reciprocal 和 ln 的基础 NumPy 功能语义。~~
 - [x] ~~按真实 `dst/src/round_mode/count` contract 实现 `CAST_NONE` 与 `CAST_RINT`，
   覆盖 float32→float16 和 float32→int32。~~
@@ -304,7 +311,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：92 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：97 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

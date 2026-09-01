@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from tilelang.simulator import (
+    AffineInt,
     BufferRegion,
     BufferSpec,
     CoreProgram,
@@ -15,6 +16,7 @@ from tilelang.simulator import (
     MemoryScope,
     Pipe,
     ProgramValidationError,
+    SymbolicInt,
     Task,
     UninitializedMemoryError,
 )
@@ -198,3 +200,54 @@ def test_scalar_vector_operations(operation, expected) -> None:
     simulator.run()
 
     np.testing.assert_array_equal(simulator.read(destination), expected(values))
+
+
+def test_dynamic_buffer_allocation_resolves_symbolic_shape() -> None:
+    dynamic_extent = SymbolicInt(
+        "max", (AffineInt.variable("element_count"), 4)
+    )
+    program = KernelProgram(
+        "dynamic-allocation",
+        "A2",
+        (CoreProgram(0),),
+        buffers=(
+            BufferSpec("dynamic", MemoryScope.GM, (dynamic_extent,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program, bindings={"element_count": 3})
+    region = BufferRegion("dynamic", MemoryScope.GM, (dynamic_extent,), "float32")
+    values = np.arange(4, dtype=np.float32)
+
+    simulator.write(region, values)
+
+    np.testing.assert_array_equal(simulator.read(region), values)
+
+
+def test_dynamic_buffer_allocation_requires_runtime_binding() -> None:
+    program = KernelProgram(
+        "missing-dynamic-allocation",
+        "A3",
+        (CoreProgram(0),),
+        buffers=(
+            BufferSpec(
+                "dynamic",
+                MemoryScope.GM,
+                (AffineInt.variable("element_count"),),
+                "float32",
+            ),
+        ),
+    )
+
+    with pytest.raises(ProgramValidationError, match="missing runtime binding"):
+        FunctionalSimulator(program)
+
+
+def test_symbolic_integer_division_matches_tir_floor_and_truncation() -> None:
+    value = AffineInt.variable("value")
+
+    assert SymbolicInt("floordiv", (value, 3)).evaluate({"value": -5}) == -2
+    assert SymbolicInt("floormod", (value, 3)).evaluate({"value": -5}) == 1
+    assert SymbolicInt("truncdiv", (value, 3)).evaluate({"value": -5}) == -1
+    assert SymbolicInt("truncmod", (value, 3)).evaluate({"value": -5}) == -2
+    with pytest.raises(ProgramValidationError, match="division by zero"):
+        SymbolicInt("floordiv", (value, 0)).evaluate({"value": 1})

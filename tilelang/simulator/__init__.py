@@ -41,6 +41,7 @@ from .program import (
     Lane,
     MemoryScope,
     Pipe,
+    SymbolicInt,
     Task,
 )
 from .scheduler import DiscreteEventScheduler, ScheduleResult
@@ -100,6 +101,7 @@ __all__ = [
     "HazardDiagnostic",
     "HazardReporter",
     "SimulatorHazardWarning",
+    "SymbolicInt",
     "contiguous_strides_bytes",
     "classify_operation",
     "default_timing_profile",

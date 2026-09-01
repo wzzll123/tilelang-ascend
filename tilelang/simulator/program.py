@@ -135,6 +135,114 @@ class AffineInt:
 
 
 @dataclass(frozen=True)
+class SymbolicInt:
+    """Backend-neutral runtime integer expression beyond affine arithmetic."""
+
+    operation: str
+    arguments: Tuple[Any, ...]
+
+    def __post_init__(self) -> None:
+        arities = {
+            "add": 2,
+            "and": 2,
+            "eq": 2,
+            "floordiv": 2,
+            "floormod": 2,
+            "ge": 2,
+            "gt": 2,
+            "le": 2,
+            "lt": 2,
+            "max": 2,
+            "min": 2,
+            "mul": 2,
+            "ne": 2,
+            "not": 1,
+            "or": 2,
+            "select": 3,
+            "sub": 2,
+            "truncdiv": 2,
+            "truncmod": 2,
+        }
+        operation = self.operation.strip().lower()
+        arguments = tuple(self.arguments)
+        if operation not in arities:
+            raise ProgramValidationError(
+                f"unsupported symbolic integer operation: {self.operation!r}"
+            )
+        if len(arguments) != arities[operation]:
+            raise ProgramValidationError(
+                f"symbolic operation {operation!r} expects {arities[operation]} arguments"
+            )
+        if any(not isinstance(value, (Integral, AffineInt, SymbolicInt))
+               for value in arguments):
+            raise ProgramValidationError(
+                "symbolic integer arguments must be integer expressions"
+            )
+        object.__setattr__(self, "operation", operation)
+        object.__setattr__(self, "arguments", arguments)
+
+    def evaluate(self, bindings: Mapping[str, int]) -> int:
+        values = tuple(_evaluate_runtime_int(value, bindings) for value in self.arguments)
+        left = values[0]
+        if self.operation == "add":
+            result = left + values[1]
+        elif self.operation == "sub":
+            result = left - values[1]
+        elif self.operation == "mul":
+            result = left * values[1]
+        elif self.operation == "floordiv":
+            if values[1] == 0:
+                raise ProgramValidationError("symbolic integer division by zero")
+            result = left // values[1]
+        elif self.operation == "floormod":
+            if values[1] == 0:
+                raise ProgramValidationError("symbolic integer division by zero")
+            result = left % values[1]
+        elif self.operation in {"truncdiv", "truncmod"}:
+            divisor = values[1]
+            if divisor == 0:
+                raise ProgramValidationError("symbolic integer division by zero")
+            quotient = (abs(left) // abs(divisor)) * (
+                -1 if (left < 0) != (divisor < 0) else 1
+            )
+            result = quotient if self.operation == "truncdiv" else left - quotient * divisor
+        elif self.operation == "min":
+            result = min(left, values[1])
+        elif self.operation == "max":
+            result = max(left, values[1])
+        elif self.operation == "select":
+            result = values[1] if left else values[2]
+        elif self.operation == "not":
+            result = not left
+        elif self.operation == "and":
+            result = bool(left) and bool(values[1])
+        elif self.operation == "or":
+            result = bool(left) or bool(values[1])
+        else:
+            comparisons = {
+                "eq": lambda: left == values[1],
+                "ne": lambda: left != values[1],
+                "lt": lambda: left < values[1],
+                "le": lambda: left <= values[1],
+                "gt": lambda: left > values[1],
+                "ge": lambda: left >= values[1],
+            }
+            result = comparisons[self.operation]()
+        return int(result)
+
+    def scaled(self, coefficient: int) -> "SymbolicInt":
+        return SymbolicInt("mul", (self, coefficient))
+
+
+def _evaluate_runtime_int(value: Any, bindings: Mapping[str, int]) -> int:
+    if isinstance(value, (AffineInt, SymbolicInt)):
+        return value.evaluate(bindings)
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    raise ProgramValidationError(f"invalid runtime integer expression: {value!r}")
+
+
+@dataclass(frozen=True)
 class BufferSpec:
     """Logical buffer declaration consumed by the simulator memory runtime.
 
@@ -160,6 +268,11 @@ class BufferSpec:
         if not isinstance(self.scope, MemoryScope):
             object.__setattr__(self, "scope", MemoryScope.parse(str(self.scope)))
         shape = tuple(self.shape)
+        if any(not isinstance(extent, (Integral, AffineInt, SymbolicInt))
+               for extent in shape):
+            raise ProgramValidationError(
+                f"buffer {self.name!r} shape must be integer or symbolic"
+            )
         if any(isinstance(extent, Integral) and extent < 0 for extent in shape):
             raise ProgramValidationError(f"buffer {self.name!r} has a negative extent")
         if not self.dtype:
@@ -198,12 +311,17 @@ class BufferRegion:
         if not isinstance(self.scope, MemoryScope):
             object.__setattr__(self, "scope", MemoryScope.parse(str(self.scope)))
         shape = tuple(self.shape)
-        if any(not isinstance(extent, (Integral, AffineInt)) for extent in shape):
-            raise ProgramValidationError("buffer region shape must be integer or affine")
+        if any(not isinstance(extent, (Integral, AffineInt, SymbolicInt))
+               for extent in shape):
+            raise ProgramValidationError(
+                "buffer region shape must be integer or symbolic"
+            )
         if any(isinstance(extent, Integral) and extent < 0 for extent in shape):
             raise ProgramValidationError("buffer region shape must not be negative")
-        if not isinstance(self.byte_offset, (Integral, AffineInt)):
-            raise ProgramValidationError("buffer region byte_offset must be integer or affine")
+        if not isinstance(self.byte_offset, (Integral, AffineInt, SymbolicInt)):
+            raise ProgramValidationError(
+                "buffer region byte_offset must be integer or symbolic"
+            )
         if isinstance(self.byte_offset, Integral) and self.byte_offset < 0:
             raise ProgramValidationError("buffer region byte_offset must not be negative")
         if not self.dtype:
@@ -211,7 +329,8 @@ class BufferRegion:
         if self.strides_bytes is not None:
             strides = tuple(self.strides_bytes)
             if len(strides) != len(shape) or any(
-                not isinstance(stride, (Integral, AffineInt)) for stride in strides
+                not isinstance(stride, (Integral, AffineInt, SymbolicInt))
+                for stride in strides
             ):
                 raise ProgramValidationError(
                     "buffer region strides must match rank and be integer or affine"

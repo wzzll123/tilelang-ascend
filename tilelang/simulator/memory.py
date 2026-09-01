@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 """Byte-addressed A2/A3 functional memory model."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from numbers import Integral
 import re
@@ -16,7 +16,7 @@ from .errors import (
     UninitializedMemoryError,
 )
 from .hazard import HazardDiagnostic, HazardReporter
-from .program import BufferSpec, KernelProgram, MemoryScope
+from .program import AffineInt, BufferSpec, KernelProgram, MemoryScope, SymbolicInt
 
 
 # Values used by the A2/A3 host codegen and memory-planning pass.
@@ -273,16 +273,24 @@ class MemoryRuntime:
 
     @classmethod
     def from_program(
-        cls, program: KernelProgram, *, hazard_check: str = "error"
+        cls,
+        program: KernelProgram,
+        *,
+        hazard_check: str = "error",
+        bindings: Optional[Mapping[str, int]] = None,
     ) -> "MemoryRuntime":
         """Instantiate program buffers according to their sharing scope."""
         runtime = cls((core.core_id for core in program.cores), hazard_check=hazard_check)
         for spec in program.buffers:
+            resolved_spec = replace(
+                spec,
+                shape=tuple(_resolve_extent(value, bindings or {}) for value in spec.shape),
+            )
             if spec.scope in _SHARED_SCOPES:
-                runtime.allocate(spec)
+                runtime.allocate(resolved_spec)
             else:
                 for core_id in runtime.core_ids:
-                    runtime.allocate(spec, core_id=core_id)
+                    runtime.allocate(resolved_spec, core_id=core_id)
         return runtime
 
     def allocate(
@@ -367,6 +375,16 @@ def _concrete_shape(shape: Sequence[object]) -> Tuple[int, ...]:
     if any(extent < 0 for extent in result):
         raise ProgramValidationError("memory allocation/view shape has a negative extent")
     return result
+
+
+def _resolve_extent(value: object, bindings: Mapping[str, int]) -> int:
+    if isinstance(value, (AffineInt, SymbolicInt)):
+        return value.evaluate(bindings)
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    raise ProgramValidationError(
+        f"memory allocation extent is not executable: {value!r}"
+    )
 
 
 def _buffer_size_bytes(spec: BufferSpec) -> int:
