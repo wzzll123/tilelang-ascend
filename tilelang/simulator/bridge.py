@@ -428,6 +428,8 @@ class _TirBridge:
             return self._scalar_metadata(arguments, context, tail=tail_kind is not None)
         if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
+        if short == "cast":
+            return self._cast_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
             return {}
         if len(arguments) < 3:
@@ -534,6 +536,27 @@ class _TirBridge:
         if tail:
             metadata["tail"] = self._tail_details(arguments, context, 3)
         return metadata
+
+    def _cast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            return {}
+        shape = self._vector_shape(arguments, context, tail=False, count_index=3)
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        source = self._access_buffer_region(arguments[1], shape, context)
+        round_mode = self._literal(arguments[2])
+        if destination is None or source is None or not isinstance(round_mode, str):
+            return {}
+        return {
+            "dst": destination,
+            "src": source,
+            "round_mode": round_mode.upper(),
+        }
 
     def _vector_shape(
         self,

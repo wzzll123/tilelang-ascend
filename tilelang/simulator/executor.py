@@ -117,6 +117,9 @@ class FunctionalSimulator:
         if operation in _UNARY_OPERATIONS:
             self._unary(task, operation)
             return
+        if operation == "cast":
+            self._cast(task)
+            return
         if operation in {"set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
                          "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
                          "auto_wait_cross_flag", "barrier_all", "pipe_barrier",
@@ -159,6 +162,21 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         values = self.read(source, task_core_id=task.core_id)
         result = _UNARY_OPERATIONS[operation](values)
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _cast(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        round_mode = task.metadata.get("round_mode")
+        if round_mode == "CAST_NONE":
+            result = values
+        elif round_mode == "CAST_RINT":
+            result = np.rint(values)
+        else:
+            raise UnsupportedSimOpError(
+                f"functional cast does not support round mode {round_mode!r}"
+            )
         self.write(destination, result, task_core_id=task.core_id)
 
     def _resolve(self, region: BufferRegion, task_core_id: int) -> MemoryView:

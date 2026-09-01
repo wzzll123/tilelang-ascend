@@ -229,6 +229,54 @@ def _tail_vector_primfunc(unary_tag="Relu"):
     )
 
 
+def _cast_primfunc(round_mode="CAST_RINT", destination_dtype="int32"):
+    source = tvm.tir.decl_buffer((8,), "float32", name="source", scope="global")
+    output = tvm.tir.decl_buffer(
+        (8,), destination_dtype, name="output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (8,), destination_dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(operation, source_buffer, destination_buffer):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            operation,
+            source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"),
+            5,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            "tl.ascend_cast",
+            ub_output.access_ptr("w"),
+            ub_source.access_ptr("r"),
+            round_mode,
+            5,
+        )),
+        copy("copy_ub_to_gm", ub_output, output),
+    ])
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        body,
+        alloc_buffers=[ub_source, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -408,6 +456,63 @@ def test_real_tir_tail_unary_scalar_and_binary_execute_valid_rectangle() -> None
 def test_tail_operation_tag_must_match_intrinsic_family() -> None:
     with pytest.raises(UnsupportedSimOpError, match="not valid for tail_unary"):
         build_kernel_program(_tail_vector_primfunc(unary_tag="Add"), platform="A2")
+
+
+def test_real_tir_cast_rint_executes_and_converts_destination_dtype() -> None:
+    program = build_kernel_program(_cast_primfunc(), platform="A2")
+    assert [task.operation for task in program.tasks] == [
+        "copy_gm_to_ub",
+        "cast",
+        "copy_ub_to_gm",
+    ]
+    load, cast, store = program.tasks
+    assert cast.metadata["round_mode"] == "CAST_RINT"
+    assert cast.metadata["src"].dtype == "float32"
+    assert cast.metadata["dst"].dtype == "int32"
+    assert cast.dependencies == (load.task_id,)
+    assert store.dependencies == (cast.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    values = np.array([-1.5, -0.5, 0.5, 1.5, 2.6, 99, 99, 99], dtype=np.float32)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (8,), "float32"), values
+    )
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.array([-2, 0, 0, 2, 3], dtype=np.int32),
+    )
+
+
+def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:
+    program = build_kernel_program(_cast_primfunc("CAST_ODD"), platform="A3")
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (8,), "float32"),
+        np.arange(8, dtype=np.float32),
+    )
+
+    with pytest.raises(UnsupportedSimOpError, match="CAST_ODD"):
+        simulator.run()
+
+
+def test_real_tir_cast_none_converts_float32_to_float16() -> None:
+    program = build_kernel_program(
+        _cast_primfunc("CAST_NONE", destination_dtype="float16"), platform="A3"
+    )
+    simulator = FunctionalSimulator(program)
+    values = np.array([0.1, -1.25, 3.14, 1024.5, 0, 99, 99, 99], dtype=np.float32)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (8,), "float32"), values
+    )
+
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(program.tasks[-1].metadata["dst"]),
+        values[:5].astype(np.float16),
+    )
 
 
 def test_real_tir_shmem_call_fails_closed() -> None:
