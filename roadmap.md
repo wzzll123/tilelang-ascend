@@ -115,15 +115,16 @@ bridge 必须 fail-closed：无法确定 operation、scope、shape、offset、la
   → NumPy result + schedule stats
 ```
 
-copy 已支持常量 `tvm_access_ptr` element offset、二维 valid rectangle 和 physical row
-stride。vector add 当前只支持一维、显式 count、三个可解析 buffer pointer。dependency
-当前基于同名重叠 `BufferRegion`，尚未覆盖不同 buffer 名映射到同一 storage-rewrite
-物理地址的 alias。
+copy 已支持常量或 runtime affine `tvm_access_ptr` element offset、二维 valid rectangle
+和 physical row stride；运行时 symbol 通过 `FunctionalSimulator(bindings=...)` 绑定。
+vector add 当前只支持一维、显式 count、三个可解析 buffer pointer。dependency 当前基于
+同名重叠 `BufferRegion`，尚未覆盖不同 buffer 名映射到同一 storage-rewrite 物理地址
+的 alias。
 
-尚未支持 symbolic runtime extent/offset、完整 pad 写入、二维 vector tail、完整
-software pipeline、Cube/MMA/fixpipe，以及后续 P3–P8 operation。JIT adapter 的静态
-schedule 可用，但普通 tensor 调用仍应 fail-closed，直到 bridge 能为实际 kernel 生成
-完整可执行 operands。
+尚未支持非仿射 runtime 表达式、动态 BufferSpec allocation、完整 pad 写入、二维
+vector tail、完整 software pipeline、Cube/MMA/fixpipe，以及后续 P3–P8 operation。
+JIT adapter 的静态 schedule 可用，但普通 tensor 调用仍应 fail-closed，直到 bridge
+能为实际 kernel 生成完整可执行 operands。
 
 ### 开发和验证环境
 
@@ -149,8 +150,8 @@ PYTHONPATH=3rdparty/tvm/python \
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
-1. symbolic copy region 和动态参数绑定；
-2. vector tail/scalar/unary/cast；
+1. vector tail/scalar/unary/cast；
+2. copy pad 写入和非仿射动态表达式；
 3. address-based alias dependency；
 4. reduction；
 5. Cube copy、MMA 和 fixpipe；
@@ -170,7 +171,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~采集 PrimFunc 参数 buffer、`Allocate` 和 `Block.alloc_buffers`。~~
 - [x] ~~未知 operation、未知 memory scope 和 shmem fail-closed。~~
 - [x] ~~构建 macOS CPU-only TVM，并用真实 `tvm.tir.PrimFunc` 验证 bridge。~~
-- [ ] 支持动态标量表达式与运行时 shape/stride/offset 求值。
+- [x] ~~以 backend-neutral `AffineInt` 表示 runtime symbol、常量加减和常量倍乘，并在
+  FunctionalSimulator 中绑定 region shape/offset/stride。~~
+- [ ] 支持非仿射动态表达式和动态 BufferSpec allocation。
 - [ ] 将 `BufferStore`、pointer arithmetic、`address_of`、`tvm_access_ptr` 和切片统一
   降为可执行 `BufferRegion`。
 - [ ] 为最终 pre-codegen TIR 增加稳定的 IR snapshot 测试。
@@ -192,7 +195,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~自动提取真实 TIR 的一维 vector add 操作数，并完成
   `PrimFunc→SimIR→GM→UB→add→UB→GM→NumPy`。~~
 - [ ] 补齐 sub/mul/div/min/max、二维 tail/mask 和 scalar vector forms。
-- [ ] 补齐 GM↔UB copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
+- [x] ~~补齐 GM↔UB copy 的 symbolic affine runtime extent 和动态 element offset。~~
+- [ ] 实现 copy pad 写入语义和非仿射 runtime region。
 - [ ] 实现 fill、duplicate、cast、abs、exp、relu、silu、sqrt、rsqrt、reciprocal、
   sigmoid、sin、cos、ln、pow、clamp 和 axpy。
 - [ ] 实现 broadcast、compare、compare_scalar、select 和 tail/mask 语义。
@@ -287,7 +291,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：71 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：73 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -297,7 +301,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 支持 copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
-2. 补齐 vector 二维 tail/mask、scalar 和 unary forms。
+1. 补齐 vector 二维 tail/mask、scalar 和 unary forms。
+2. 实现 copy pad 写入和非仿射 runtime region。
 3. 将 TIR dependency/hazard 扩展到 storage alias 和物理地址。
 4. 完成 P1 cast、broadcast、compare/select 和基础 reduction。

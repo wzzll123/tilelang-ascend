@@ -10,7 +10,7 @@ import numpy as np
 from .config import SimulatorConfig
 from .errors import ProgramValidationError, UnsupportedSimOpError
 from .memory import MemoryRuntime, MemoryView
-from .program import BufferRegion, KernelProgram, MemoryScope, Task
+from .program import AffineInt, BufferRegion, KernelProgram, MemoryScope, Task
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .sync import FlagBarrierSynchronizationModel
 
@@ -40,6 +40,7 @@ class FunctionalSimulator:
         self,
         program: KernelProgram,
         config: Optional[SimulatorConfig] = None,
+        bindings: Optional[Mapping[str, int]] = None,
     ) -> None:
         self.program = program
         self.config = config or SimulatorConfig(platform=program.platform)
@@ -50,14 +51,15 @@ class FunctionalSimulator:
         self.memory = MemoryRuntime.from_program(
             program, hazard_check=self.config.hazard_check
         )
+        self.bindings = dict(bindings or {})
 
     def write(self, region: BufferRegion, values: Any, *, task_core_id: int = 0) -> None:
         """Initialize a concrete region from an array-like CPU value."""
         view = self._resolve(region, task_core_id)
         array = np.asarray(values, dtype=_numpy_dtype(region.dtype))
-        if array.shape != region.shape:
+        if array.shape != view.shape:
             raise ProgramValidationError(
-                f"input for {region.buffer!r} has shape {array.shape}, expected {region.shape}"
+                f"input for {region.buffer!r} has shape {array.shape}, expected {view.shape}"
             )
         view.allocation.write(view, np.ascontiguousarray(array).tobytes(order="C"))
 
@@ -66,7 +68,7 @@ class FunctionalSimulator:
         view = self._resolve(region, task_core_id)
         payload = view.allocation.read(view)
         return np.frombuffer(payload, dtype=_numpy_dtype(region.dtype)).reshape(
-            region.shape
+            view.shape
         ).copy()
 
     def run(self) -> FunctionalExecutionResult:
@@ -131,11 +133,18 @@ class FunctionalSimulator:
             scope=region.scope,
             core_id=None if region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE} else owner,
         )
+        shape = tuple(_resolve_int(value, self.bindings) for value in region.shape)
+        byte_offset = _resolve_int(region.byte_offset, self.bindings)
+        strides = (
+            None
+            if region.strides_bytes is None
+            else tuple(_resolve_int(value, self.bindings) for value in region.strides_bytes)
+        )
         return allocation.view(
-            byte_offset=region.byte_offset,
-            shape=region.shape,
+            byte_offset=byte_offset,
+            shape=shape,
             dtype=region.dtype,
-            strides_bytes=region.strides_bytes,
+            strides_bytes=strides,
         )
 
 
@@ -158,3 +167,11 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
         raise UnsupportedSimOpError(
             f"NumPy cannot represent simulator dtype {dtype!r}"
         ) from error
+
+
+def _resolve_int(value: Any, bindings: Mapping[str, int]) -> int:
+    if isinstance(value, AffineInt):
+        return value.evaluate(bindings)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    raise ProgramValidationError(f"simulator integer value is not executable: {value!r}")

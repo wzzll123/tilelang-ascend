@@ -9,8 +9,9 @@ hazard checks, storage aliases, and Chrome/Perfetto trace export. The first func
 slice now executes explicit GM-to-UB copies, basic vector binary operations, and UB-to-GM copies
 on one or both AIV lanes, including non-divisible tails. The bridge extracts constant-offset,
 strided GM/UB copy regions and one-dimensional vector-add operands from real TVM TIR, and derives
-basic overlapping-region dependencies. Dynamic operands and the remaining roadmap phases are not
-implemented yet.
+basic overlapping-region dependencies. Runtime affine region extents and offsets are bound by the
+functional simulator. Non-affine operands and the remaining roadmap phases are not implemented
+yet.
 
 ## 1. Purpose
 

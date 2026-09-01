@@ -84,6 +84,57 @@ class MemoryScope(str, Enum):
 
 
 @dataclass(frozen=True)
+class AffineInt:
+    """Backend-neutral affine integer evaluated from runtime symbol bindings."""
+
+    terms: Tuple[Tuple[str, int], ...]
+    constant: int = 0
+
+    def __post_init__(self) -> None:
+        combined = {}
+        for name, coefficient in self.terms:
+            if not name:
+                raise ProgramValidationError("affine symbol name must not be empty")
+            if not isinstance(coefficient, Integral) or isinstance(coefficient, bool):
+                raise ProgramValidationError("affine coefficients must be integers")
+            combined[name] = combined.get(name, 0) + int(coefficient)
+        if not isinstance(self.constant, Integral) or isinstance(self.constant, bool):
+            raise ProgramValidationError("affine constant must be an integer")
+        object.__setattr__(
+            self,
+            "terms",
+            tuple(sorted((name, value) for name, value in combined.items() if value)),
+        )
+        object.__setattr__(self, "constant", int(self.constant))
+
+    @classmethod
+    def variable(cls, name: str) -> "AffineInt":
+        return cls(((name, 1),))
+
+    def evaluate(self, bindings: Mapping[str, int]) -> int:
+        value = self.constant
+        for name, coefficient in self.terms:
+            if name not in bindings:
+                raise ProgramValidationError(f"missing runtime binding for symbol {name!r}")
+            bound = bindings[name]
+            if not isinstance(bound, Integral) or isinstance(bound, bool):
+                raise ProgramValidationError(
+                    f"runtime binding for symbol {name!r} must be an integer"
+                )
+            value += coefficient * int(bound)
+        return value
+
+    def scaled(self, coefficient: int) -> "AffineInt":
+        return AffineInt(
+            tuple((name, value * coefficient) for name, value in self.terms),
+            self.constant * coefficient,
+        )
+
+    def plus(self, other: "AffineInt") -> "AffineInt":
+        return AffineInt(self.terms + other.terms, self.constant + other.constant)
+
+
+@dataclass(frozen=True)
 class BufferSpec:
     """Logical buffer declaration consumed by the simulator memory runtime.
 
@@ -135,10 +186,10 @@ class BufferRegion:
 
     buffer: str
     scope: MemoryScope
-    shape: Tuple[int, ...]
+    shape: Tuple[Any, ...]
     dtype: str
-    byte_offset: int = 0
-    strides_bytes: Optional[Tuple[int, ...]] = None
+    byte_offset: Any = 0
+    strides_bytes: Optional[Tuple[Any, ...]] = None
     core_id: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -147,22 +198,34 @@ class BufferRegion:
         if not isinstance(self.scope, MemoryScope):
             object.__setattr__(self, "scope", MemoryScope.parse(str(self.scope)))
         shape = tuple(self.shape)
-        if any(not isinstance(extent, Integral) or extent < 0 for extent in shape):
-            raise ProgramValidationError("buffer region shape must be concrete and non-negative")
-        if self.byte_offset < 0:
+        if any(not isinstance(extent, (Integral, AffineInt)) for extent in shape):
+            raise ProgramValidationError("buffer region shape must be integer or affine")
+        if any(isinstance(extent, Integral) and extent < 0 for extent in shape):
+            raise ProgramValidationError("buffer region shape must not be negative")
+        if not isinstance(self.byte_offset, (Integral, AffineInt)):
+            raise ProgramValidationError("buffer region byte_offset must be integer or affine")
+        if isinstance(self.byte_offset, Integral) and self.byte_offset < 0:
             raise ProgramValidationError("buffer region byte_offset must not be negative")
         if not self.dtype:
             raise ProgramValidationError("buffer region dtype must not be empty")
         if self.strides_bytes is not None:
             strides = tuple(self.strides_bytes)
-            if len(strides) != len(shape) or any(stride < 0 for stride in strides):
+            if len(strides) != len(shape) or any(
+                not isinstance(stride, (Integral, AffineInt)) for stride in strides
+            ):
                 raise ProgramValidationError(
-                    "buffer region strides must match rank and be non-negative"
+                    "buffer region strides must match rank and be integer or affine"
                 )
+            if any(isinstance(stride, Integral) and stride < 0 for stride in strides):
+                raise ProgramValidationError("buffer region strides must not be negative")
             object.__setattr__(self, "strides_bytes", strides)
         if self.core_id is not None and self.core_id < 0:
             raise ProgramValidationError("buffer region core_id must not be negative")
-        object.__setattr__(self, "shape", tuple(int(extent) for extent in shape))
+        object.__setattr__(
+            self,
+            "shape",
+            tuple(int(extent) if isinstance(extent, Integral) else extent for extent in shape),
+        )
 
 
 @dataclass(frozen=True)

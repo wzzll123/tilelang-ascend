@@ -12,6 +12,7 @@ from .errors import ProgramValidationError, UnsupportedSimOpError
 from .memory import contiguous_strides_bytes, dtype_size_bytes
 from .profile import TimingProfile, default_timing_profile, normalize_platform
 from .program import (
+    AffineInt,
     BufferRegion,
     BufferSpec,
     CoreProgram,
@@ -394,11 +395,12 @@ class _TirBridge:
         if len(arguments) < 3:
             return {}
         if len(arguments) >= 5:
-            valid_rows = self._const_int(arguments[3], context.environment)
-            valid_cols = self._const_int(arguments[4], context.environment)
+            valid_rows = self._affine_int(arguments[3], context.environment)
+            valid_cols = self._affine_int(arguments[4], context.environment)
             if valid_rows is None or valid_cols is None:
                 return {}
-            if valid_rows < 0 or valid_cols < 0:
+            if ((isinstance(valid_rows, int) and valid_rows < 0)
+                    or (isinstance(valid_cols, int) and valid_cols < 0)):
                 raise ProgramValidationError("copy valid rows/columns must not be negative")
             shape = (valid_rows, valid_cols)
             source = self._access_buffer_region(arguments[0], shape, context)
@@ -414,8 +416,8 @@ class _TirBridge:
                 details["physical_rows"] = self._literal(arguments[6])
                 details["physical_cols"] = self._literal(arguments[7])
         else:
-            length = self._const_int(arguments[2], context.environment)
-            if length is None or length < 0:
+            length = self._affine_int(arguments[2], context.environment)
+            if length is None or (isinstance(length, int) and length < 0):
                 return {}
             source = self._access_buffer_region(arguments[0], (length,), context)
             destination = self._access_buffer_region(arguments[1], (length,), context)
@@ -431,8 +433,8 @@ class _TirBridge:
     ) -> Dict[str, Any]:
         if len(arguments) != 4:
             return {}
-        length = self._const_int(arguments[3], context.environment)
-        if length is None or length < 0:
+        length = self._affine_int(arguments[3], context.environment)
+        if length is None or (isinstance(length, int) and length < 0):
             return {}
         shape = (length,)
         destination = self._access_buffer_region(arguments[0], shape, context)
@@ -445,7 +447,7 @@ class _TirBridge:
     def _access_buffer_region(
         self,
         pointer: Any,
-        shape: Tuple[int, ...],
+        shape: Tuple[Any, ...],
         context: _Context,
     ) -> Optional[BufferRegion]:
         data_var = pointer
@@ -454,7 +456,7 @@ class _TirBridge:
             if len(pointer.args) < 4:
                 return None
             data_var = pointer.args[1]
-            offset = self._const_int(pointer.args[2], context.environment)
+            offset = self._affine_int(pointer.args[2], context.environment)
             if offset is None:
                 return None
             element_offset = offset
@@ -469,12 +471,17 @@ class _TirBridge:
             if physical_cols is None:
                 return None
             strides = (physical_cols * itemsize, itemsize)
+        byte_offset = (
+            element_offset * itemsize
+            if isinstance(element_offset, int)
+            else element_offset.scaled(itemsize)
+        )
         return BufferRegion(
             name,
             spec.scope,
             shape,
             spec.dtype,
-            byte_offset=element_offset * itemsize,
+            byte_offset=byte_offset,
             strides_bytes=strides,
             core_id=(
                 None
@@ -564,8 +571,12 @@ class _TirBridge:
         if left.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}:
             if left_owner != right_owner:
                 return False
-        left_start, left_end = _region_bounds(left)
-        right_start, right_end = _region_bounds(right)
+        left_bounds = _region_bounds(left)
+        right_bounds = _region_bounds(right)
+        if left_bounds is None or right_bounds is None:
+            return True
+        left_start, left_end = left_bounds
+        right_start, right_end = right_bounds
         return left_start < right_end and right_start < left_end
 
     def _call_operation(self, call: Any) -> Tuple[str, Tuple[Any, ...]]:
@@ -623,6 +634,44 @@ class _TirBridge:
         literal = getattr(simplified, "value", None)
         return int(literal) if isinstance(literal, (bool, int)) else None
 
+    def _affine_int(
+        self, value: Any, environment: Mapping[Any, int]
+    ) -> Optional[Any]:
+        constant = self._const_int(value, environment)
+        if constant is not None:
+            return constant
+        substituted = value
+        if environment:
+            replacements = {
+                var: self.tir.IntImm(getattr(var, "dtype", "int32"), number)
+                for var, number in environment.items()
+            }
+            substituted = self.tir.stmt_functor.substitute(value, replacements)
+        simplified = self.analyzer.simplify(substituted)
+        if isinstance(simplified, self.tir.Var):
+            return AffineInt.variable(self._var_name(simplified))
+        if isinstance(simplified, (self.tir.Add, self.tir.Sub)):
+            left = self._affine_int(simplified.a, {})
+            right = self._affine_int(simplified.b, {})
+            if left is None or right is None:
+                return None
+            left_expr = left if isinstance(left, AffineInt) else AffineInt((), left)
+            right_expr = right if isinstance(right, AffineInt) else AffineInt((), right)
+            if isinstance(simplified, self.tir.Sub):
+                right_expr = right_expr.scaled(-1)
+            result = left_expr.plus(right_expr)
+            return result.constant if not result.terms else result
+        if isinstance(simplified, self.tir.Mul):
+            left = self._affine_int(simplified.a, {})
+            right = self._affine_int(simplified.b, {})
+            if isinstance(left, int) and isinstance(right, AffineInt):
+                return right.scaled(left)
+            if isinstance(right, int) and isinstance(left, AffineInt):
+                return left.scaled(right)
+            if isinstance(left, int) and isinstance(right, int):
+                return left * right
+        return None
+
     def _extent_or_symbol(self, value: Any, environment: Mapping[Any, int]) -> Any:
         literal = self._const_int(value, environment)
         return literal if literal is not None else str(value)
@@ -643,7 +692,10 @@ class _TirBridge:
         return str(getattr(value, "name", getattr(value, "name_hint", value)))
 
 
-def _region_bounds(region: BufferRegion) -> Tuple[int, int]:
+def _region_bounds(region: BufferRegion) -> Optional[Tuple[int, int]]:
+    values = (region.byte_offset,) + region.shape + (region.strides_bytes or ())
+    if any(isinstance(value, AffineInt) for value in values):
+        return None
     if any(extent == 0 for extent in region.shape):
         return region.byte_offset, region.byte_offset
     itemsize = dtype_size_bytes(region.dtype)

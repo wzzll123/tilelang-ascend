@@ -9,11 +9,13 @@ tvm = pytest.importorskip("tvm")
 from tvm.script import tir as T  # noqa: E402
 
 from tilelang.simulator import (  # noqa: E402
+    AffineInt,
     BufferRegion,
     FunctionalSimulator,
     Lane,
     MemoryScope,
     Pipe,
+    ProgramValidationError,
     UnsupportedSimOpError,
     build_kernel_program,
 )
@@ -119,6 +121,39 @@ def _vector_add_primfunc():
     )
 
 
+def _dynamic_copy_primfunc():
+    source = tvm.tir.decl_buffer((32,), "float32", name="source", scope="global")
+    destination = tvm.tir.decl_buffer(
+        (32,), "float32", name="destination", scope="shared.ub"
+    )
+    valid_cols = tvm.tir.Var("valid_cols", "int32")
+    call = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_gm_to_ub<float32, 32>",
+        source.access_ptr("r", offset=valid_cols + 1, extent=valid_cols),
+        destination.access_ptr("w", offset=valid_cols * 2, extent=valid_cols),
+        32,
+        1,
+        valid_cols,
+        0,
+        1,
+        32,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.Evaluate(call),
+        alloc_buffers=[destination],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, valid_cols],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source},
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -221,6 +256,39 @@ def test_real_tir_vector_add_builds_dependencies_and_executes_end_to_end() -> No
 
     np.testing.assert_array_equal(simulator.read(output_region), x + y)
     assert result.schedule.stats.makespan_cycles == 4
+
+
+def test_symbolic_extent_and_affine_offsets_bind_at_runtime() -> None:
+    program = build_kernel_program(_dynamic_copy_primfunc(), platform="A2")
+    task = program.tasks[0]
+    source = task.metadata["src"]
+    destination = task.metadata["dst"]
+    assert source.shape == destination.shape == (1, AffineInt.variable("valid_cols"))
+    assert source.byte_offset == AffineInt((("valid_cols", 4),), constant=4)
+    assert destination.byte_offset == AffineInt((("valid_cols", 8),))
+
+    simulator = FunctionalSimulator(program, bindings={"valid_cols": 5})
+    whole_source = BufferRegion("source", MemoryScope.GM, (32,), "float32")
+    values = np.arange(32, dtype=np.float32)
+    simulator.write(whole_source, values)
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(destination),
+        values[6:11].reshape(1, 5),
+    )
+
+
+def test_missing_symbolic_binding_fails_before_memory_access() -> None:
+    program = build_kernel_program(_dynamic_copy_primfunc(), platform="A2")
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (32,), "float32"),
+        np.arange(32, dtype=np.float32),
+    )
+
+    with pytest.raises(ProgramValidationError, match="missing runtime binding"):
+        simulator.run()
 
 
 def test_real_tir_shmem_call_fails_closed() -> None:

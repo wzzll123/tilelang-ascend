@@ -33,6 +33,7 @@ from .memory import (
 )
 from .profile import DeviceProfile, TimingProfile, default_timing_profile, get_device_profile
 from .program import (
+    AffineInt,
     BufferRegion,
     BufferSpec,
     CoreProgram,
@@ -55,6 +56,7 @@ from .trace import ChromeTraceExporter, ExecutionRecord
 __all__ = [
     "A2_A3_LOCAL_CAPACITIES",
     "AddressRange",
+    "AffineInt",
     "BufferSpec",
     "BufferRegion",
     "build_kernel_program",
