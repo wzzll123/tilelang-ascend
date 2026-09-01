@@ -7,8 +7,10 @@ plumbing, A2/A3 profiles, SimIR program validation, a first fail-closed TIR brid
 discrete-event scheduling, local/cross flag and barrier modeling, byte-addressed local memory,
 hazard checks, storage aliases, and Chrome/Perfetto trace export. The first functional vertical
 slice now executes explicit GM-to-UB copies, basic vector binary operations, and UB-to-GM copies
-on one or both AIV lanes, including non-divisible tails. Automatic operand extraction from final
-TIR and the remaining roadmap phases are not implemented yet.
+on one or both AIV lanes, including non-divisible tails. The bridge extracts constant-offset,
+strided GM/UB copy regions and one-dimensional vector-add operands from real TVM TIR, and derives
+basic overlapping-region dependencies. Dynamic operands and the remaining roadmap phases are not
+implemented yet.
 
 ## 1. Purpose
 

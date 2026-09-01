@@ -42,7 +42,9 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 - [x] ~~解析 GM↔UB `tvm_access_ptr` 的常量 element offset、二维 valid rectangle、
   physical stride、mask/pad 元数据，并执行 strided copy。~~
 - [x] ~~实现基本二元执行器：add、sub、mul、div、min、max。~~
-- [ ] 自动提取真实 TIR 的 vector add/sub/mul/div/min/max 操作数。
+- [x] ~~自动提取真实 TIR 的一维 vector add 操作数，并完成
+  `PrimFunc→SimIR→GM→UB→add→UB→GM→NumPy`。~~
+- [ ] 补齐 sub/mul/div/min/max、二维 tail/mask 和 scalar vector forms。
 - [ ] 补齐 GM↔UB copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
 - [ ] 实现 fill、duplicate、cast、abs、exp、relu、silu、sqrt、rsqrt、reciprocal、
   sigmoid、sin、cos、ln、pow、clamp 和 axpy。
@@ -107,7 +109,8 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 - [x] ~~实现 local/cross set-wait flag、auto flag、barrier_all 和 pipe_barrier。~~
 - [x] ~~将同步等待输出为显式 trace wait event。~~
 - [x] ~~实现 max cycles、wall timeout 和基础 deadlock 报告。~~
-- [ ] 从最终 TIR 完整恢复 producer/consumer dependency，而不依赖手工 Task dependency。
+- [x] ~~从真实 TIR 的同名重叠 `BufferRegion` 自动生成 RAW、WAR 和 WAW dependency。~~
+- [ ] 将 dependency/hazard 扩展到 storage alias、跨 buffer 物理地址和动态 region。
 - [ ] 执行 software-pipeline prologue、steady state、epilogue、stage/ring index 和 wrap。
 - [ ] 检查 ring-slot reuse、in-flight memory hazard 和 flag 配对协议。
 - [ ] 将 deadlock 报告扩展到 outstanding producer、flag ID、memory region 和 source span。
@@ -137,7 +140,7 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：68 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：71 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -147,8 +150,7 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 下一批工作
 
-1. 自动解析真实 TIR vector add，并打通完整
-   `PrimFunc → SimIR → GM→UB→add→UB→GM → NumPy result`。
-2. 支持 copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
-3. 从 TIR buffer access 建立数据依赖和 memory hazard。
-4. 完成 P1 unary、cast、broadcast、compare/select 和基础 reduction。
+1. 支持 copy 的 symbolic runtime extent、动态 offset 和 pad 写入语义。
+2. 补齐 vector 二维 tail/mask、scalar 和 unary forms。
+3. 将 TIR dependency/hazard 扩展到 storage alias 和物理地址。
+4. 完成 P1 cast、broadcast、compare/select 和基础 reduction。

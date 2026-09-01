@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .errors import ProgramValidationError, UnsupportedSimOpError
-from .memory import dtype_size_bytes
+from .memory import contiguous_strides_bytes, dtype_size_bytes
 from .profile import TimingProfile, default_timing_profile, normalize_platform
 from .program import (
     BufferRegion,
@@ -64,6 +64,8 @@ def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
         if short.startswith(prefix):
             short = short[len(prefix):]
             break
+    if "<" in short:
+        short = short.split("<", 1)[0]
     if short == "tl.arith_progression":
         short = "arith_progression"
 
@@ -162,6 +164,8 @@ class _TirBridge:
         self.buffers: Dict[str, BufferSpec] = {}
         self.buffer_name_by_data_var: Dict[str, str] = {}
         self.storage_scope_by_var: Dict[str, MemoryScope] = {}
+        self.last_writes: list[Tuple[BufferRegion, str]] = []
+        self.last_reads: list[Tuple[BufferRegion, str]] = []
         self.task_counter = 0
         self.kernel_name = "main"
 
@@ -374,8 +378,17 @@ class _TirBridge:
         arguments: Tuple[Any, ...],
         context: _Context,
     ) -> Dict[str, Any]:
-        """Extract operands for copy forms whose pointer/extent contract is unambiguous."""
+        """Extract executable operands for currently supported copy and vector forms."""
         normalized = operation.lower()
+        short = normalized
+        for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+            if short.startswith(prefix):
+                short = short[len(prefix):]
+                break
+        if "<" in short:
+            short = short.split("<", 1)[0]
+        if short in {"add", "sub", "mul", "div", "min", "max"}:
+            return self._binary_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
             return {}
         if len(arguments) < 3:
@@ -411,6 +424,24 @@ class _TirBridge:
             return {}
         return {"src": source, "dst": destination, "copy": details}
 
+    def _binary_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            return {}
+        length = self._const_int(arguments[3], context.environment)
+        if length is None or length < 0:
+            return {}
+        shape = (length,)
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        left = self._access_buffer_region(arguments[1], shape, context)
+        right = self._access_buffer_region(arguments[2], shape, context)
+        if destination is None or left is None or right is None:
+            return {}
+        return {"dst": destination, "lhs": left, "rhs": right}
+
     def _access_buffer_region(
         self,
         pointer: Any,
@@ -445,6 +476,11 @@ class _TirBridge:
             spec.dtype,
             byte_offset=element_offset * itemsize,
             strides_bytes=strides,
+            core_id=(
+                None
+                if spec.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+                else context.core_id
+            ),
         )
 
     def _emit_task(
@@ -460,6 +496,7 @@ class _TirBridge:
             ) from error
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
         self.task_counter += 1
+        dependencies = self._memory_dependencies(metadata, context.core_id)
         task = Task(
             task_id,
             normalized,
@@ -467,9 +504,69 @@ class _TirBridge:
             lane,
             pipe,
             self.timing_profile.estimate_cycles(normalized),
+            dependencies=dependencies,
             metadata=metadata,
         )
         self.tasks[context.core_id].append(task)
+        self._record_memory_accesses(task, context.core_id)
+
+    def _memory_dependencies(
+        self,
+        metadata: Mapping[str, Any],
+        core_id: int,
+    ) -> Tuple[str, ...]:
+        reads = self._operand_regions(metadata, ("src", "lhs", "rhs"))
+        writes = self._operand_regions(metadata, ("dst",))
+        dependencies = {
+            task_id
+            for region in reads
+            for previous, task_id in self.last_writes
+            if self._regions_overlap(region, previous, core_id)
+        }
+        for region in writes:
+            dependencies.update(
+                task_id
+                for previous, task_id in self.last_writes + self.last_reads
+                if self._regions_overlap(region, previous, core_id)
+            )
+        return tuple(sorted(dependencies))
+
+    def _record_memory_accesses(self, task: Task, core_id: int) -> None:
+        reads = self._operand_regions(task.metadata, ("src", "lhs", "rhs"))
+        writes = self._operand_regions(task.metadata, ("dst",))
+        for region in writes:
+            self.last_writes = [
+                entry for entry in self.last_writes
+                if not self._regions_overlap(region, entry[0], core_id)
+            ]
+            self.last_reads = [
+                entry for entry in self.last_reads
+                if not self._regions_overlap(region, entry[0], core_id)
+            ]
+            self.last_writes.append((region, task.task_id))
+        self.last_reads.extend((region, task.task_id) for region in reads)
+
+    @staticmethod
+    def _operand_regions(
+        metadata: Mapping[str, Any], names: Tuple[str, ...]
+    ) -> Tuple[BufferRegion, ...]:
+        return tuple(
+            value for name in names
+            if isinstance((value := metadata.get(name)), BufferRegion)
+        )
+
+    @staticmethod
+    def _regions_overlap(left: BufferRegion, right: BufferRegion, core_id: int) -> bool:
+        if left.buffer != right.buffer or left.scope != right.scope:
+            return False
+        left_owner = left.core_id if left.core_id is not None else core_id
+        right_owner = right.core_id if right.core_id is not None else core_id
+        if left.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}:
+            if left_owner != right_owner:
+                return False
+        left_start, left_end = _region_bounds(left)
+        right_start, right_end = _region_bounds(right)
+        return left_start < right_end and right_start < left_end
 
     def _call_operation(self, call: Any) -> Tuple[str, Tuple[Any, ...]]:
         name = str(call.op.name)
@@ -544,3 +641,14 @@ class _TirBridge:
     @staticmethod
     def _var_name(value: Any) -> str:
         return str(getattr(value, "name", getattr(value, "name_hint", value)))
+
+
+def _region_bounds(region: BufferRegion) -> Tuple[int, int]:
+    if any(extent == 0 for extent in region.shape):
+        return region.byte_offset, region.byte_offset
+    itemsize = dtype_size_bytes(region.dtype)
+    strides = region.strides_bytes or contiguous_strides_bytes(region.shape, itemsize)
+    last_offset = sum(
+        (extent - 1) * stride for extent, stride in zip(region.shape, strides)
+    )
+    return region.byte_offset, region.byte_offset + last_offset + itemsize
