@@ -130,6 +130,42 @@ class BufferSpec:
 
 
 @dataclass(frozen=True)
+class BufferRegion:
+    """Concrete task operand naming a typed, optionally strided buffer region."""
+
+    buffer: str
+    scope: MemoryScope
+    shape: Tuple[int, ...]
+    dtype: str
+    byte_offset: int = 0
+    strides_bytes: Optional[Tuple[int, ...]] = None
+    core_id: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not self.buffer:
+            raise ProgramValidationError("buffer region name must not be empty")
+        if not isinstance(self.scope, MemoryScope):
+            object.__setattr__(self, "scope", MemoryScope.parse(str(self.scope)))
+        shape = tuple(self.shape)
+        if any(not isinstance(extent, Integral) or extent < 0 for extent in shape):
+            raise ProgramValidationError("buffer region shape must be concrete and non-negative")
+        if self.byte_offset < 0:
+            raise ProgramValidationError("buffer region byte_offset must not be negative")
+        if not self.dtype:
+            raise ProgramValidationError("buffer region dtype must not be empty")
+        if self.strides_bytes is not None:
+            strides = tuple(self.strides_bytes)
+            if len(strides) != len(shape) or any(stride < 0 for stride in strides):
+                raise ProgramValidationError(
+                    "buffer region strides must match rank and be non-negative"
+                )
+            object.__setattr__(self, "strides_bytes", strides)
+        if self.core_id is not None and self.core_id < 0:
+            raise ProgramValidationError("buffer region core_id must not be negative")
+        object.__setattr__(self, "shape", tuple(int(extent) for extent in shape))
+
+
+@dataclass(frozen=True)
 class Task:
     """One schedulable simulator operation."""
 

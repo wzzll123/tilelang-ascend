@@ -108,7 +108,7 @@ def test_views_check_physical_extent_for_contiguous_and_strided_layouts() -> Non
     assert allocation.read(view) == b"abcdefgh"
     assert allocation.read(AddressRange(6, 10)) == b"\xff" * 4
     with pytest.raises(MemoryBoundsError, match="reaches byte"):
-        allocation.view(byte_offset=24, shape=(2, 2), dtype="float16")
+        allocation.view(byte_offset=26, shape=(2, 2), dtype="float16")
     with pytest.raises(MemoryBoundsError, match="same rank"):
         allocation.view(shape=(2, 2), strides_bytes=(2,))
 

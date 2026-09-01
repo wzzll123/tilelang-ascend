@@ -3,6 +3,7 @@
 """CPU-only simulator foundations for TileLang Ascend A2/A3."""
 
 from .config import SimulatorConfig
+from .executor import FunctionalExecutionResult, FunctionalSimulator
 from .bridge import build_kernel_program, classify_operation
 from .errors import (
     MemoryAccessError,
@@ -31,7 +32,16 @@ from .memory import (
     dtype_size_bytes,
 )
 from .profile import DeviceProfile, TimingProfile, default_timing_profile, get_device_profile
-from .program import BufferSpec, CoreProgram, KernelProgram, Lane, MemoryScope, Pipe, Task
+from .program import (
+    BufferRegion,
+    BufferSpec,
+    CoreProgram,
+    KernelProgram,
+    Lane,
+    MemoryScope,
+    Pipe,
+    Task,
+)
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .stats import SimulationStats
 from .sync import (
@@ -46,6 +56,7 @@ __all__ = [
     "A2_A3_LOCAL_CAPACITIES",
     "AddressRange",
     "BufferSpec",
+    "BufferRegion",
     "build_kernel_program",
     "ChromeTraceExporter",
     "CoreProgram",
@@ -53,6 +64,8 @@ __all__ = [
     "DiscreteEventScheduler",
     "ExecutionRecord",
     "FlagBarrierSynchronizationModel",
+    "FunctionalExecutionResult",
+    "FunctionalSimulator",
     "KernelProgram",
     "Lane",
     "MemoryAccessError",

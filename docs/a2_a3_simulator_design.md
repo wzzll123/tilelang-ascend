@@ -5,8 +5,10 @@ Status: implementation in progress on `feat/a2-a3-simulator`.
 The initial foundation is implemented: shared final-TIR lowering, `simulator=True` JIT
 plumbing, A2/A3 profiles, SimIR program validation, a first fail-closed TIR bridge, static
 discrete-event scheduling, local/cross flag and barrier modeling, byte-addressed local memory,
-hazard checks, storage aliases, and Chrome/Perfetto trace export. Functional operation
-executors and the remaining roadmap phases are not implemented yet.
+hazard checks, storage aliases, and Chrome/Perfetto trace export. The first functional vertical
+slice now executes explicit GM-to-UB copies, basic vector binary operations, and UB-to-GM copies
+on one or both AIV lanes, including non-divisible tails. Automatic operand extraction from final
+TIR and the remaining roadmap phases are not implemented yet.
 
 ## 1. Purpose
 
