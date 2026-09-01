@@ -154,6 +154,81 @@ def _dynamic_copy_primfunc():
     )
 
 
+def _tail_vector_primfunc(unary_tag="Relu"):
+    x = tvm.tir.decl_buffer((1, 8), "float32", name="x", scope="global")
+    y = tvm.tir.decl_buffer((1, 8), "float32", name="y", scope="global")
+    output = tvm.tir.decl_buffer((1, 8), "float32", name="output", scope="global")
+    ub_x = tvm.tir.decl_buffer((1, 8), "float32", name="ub_x", scope="shared.ub")
+    ub_y = tvm.tir.decl_buffer((1, 8), "float32", name="ub_y", scope="shared.ub")
+    ub_relu = tvm.tir.decl_buffer(
+        (1, 8), "float32", name="ub_relu", scope="shared.ub"
+    )
+    ub_scaled = tvm.tir.decl_buffer(
+        (1, 8), "float32", name="ub_scaled", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (1, 8), "float32", name="ub_output", scope="shared.ub"
+    )
+
+    def copy(operation, source, destination):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            operation,
+            source.access_ptr("r"),
+            destination.access_ptr("w"),
+            8,
+            1,
+            5,
+            0,
+            1,
+            8,
+        ))
+
+    def tail(operation, tag, *arguments):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", operation, tag, *arguments, 1, 5, 8
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("tl::ascend::copy_gm_to_ub<float32, 8>", x, ub_x),
+        copy("tl::ascend::copy_gm_to_ub<float32, 8>", y, ub_y),
+        tail(
+            "tl.ascend_tail_unary",
+            unary_tag,
+            ub_relu.access_ptr("w"),
+            ub_x.access_ptr("r"),
+        ),
+        tail(
+            "tl.ascend_tail_scalar",
+            "Adds",
+            ub_scaled.access_ptr("w"),
+            ub_relu.access_ptr("r"),
+            tvm.tir.FloatImm("float32", 1.5),
+        ),
+        tail(
+            "tl.ascend_tail_binary",
+            "Mul",
+            ub_output.access_ptr("w"),
+            ub_scaled.access_ptr("r"),
+            ub_y.access_ptr("r"),
+        ),
+        copy("tl::ascend::copy_ub_to_gm<float32, 8>", ub_output, output),
+    ])
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        body,
+        alloc_buffers=[ub_x, ub_y, ub_relu, ub_scaled, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [x.data, y.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={x.data: x, y.data: y, output.data: output},
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -289,6 +364,50 @@ def test_missing_symbolic_binding_fails_before_memory_access() -> None:
 
     with pytest.raises(ProgramValidationError, match="missing runtime binding"):
         simulator.run()
+
+
+def test_real_tir_tail_unary_scalar_and_binary_execute_valid_rectangle() -> None:
+    program = build_kernel_program(_tail_vector_primfunc(), platform="A3")
+    assert [task.operation for task in program.tasks] == [
+        "copy_gm_to_ub",
+        "copy_gm_to_ub",
+        "relu",
+        "adds",
+        "mul",
+        "copy_ub_to_gm",
+    ]
+    load_x, load_y, relu, adds, mul, store = program.tasks
+    assert relu.metadata["tail_kind"] == "tail_unary"
+    assert adds.metadata["tail_kind"] == "tail_scalar"
+    assert mul.metadata["tail_kind"] == "tail_binary"
+    assert relu.metadata["tail"] == {
+        "valid_rows": 1,
+        "valid_cols": 5,
+        "physical_cols": 8,
+    }
+    assert relu.dependencies == (load_x.task_id,)
+    assert adds.dependencies == (relu.task_id,)
+    assert set(mul.dependencies) == {load_y.task_id, adds.task_id}
+    assert store.dependencies == (mul.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    x = np.array([[-3, -1, 0, 2, 4, 99, 99, 99]], dtype=np.float32)
+    y = np.array([[2, 3, 4, 5, 6, 99, 99, 99]], dtype=np.float32)
+    simulator.write(BufferRegion("x", MemoryScope.GM, (1, 8), "float32"), x)
+    simulator.write(BufferRegion("y", MemoryScope.GM, (1, 8), "float32"), y)
+
+    simulator.run()
+
+    output = store.metadata["dst"]
+    np.testing.assert_array_equal(
+        simulator.read(output),
+        (np.maximum(x[:, :5], 0) + 1.5) * y[:, :5],
+    )
+
+
+def test_tail_operation_tag_must_match_intrinsic_family() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="not valid for tail_unary"):
+        build_kernel_program(_tail_vector_primfunc(unary_tag="Add"), platform="A2")
 
 
 def test_real_tir_shmem_call_fails_closed() -> None:

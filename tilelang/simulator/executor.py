@@ -24,6 +24,25 @@ _BINARY_OPERATIONS = {
     "min": np.minimum,
 }
 
+_SCALAR_OPERATIONS = {
+    "adds": np.add,
+    "subs": np.subtract,
+    "muls": np.multiply,
+    "divs": np.divide,
+    "maxs": np.maximum,
+    "mins": np.minimum,
+}
+
+_UNARY_OPERATIONS = {
+    "abs": np.abs,
+    "exp": np.exp,
+    "ln": np.log,
+    "reciprocal": lambda value: np.divide(1, value),
+    "relu": lambda value: np.maximum(value, 0),
+    "rsqrt": lambda value: np.divide(1, np.sqrt(value)),
+    "sqrt": np.sqrt,
+}
+
 
 @dataclass(frozen=True)
 class FunctionalExecutionResult:
@@ -89,10 +108,14 @@ class FunctionalSimulator:
         if "copy" in operation or "datacopy" in operation or "data_copy" in operation:
             self._copy(task)
             return
-        if operation.startswith("tail_"):
-            operation = operation[len("tail_"):]
         if operation in _BINARY_OPERATIONS:
             self._binary(task, operation)
+            return
+        if operation in _SCALAR_OPERATIONS:
+            self._binary(task, operation)
+            return
+        if operation in _UNARY_OPERATIONS:
+            self._unary(task, operation)
             return
         if operation in {"set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
                          "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
@@ -123,7 +146,19 @@ class FunctionalSimulator:
             raise ProgramValidationError(
                 f"task {task.task_id!r} requires a BufferRegion 'rhs' or scalar"
             )
-        result = _BINARY_OPERATIONS[operation](left_values, right_values)
+        implementation = (
+            _BINARY_OPERATIONS[operation]
+            if operation in _BINARY_OPERATIONS
+            else _SCALAR_OPERATIONS[operation]
+        )
+        result = implementation(left_values, right_values)
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _unary(self, task: Task, operation: str) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        result = _UNARY_OPERATIONS[operation](values)
         self.write(destination, result, task_core_id=task.core_id)
 
     def _resolve(self, region: BufferRegion, task_core_id: int) -> MemoryView:

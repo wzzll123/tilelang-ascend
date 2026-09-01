@@ -113,3 +113,88 @@ def test_binary_task_requires_explicit_operands() -> None:
 
     with pytest.raises(ProgramValidationError, match="requires BufferRegion"):
         FunctionalSimulator(program).run()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("abs", lambda value: np.abs(value)),
+        ("exp", lambda value: np.exp(value)),
+        ("ln", lambda value: np.log(value)),
+        ("reciprocal", lambda value: 1 / value),
+        ("relu", lambda value: np.maximum(value, 0)),
+        ("rsqrt", lambda value: 1 / np.sqrt(value)),
+        ("sqrt", lambda value: np.sqrt(value)),
+    ],
+)
+def test_unary_vector_operations(operation, expected) -> None:
+    source = _region("ub_source", MemoryScope.UB, 4)
+    destination = _region("ub_destination", MemoryScope.UB, 4)
+    program = KernelProgram(
+        f"vector-{operation}",
+        "A2",
+        (CoreProgram(0, (
+            Task(
+                operation,
+                operation,
+                0,
+                Lane.VECTOR_0,
+                Pipe.VECTOR,
+                1,
+                metadata={"src": source, "dst": destination},
+            ),
+        )),),
+        buffers=(
+            BufferSpec("ub_source", MemoryScope.UB, (4,), "float32"),
+            BufferSpec("ub_destination", MemoryScope.UB, (4,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program)
+    values = np.array([0.25, 1, 4, 9], dtype=np.float32)
+    simulator.write(source, values)
+
+    simulator.run()
+
+    np.testing.assert_allclose(simulator.read(destination), expected(values), rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("adds", lambda value: value + 2),
+        ("subs", lambda value: value - 2),
+        ("muls", lambda value: value * 2),
+        ("divs", lambda value: value / 2),
+        ("maxs", lambda value: np.maximum(value, 2)),
+        ("mins", lambda value: np.minimum(value, 2)),
+    ],
+)
+def test_scalar_vector_operations(operation, expected) -> None:
+    source = _region("ub_source", MemoryScope.UB, 4)
+    destination = _region("ub_destination", MemoryScope.UB, 4)
+    program = KernelProgram(
+        f"vector-{operation}",
+        "A3",
+        (CoreProgram(0, (
+            Task(
+                operation,
+                operation,
+                0,
+                Lane.VECTOR_0,
+                Pipe.VECTOR,
+                1,
+                metadata={"lhs": source, "scalar": 2, "dst": destination},
+            ),
+        )),),
+        buffers=(
+            BufferSpec("ub_source", MemoryScope.UB, (4,), "float32"),
+            BufferSpec("ub_destination", MemoryScope.UB, (4,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program)
+    values = np.array([-1, 1, 3, 5], dtype=np.float32)
+    simulator.write(source, values)
+
+    simulator.run()
+
+    np.testing.assert_array_equal(simulator.read(destination), expected(values))

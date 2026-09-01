@@ -44,6 +44,14 @@ _VECTOR_OPS = frozenset({
     "sum_experiment",
 })
 
+_TAIL_OPERATIONS = {
+    "tail_binary": frozenset({"add", "div", "max", "min", "mul", "sub"}),
+    "tail_scalar": frozenset({"adds", "maxs", "mins", "muls"}),
+    "tail_unary": frozenset({
+        "abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt",
+    }),
+}
+
 
 @dataclass(frozen=True)
 class _Context:
@@ -60,15 +68,7 @@ class _Context:
 def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
     """Map one lowered operation name to the A2/A3 execution resource."""
     normalized = operation.strip().lower()
-    short = normalized
-    for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
-        if short.startswith(prefix):
-            short = short[len(prefix):]
-            break
-    if "<" in short:
-        short = short.split("<", 1)[0]
-    if short == "tl.arith_progression":
-        short = "arith_progression"
+    short = _short_operation(normalized)
 
     if "shmem" in short:
         raise UnsupportedSimOpError(
@@ -105,6 +105,19 @@ def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
     if normalized == "buffer_store":
         return _vector_lane(lane), Pipe.VECTOR, normalized
     raise UnsupportedSimOpError(f"unsupported lowered simulator operation: {operation!r}")
+
+
+def _short_operation(operation: str) -> str:
+    short = operation.strip().lower()
+    for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+        if short.startswith(prefix):
+            short = short[len(prefix):]
+            break
+    if "<" in short:
+        short = short.split("<", 1)[0]
+    if short == "tl.arith_progression":
+        short = "arith_progression"
+    return short
 
 
 def _vector_lane(lane: Lane) -> Lane:
@@ -362,11 +375,36 @@ class _TirBridge:
 
     def _emit_call(self, call: Any, context: _Context) -> None:
         operation, arguments = self._call_operation(call)
+        lowered_operation = operation
+        tail_kind = _short_operation(operation)
+        if tail_kind in _TAIL_OPERATIONS:
+            if not arguments:
+                raise ProgramValidationError(f"{tail_kind} requires an operation tag")
+            operation_tag = self._literal(arguments[0])
+            if not isinstance(operation_tag, str):
+                raise ProgramValidationError(
+                    f"{tail_kind} operation tag must be a string, got {operation_tag!r}"
+                )
+            operation = _short_operation(operation_tag)
+            if operation not in _TAIL_OPERATIONS[tail_kind]:
+                raise UnsupportedSimOpError(
+                    f"operation tag {operation_tag!r} is not valid for {tail_kind}"
+                )
+            arguments = arguments[1:]
         metadata = {
             "arguments": tuple(self._literal(arg) for arg in arguments),
             "tir": str(call),
         }
-        metadata.update(self._functional_metadata(operation, arguments, context))
+        if tail_kind in _TAIL_OPERATIONS:
+            metadata.update({
+                "lowered_operation": lowered_operation,
+                "tail_kind": tail_kind,
+            })
+        else:
+            tail_kind = None
+        metadata.update(
+            self._functional_metadata(operation, arguments, context, tail_kind=tail_kind)
+        )
         metadata.update(self._sync_metadata(operation, arguments))
         span = getattr(call, "span", None)
         if span is not None:
@@ -378,18 +416,18 @@ class _TirBridge:
         operation: str,
         arguments: Tuple[Any, ...],
         context: _Context,
+        *,
+        tail_kind: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Extract executable operands for currently supported copy and vector forms."""
         normalized = operation.lower()
-        short = normalized
-        for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
-            if short.startswith(prefix):
-                short = short[len(prefix):]
-                break
-        if "<" in short:
-            short = short.split("<", 1)[0]
+        short = _short_operation(normalized)
         if short in {"add", "sub", "mul", "div", "min", "max"}:
-            return self._binary_metadata(arguments, context)
+            return self._binary_metadata(arguments, context, tail=tail_kind is not None)
+        if short in {"adds", "subs", "muls", "divs", "mins", "maxs"}:
+            return self._scalar_metadata(arguments, context, tail=tail_kind is not None)
+        if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
+            return self._unary_metadata(arguments, context, tail=tail_kind is not None)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
             return {}
         if len(arguments) < 3:
@@ -430,19 +468,118 @@ class _TirBridge:
         self,
         arguments: Tuple[Any, ...],
         context: _Context,
+        *,
+        tail: bool = False,
     ) -> Dict[str, Any]:
-        if len(arguments) != 4:
+        expected_arguments = 6 if tail else 4
+        if len(arguments) != expected_arguments:
             return {}
-        length = self._affine_int(arguments[3], context.environment)
-        if length is None or (isinstance(length, int) and length < 0):
+        shape = self._vector_shape(arguments, context, tail=tail, count_index=3)
+        if shape is None:
             return {}
-        shape = (length,)
         destination = self._access_buffer_region(arguments[0], shape, context)
         left = self._access_buffer_region(arguments[1], shape, context)
         right = self._access_buffer_region(arguments[2], shape, context)
         if destination is None or left is None or right is None:
             return {}
-        return {"dst": destination, "lhs": left, "rhs": right}
+        metadata: Dict[str, Any] = {"dst": destination, "lhs": left, "rhs": right}
+        if tail:
+            metadata["tail"] = self._tail_details(arguments, context, 3)
+        return metadata
+
+    def _unary_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool = False,
+    ) -> Dict[str, Any]:
+        expected_arguments = 5 if tail else 3
+        if len(arguments) != expected_arguments:
+            return {}
+        shape = self._vector_shape(arguments, context, tail=tail, count_index=2)
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        source = self._access_buffer_region(arguments[1], shape, context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        if tail:
+            metadata["tail"] = self._tail_details(arguments, context, 2)
+        return metadata
+
+    def _scalar_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool = False,
+    ) -> Dict[str, Any]:
+        expected_arguments = 6 if tail else 4
+        if len(arguments) != expected_arguments:
+            return {}
+        shape = self._vector_shape(arguments, context, tail=tail, count_index=3)
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        source = self._access_buffer_region(arguments[1], shape, context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "lhs": source,
+            "scalar": self._literal(arguments[2]),
+        }
+        if tail:
+            metadata["tail"] = self._tail_details(arguments, context, 3)
+        return metadata
+
+    def _vector_shape(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool,
+        count_index: int,
+    ) -> Optional[Tuple[Any, ...]]:
+        indices = (
+            (count_index, count_index + 1, count_index + 2)
+            if tail
+            else (count_index,)
+        )
+        values = tuple(
+            self._affine_int(arguments[index], context.environment) for index in indices
+        )
+        if any(value is None for value in values):
+            return None
+        if any(isinstance(value, int) and value < 0 for value in values):
+            raise ProgramValidationError("vector extents must not be negative")
+        if tail and all(isinstance(value, int) for value in values):
+            _, valid_cols, physical_cols = values
+            if valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "tail valid columns must not exceed physical columns"
+                )
+        return values[:2] if tail else values
+
+    def _tail_details(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        count_index: int,
+    ) -> Dict[str, Any]:
+        return {
+            "valid_rows": self._affine_int(
+                arguments[count_index], context.environment
+            ),
+            "valid_cols": self._affine_int(
+                arguments[count_index + 1], context.environment
+            ),
+            "physical_cols": self._affine_int(
+                arguments[count_index + 2], context.environment
+            ),
+        }
 
     def _access_buffer_region(
         self,
