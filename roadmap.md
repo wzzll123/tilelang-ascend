@@ -102,6 +102,27 @@ bridge 必须 fail-closed：无法确定 operation、scope、shape、offset、la
    断言。
 8. 测试通过后再在本文件划掉对应条目；只完成一种签名时必须保留其它 variants。
 
+### EasyASC 语义复用策略
+
+不要重新发明 EasyASC 已在 A2/CANNSIM/真机验证过的执行语义。EasyASC 当前有效实现是
+`../plugins-community/ops-easyasc-dsl/easyasc/simulator/`；`simulator_v2/` 和 A5-only
+micro/MX/SIMT 路径不属于本项目当前范围。复用边界如下：
+
+| EasyASC 来源 | TileLang 落点 | 复用方式 |
+|---|---|---|
+| `util.py` 的 NZ/ZZ、stride、footprint | `layout.py`、`memory.py` | 移植物理公式和边界 golden |
+| `pipe_cube.py` | `bridge.py`、`executor.py` | 移植 GM/L1/L0/MMAD/fixpipe 功能语义 |
+| `pipe_vec.py`、`cast_rounding.py` | `executor.py` | 移植 mask/repeat/round/saturate 语义 |
+| `hazard.py`、`physical_alias.py` | `hazard.py`、`memory.py` | 移植实际 touched ranges 与 ownership hazard |
+| `trace.py` 和 trace analyzer | `trace.py`、`stats.py` | 对齐事件字段、merge、makespan/utilization |
+| `timing/a2_cycle_model.json` | `profile.py` | 保留来源和 calibration 标记后导入 A2 参数 |
+
+不能照搬 EasyASC bridge：EasyASC 输入是 DSL 已发射 instruction stream，TileLang 的权威
+输入是 final pre-codegen TIR。每个移植语义必须增加独立 physical-coordinate golden，能运行
+EasyASC 时再增加 differential test；禁止只用同一 codec pack 后再 unpack 的自洽测试。
+A3 没有对应的 EasyASC timing profile，功能语义可在 contract 相同时共享，性能参数不能从
+A2 猜测。
+
 ### 当前实现状态与已知限制
 
 当前已经存在一条可执行 vertical slice：
@@ -169,13 +190,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `184 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `185 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 184 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 185 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -275,8 +296,12 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   contract 和 32-byte row alignment。~~
 - [x] ~~实现默认 zN `copy_gm_to_l1` 的 aligned physical tile/base 路径、tail clear
   和真实物理 pack。~~
-- [x] ~~实现 tile-base L1→L0A/L0B 的 zN→zZ/zN→nZ layout conversion、transpose
-  重解释、容量检查和跨级 RAW dependency。~~
+- [x] ~~实现 tile-base L1→L0A/L0B 的 EasyASC A2 ZZ/NZ physical payload、transpose
+  语义、容量检查和跨级 RAW dependency。~~
+- [x] ~~完成第一轮 EasyASC Cube layout audit，修正 L0A fractal 内顺序，并用独立 raw
+  offset golden 区分 L0A ZZ 与 L0B NZ。~~
+- [ ] 对 EasyASC A2 `pipe_cube.py` 的 copy/MMAD/fixpipe 建立逐项 parity/differential
+  测试；contract 不同的项记录差异而不是强行套用。
 - [x] ~~实现 standalone L0C→RowMajor GM 的固定 accumulator layout、valid rectangle、
   dtype conversion、ReLU 和 `unitFlag=0` fixpipe。~~
 - [ ] 实现非对齐/子 tile GM→L1、sliced L1→L0A/L0B 和其它 L0C→GM copy variants。
@@ -365,7 +390,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：184 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：185 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -375,7 +400,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 接入 `gemm_v0`，再实现显式 `mma` 的 init/accumulate/K-tile。
-2. 打通 GM→L1→L0→MMA→L0C→GM 的真实 TIR 端到端 golden。
-3. 扩展 sliced L1→L0 和非 tile-base 的合法路径。
-4. 并行补齐 compare/select mask variants 与 reduction dtype/whole/block variants。
+1. 以 EasyASC `_l1_to_l0`、`_mmad` 为 oracle，实现显式 `mma` init/accumulate/K-tail。
+2. 接入 `gemm_v0`，打通 GM→L1→L0→MMA→L0C→GM 的真实 TIR golden。
+3. 以 EasyASC footprint guards 扩展 sliced L1→L0 和非 tile-base 合法路径。
+4. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。

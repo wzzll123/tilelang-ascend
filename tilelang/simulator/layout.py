@@ -44,7 +44,7 @@ def storage_elements(layout: str, shape: Tuple[int, int], itemsize: int) -> int:
         return _round_up(rows, C0_NUM_PER_FRACTAL) * _round_up(
             cols, C0_NUM_PER_FRACTAL
         )
-    if normalized in {"zn", "zz"}:
+    if normalized in {"zn", "zz", "l0a", "l0b"}:
         return _round_up(rows, C0_NUM_PER_FRACTAL) * _round_up(cols, elements_per_c0)
     if normalized == "nz":
         return _round_up(rows, elements_per_c0) * _round_up(cols, C0_NUM_PER_FRACTAL)
@@ -60,8 +60,9 @@ def physical_index(
 ) -> int:
     """Map one logical matrix coordinate to its physical element offset.
 
-    zN/nZ follow ``tilelang/intrinsics/ascend_layout.py``; zZ and L0C follow
-    the Catlass ``layout::zZ::MakeLayout`` and ``tla::MakeLayoutL0C`` strides.
+    zN/nZ follow ``tilelang/intrinsics/ascend_layout.py``. A2 L0A zZ follows
+    EasyASC's hardware-tested ``encode_nd_to_zz`` representation. L0C follows
+    ``tla::MakeLayoutL0C`` and EasyASC's fixed-C0 NZ decoder.
     """
     rows, cols, elements_per_c0 = _validate(shape, itemsize)
     if not (0 <= row < rows and 0 <= col < cols):
@@ -83,7 +84,7 @@ def physical_index(
             + row % C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL
             + col % C0_NUM_PER_FRACTAL
         )
-    if normalized == "zn":
+    if normalized in {"zn", "l0b"}:
         return (
             row // C0_NUM_PER_FRACTAL * elements_per_fractal
             + col // elements_per_c0
@@ -92,14 +93,13 @@ def physical_index(
             + row % C0_NUM_PER_FRACTAL * elements_per_c0
             + col % elements_per_c0
         )
-    if normalized == "zz":
+    if normalized in {"zz", "l0a"}:
         return (
             row // C0_NUM_PER_FRACTAL
             * _round_up(cols, elements_per_c0)
             * C0_NUM_PER_FRACTAL
-            + col // elements_per_c0 * elements_per_fractal
-            + row % C0_NUM_PER_FRACTAL * elements_per_c0
-            + col % elements_per_c0
+            + col * C0_NUM_PER_FRACTAL
+            + row % C0_NUM_PER_FRACTAL
         )
     if normalized == "nz":
         return (

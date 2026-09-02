@@ -1334,7 +1334,7 @@ def test_zn_gm_to_l1_rejects_non_fractal_physical_tile() -> None:
 
 @pytest.mark.parametrize(
     ("destination_scope", "destination_layout"),
-    [("wmma.matrix_a", "zZ"), ("wmma.matrix_b", "nZ")],
+    [("wmma.matrix_a", "l0a"), ("wmma.matrix_b", "l0b")],
 )
 def test_real_tir_l1_to_l0_copy_converts_physical_layout(
     destination_scope, destination_layout
@@ -1378,7 +1378,7 @@ def test_real_tir_transposed_l1_to_l0b_reinterprets_zn_as_nz() -> None:
     assert task.metadata["copy"] == {
         "layout_transform": True,
         "source_layout": "nZ",
-        "destination_layout": "nZ",
+        "destination_layout": "l0b",
         "source_shape": (32, 16),
         "destination_shape": (32, 16),
         "transpose": True,
@@ -1393,7 +1393,7 @@ def test_real_tir_transposed_l1_to_l0b_reinterprets_zn_as_nz() -> None:
 
     physical = simulator.read(task.metadata["dst"])
     np.testing.assert_array_equal(
-        unpack_matrix(physical, "nZ", (32, 16)), original.T
+        unpack_matrix(physical, "l0b", (32, 16)), original.T
     )
 
 
@@ -1417,7 +1417,7 @@ def test_real_tir_gm_l1_l0a_pipeline_executes_with_raw_dependency() -> None:
     simulator.run()
 
     physical = simulator.read(program.tasks[1].metadata["dst"])
-    np.testing.assert_array_equal(unpack_matrix(physical, "zZ", (32, 32)), logical)
+    np.testing.assert_array_equal(unpack_matrix(physical, "l0a", (32, 32)), logical)
 
 
 def test_real_tir_l0c_to_gm_executes_relu_tail_and_dtype_conversion() -> None:

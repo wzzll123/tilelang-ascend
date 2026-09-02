@@ -831,7 +831,7 @@ class _TirBridge:
                 f"{operation} destination tile must fit its logical L1 source"
             )
         source_layout = "nZ" if transpose else "zN"
-        destination_layout = "zZ" if operation.endswith("l0a") else "nZ"
+        destination_layout = "l0a" if operation.endswith("l0a") else "l0b"
 
         source_name = self._access_ptr_data_name(arguments[0])
         destination_name = self._access_ptr_data_name(arguments[1])
