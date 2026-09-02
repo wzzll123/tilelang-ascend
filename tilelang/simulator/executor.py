@@ -135,6 +135,9 @@ class FunctionalSimulator:
         if operation == "cast":
             self._cast(task)
             return
+        if operation == "fill":
+            self._fill(task)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -211,6 +214,17 @@ class FunctionalSimulator:
             raise UnsupportedSimOpError(
                 f"functional cast does not support round mode {round_mode!r}"
             )
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _fill(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        scalar = task.metadata.get("scalar")
+        if not isinstance(scalar, (bool, int, float)):
+            raise UnsupportedSimOpError(
+                f"functional fill requires a literal scalar, got {scalar!r}"
+            )
+        shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
+        result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
         self.write(destination, result, task_core_id=task.core_id)
 
     def _reduce(self, task: Task, operation: str) -> None:

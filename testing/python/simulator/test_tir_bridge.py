@@ -278,6 +278,40 @@ def _cast_primfunc(round_mode="CAST_RINT", destination_dtype="int32"):
     )
 
 
+def _fill_primfunc(count=5, scalar=-3.5):
+    output = tvm.tir.decl_buffer((8,), "float32", name="output", scope="global")
+    ub_output = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_output", scope="shared.ub"
+    )
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            "tl.ascend_fill",
+            ub_output.access_ptr("w", offset=1),
+            tvm.tir.FloatImm("float32", scalar),
+            count,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            "copy_ub_to_gm",
+            ub_output.access_ptr("r", offset=1),
+            output.access_ptr("w", offset=2),
+            count,
+        )),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_output]
+    )
+    parameters = [output.data]
+    if isinstance(count, tvm.tir.Var):
+        parameters.append(count)
+    return tvm.tir.PrimFunc(
+        parameters,
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -699,6 +733,33 @@ def test_real_tir_cast_rint_executes_and_converts_destination_dtype() -> None:
         simulator.read(store.metadata["dst"]),
         np.array([-2, 0, 0, 2, 3], dtype=np.int32),
     )
+
+
+def test_real_tir_fill_initializes_offset_region_and_builds_dependency() -> None:
+    count = tvm.tir.Var("count", "int32")
+    program = build_kernel_program(_fill_primfunc(count=count), platform="A3")
+    assert [task.operation for task in program.tasks] == [
+        "fill",
+        "copy_ub_to_gm",
+    ]
+    fill, store = program.tasks
+    assert fill.metadata["scalar"] == -3.5
+    assert fill.metadata["dst"].byte_offset == 4
+    assert store.metadata["dst"].byte_offset == 8
+    assert store.dependencies == (fill.task_id,)
+
+    simulator = FunctionalSimulator(program, bindings={"count": 4})
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.full((4,), -3.5, dtype=np.float32),
+    )
+
+
+def test_real_tir_fill_rejects_negative_count() -> None:
+    with pytest.raises(ProgramValidationError, match="fill count must not be negative"):
+        build_kernel_program(_fill_primfunc(count=-1), platform="A2")
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:

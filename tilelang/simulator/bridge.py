@@ -491,6 +491,8 @@ class _TirBridge:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
         if short == "cast":
             return self._cast_metadata(arguments, context)
+        if short == "fill":
+            return self._fill_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -667,6 +669,33 @@ class _TirBridge:
             "src": source,
             "round_mode": round_mode.upper(),
         }
+
+    def _fill_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Native tl.ascend_fill carries a backend template name before the
+        # destination pointer.  Accept the equivalent call_extern form as well
+        # so bridge tests and already-lowered external calls share one contract.
+        argument_offset = 1 if len(arguments) == 4 else 0
+        if len(arguments) - argument_offset != 3:
+            return {}
+        destination_arg, scalar_arg, count_arg = arguments[argument_offset:]
+        count = self._runtime_int(count_arg, context.environment)
+        scalar = self._literal(self.analyzer.simplify(scalar_arg))
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("fill count must not be negative")
+        if not isinstance(scalar, (bool, int, float)):
+            raise UnsupportedSimOpError(
+                f"functional fill requires a literal scalar, got {scalar!r}"
+            )
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        if destination is None:
+            return {}
+        return {"dst": destination, "scalar": scalar}
 
     def _tail_reduce_metadata(
         self,

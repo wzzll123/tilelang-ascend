@@ -128,6 +128,8 @@ PrimFunc 的 `address_map/size_map`；dependency 与 FunctionalSimulator backing
 scope、core 和绝对 byte range 处理跨 buffer 的部分或完全 alias。
 cast 已贯通 `dst/src/round_mode/count` contract；当前仅执行 `CAST_NONE` 和
 `CAST_RINT`，其它 round mode 明确拒绝。
+fill 已贯通原生 intrinsic 和等价 call_extern contract，支持 literal scalar、runtime
+count、pointer offset、poison 初始化和后续访问 dependency。
 tail reduction 已贯通仓库当前验证的 float32、axis 0、clear=true contract，支持
 sum/max/min 对二维 valid rectangle 按列归约；workspace、axis 1 和 accumulate 仍待实现。
 
@@ -150,7 +152,7 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `104 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `107 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -220,8 +222,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 abs、exp、relu、sqrt、rsqrt、reciprocal 和 ln 的基础 NumPy 功能语义。~~
 - [x] ~~按真实 `dst/src/round_mode/count` contract 实现 `CAST_NONE` 与 `CAST_RINT`，
   覆盖 float32→float16 和 float32→int32。~~
-- [ ] 实现 fill、duplicate、silu、sigmoid、sin、cos、pow、clamp 和 axpy；补齐其它 cast
-  round mode，并为已有 unary/cast 补齐 dtype/异常值语义。
+- [x] ~~实现 fill 的 literal scalar、runtime count、pointer offset、poison 初始化和
+  dependency 语义。~~
+- [ ] 实现 duplicate、silu、sigmoid、sin、cos、pow、clamp 和 axpy；补齐其它 cast round
+  mode，并为已有 unary/cast 补齐 dtype/异常值语义。
 - [ ] 实现 broadcast、compare、compare_scalar、select 和 tail/mask 语义。
 - [x] ~~实现真实 `tail_reduce` 的 float32 axis-0 clear=true sum/max/min，并覆盖
   valid rectangle、dependency 和非法 dim/clear contract。~~
@@ -317,7 +321,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：104 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：107 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -327,7 +331,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 补齐 vector 二维 tail/mask、scalar 和 unary forms。
-2. 实现 copy pad 写入和非仿射 runtime region。
-3. 将 TIR dependency/hazard 扩展到 storage alias 和物理地址。
-4. 完成 P1 cast、broadcast、compare/select 和基础 reduction。
+1. 实现 duplicate、剩余 unary/scalar operation 和 cast round mode。
+2. 补齐 vector 二维 mask、broadcast、compare/select。
+3. 扩展普通 reduction、axis 1 和 accumulate/workspace。
+4. 开始 Cube copy vertical slice，再进入 `gemm_v0`。

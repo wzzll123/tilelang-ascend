@@ -202,6 +202,35 @@ def test_scalar_vector_operations(operation, expected) -> None:
     np.testing.assert_array_equal(simulator.read(destination), expected(values))
 
 
+def test_fill_initializes_poisoned_ub_memory() -> None:
+    destination = _region("ub_destination", MemoryScope.UB, 5)
+    program = KernelProgram(
+        "fill",
+        "A3",
+        (CoreProgram(0, (
+            Task(
+                "fill",
+                "fill",
+                0,
+                Lane.VECTOR_0,
+                Pipe.VECTOR,
+                1,
+                metadata={"dst": destination, "scalar": -2.5},
+            ),
+        )),),
+        buffers=(
+            BufferSpec("ub_destination", MemoryScope.UB, (5,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program)
+
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(destination), np.full((5,), -2.5, dtype=np.float32)
+    )
+
+
 def test_dynamic_buffer_allocation_resolves_symbolic_shape() -> None:
     dynamic_extent = SymbolicInt(
         "max", (AffineInt.variable("element_count"), 4)
