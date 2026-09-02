@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 36%**。checkbox 裸计数约 53%，但未完成的完整
+- **完整 roadmap：约 38%**。checkbox 裸计数约 54%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 66%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 68%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -192,8 +192,9 @@ rectangle、float32→float16 转换和 ReLU；与 MMA 配对的非零 `unitFlag
 task，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot capacity legality check；功能
 结果准确，但 trace/timing 尚未展开内部 pipeline。
 当 `gemm_v0` 有多个 K/N step 时，bridge 会展开每步 L0A/L0B MTE1 load 和 MATRIX stage，
-模拟双 slot ping-pong reuse dependency 与 copy/compute overlap；目前内部 stage 为 trace-only，
-最后一个 MATRIX stage 统一提交 NumPy 结果，尚未物化内部 L0 payload。
+模拟双 slot ping-pong reuse dependency 与 copy/compute overlap；内部 stage 已物化真实
+L0A/L0B payload，逐 K tile 累加并按 N tile 写入对应 L0C column band。内部 load 的 L1
+dependency footprint 仍覆盖完整输入 tile，硬件 flag/timing 也尚未细化。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
@@ -214,13 +215,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `205 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `209 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 205 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 209 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -338,7 +339,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   init/accumulate 和无 BiSheng 端到端路径。~~
 - [x] ~~将多 step `gemm_v0` 展开为 MTE1/MATRIX trace stages，建模双 slot reuse dependency
   和 copy/compute overlap，并保持单次功能结果提交。~~
-- [ ] 为 `gemm_v0` 内部 stages 物化 L0 payload、精确 source window、硬件同步和 timing。
+- [x] ~~为 `gemm_v0` 内部 stages 物化双 slot L0A/L0B payload，执行 K-tile accumulate 和
+  N-tile L0C column-band 写入；覆盖四种 transpose 组合。~~
+- [ ] 为 `gemm_v0` 内部 stages 建立精确 L1 source regions、硬件同步和 timing。
 - [x] ~~实现显式 half→float32 `mma`，支持 K-tail、init 和 accumulate。~~
 - [x] ~~实现多 MMA task 对同一 L0C 的 K 分块累加与 RAW dependency golden。~~
 - [ ] 实现 partial `n_actual` 和其它 MMA dtype。
@@ -425,7 +428,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：205 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：209 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -435,7 +438,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 为已展开的 `gemm_v0` stages 物化 L0A/L0B payload 和精确 source windows。
+1. 为已展开的 `gemm_v0` stages 建立精确 L1 source regions 和硬件 event dependency。
 2. 实现 partial `n_actual` 与 unitFlag/fixpipe 配对协议。
 3. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
 4. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。

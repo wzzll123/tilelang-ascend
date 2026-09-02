@@ -296,20 +296,25 @@ def _mma_chain_primfunc():
 
 def _gemm_v0_primfunc(
     transpose_a=False, transpose_b=False, init=True, n_actual=None,
-    k_l0_size=16, inner=13,
+    k_l0_size=16, inner=13, rows=16, cols=16,
 ):
-    rows, cols = 16, 16
     shape_a = (inner, rows) if transpose_a else (rows, inner)
     shape_b = (cols, inner) if transpose_b else (inner, cols)
-    input_elements = 16 * ((inner + 15) // 16 * 16)
+    a_elements = ((shape_a[0] + 15) // 16 * 16) * (
+        (shape_a[1] + 15) // 16 * 16
+    )
+    b_elements = ((shape_b[0] + 15) // 16 * 16) * (
+        (shape_b[1] + 15) // 16 * 16
+    )
+    c_elements = ((rows + 15) // 16 * 16) * ((cols + 15) // 16 * 16)
     l1a = tvm.tir.decl_buffer(
-        (input_elements,), "float16", name="l1a", scope="shared.l1"
+        (a_elements,), "float16", name="l1a", scope="shared.l1"
     )
     l1b = tvm.tir.decl_buffer(
-        (input_elements,), "float16", name="l1b", scope="shared.l1"
+        (b_elements,), "float16", name="l1b", scope="shared.l1"
     )
     l0c = tvm.tir.decl_buffer(
-        (256,), "float32", name="l0c", scope="wmma.accumulator"
+        (c_elements,), "float32", name="l0c", scope="wmma.accumulator"
     )
     call = tvm.tir.call_extern(
         "handle",
@@ -1885,15 +1890,25 @@ def test_gemm_v0_rejects_internal_l0_tile_overflow() -> None:
         build_kernel_program(prim_func, platform="A2")
 
 
-def test_gemm_v0_expands_multi_k_steps_for_trace_and_executes_once() -> None:
-    prim_func, shape_a, shape_b = _gemm_v0_primfunc(inner=48, k_l0_size=16)
+@pytest.mark.parametrize(
+    "transpose_a,transpose_b",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_gemm_v0_expands_multi_k_steps_with_real_l0_payloads(
+    transpose_a, transpose_b
+) -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(
+        inner=48,
+        k_l0_size=16,
+        transpose_a=transpose_a,
+        transpose_b=transpose_b,
+    )
     program = build_kernel_program(prim_func, platform="A3")
     assert [task.operation for task in program.tasks] == [
         "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
         "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
-        "copy_l1_to_l0a", "copy_l1_to_l0b", "gemm_v0",
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
     ]
-    assert all(task.metadata.get("trace_only") for task in program.tasks[:-1])
     final = program.tasks[-1]
     assert program.tasks[2].task_id in program.tasks[6].dependencies
     simulator = FunctionalSimulator(program)
@@ -1901,8 +1916,8 @@ def test_gemm_v0_expands_multi_k_steps_for_trace_and_executes_once() -> None:
     right = (
         np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 100
     ) / 128
-    simulator.write(final.metadata["lhs"], pack_matrix(left, "zn"))
-    simulator.write(final.metadata["rhs"], pack_matrix(right, "zn"))
+    simulator.write(program.tasks[0].metadata["src"], pack_matrix(left, "zn"))
+    simulator.write(program.tasks[1].metadata["src"], pack_matrix(right, "zn"))
     result = simulator.run()
     records = {record.task_id: record for record in result.schedule.records}
     assert records[program.tasks[2].task_id].start_cycle == records[
@@ -1910,6 +1925,38 @@ def test_gemm_v0_expands_multi_k_steps_for_trace_and_executes_once() -> None:
     ].start_cycle
     np.testing.assert_allclose(
         unpack_matrix(simulator.read(final.metadata["dst"]), "l0c", (16, 16)),
+        (left.T if transpose_a else left).astype(np.float32)
+        @ (right.T if transpose_b else right).astype(np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_gemm_v0_expands_n_tiles_into_l0c_column_bands() -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(
+        rows=16, cols=256, inner=16, k_l0_size=128
+    )
+    program = build_kernel_program(prim_func, platform="A2")
+    assert [task.metadata["gemm_stage"]["n_index"] for task in program.tasks] == [
+        0, 0, 0, 1, 1, 1,
+    ]
+    simulator = FunctionalSimulator(program)
+    left = np.arange(np.prod(shape_a), dtype=np.float16).reshape(shape_a) / 64
+    right = (
+        np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 100
+    ) / 128
+    simulator.write(program.tasks[0].metadata["src"], pack_matrix(left, "zn"))
+    simulator.write(program.tasks[1].metadata["src"], pack_matrix(right, "zn"))
+    simulator.run()
+    output = BufferRegion(
+        program.tasks[2].metadata["dst"].buffer,
+        MemoryScope.L0C,
+        (16 * 256,),
+        "float32",
+        core_id=program.tasks[2].core_id,
+    )
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(output), "l0c", (16, 256)),
         left.astype(np.float32) @ right.astype(np.float32),
         rtol=1e-6,
         atol=1e-6,

@@ -480,50 +480,112 @@ class _TirBridge:
         self._emit_task(operation, context, metadata=metadata)
 
     def _emit_gemm_v0_trace_tasks(
-        self, operation: str, context: _Context, metadata: Mapping[str, Any]
+        self, _operation: str, context: _Context, metadata: Mapping[str, Any]
     ) -> None:
         details = metadata["gemm"]
         step_count = details["step_count"]
         k_split = (details["inner"] + details["k_l0_size"] - 1) // details["k_l0_size"]
-        previous_mma = None
-        last_mma_by_slot = {}
+        input_dtype = metadata["lhs"].dtype
+        accumulator_dtype = metadata["dst"].dtype
+        input_bytes = dtype_size_bytes(input_dtype)
+        accumulator_bytes = dtype_size_bytes(accumulator_dtype)
+        max_k = min(details["inner"], details["k_l0_size"])
+        prefix = f"__sim_gemm_{context.core_id}_{self.task_counter}"
+        l0a_names = [f"{prefix}_l0a_{slot}" for slot in range(2)]
+        l0b_names = [f"{prefix}_l0b_{slot}" for slot in range(2)]
+        for name in l0a_names:
+            self.buffers[name] = BufferSpec(
+                name, MemoryScope.L0A,
+                (storage_elements("l0a", (details["rows"], max_k), input_bytes),),
+                input_dtype,
+            )
+        for name in l0b_names:
+            self.buffers[name] = BufferSpec(
+                name, MemoryScope.L0B,
+                (storage_elements("l0b", (max_k, details["n_tile"]), input_bytes),),
+                input_dtype,
+            )
         for step in range(step_count):
             n_index, k_index = divmod(step, k_split)
             slot = step % 2
-            stage = {"trace_only": True, "gemm_stage": {
+            k_start = k_index * details["k_l0_size"]
+            n_start = n_index * details["n_tile"]
+            k_size = min(details["k_l0_size"], details["inner"] - k_start)
+            n_size = details["n_tile"]
+            stage = {"gemm_stage": {
                 "step": step,
                 "n_index": n_index,
                 "k_index": k_index,
                 "ping_pong_slot": slot,
             }}
-            slot_dependency = (
-                (last_mma_by_slot[slot].task_id,)
-                if slot in last_mma_by_slot else ()
+            shape_a_source = (k_size, details["rows"]) if details["transpose_a"] else (
+                details["rows"], k_size
+            )
+            origin_a = (k_start, 0) if details["transpose_a"] else (0, k_start)
+            shape_b_source = (n_size, k_size) if details["transpose_b"] else (
+                k_size, n_size
+            )
+            origin_b = (n_start, k_start) if details["transpose_b"] else (
+                k_start, n_start
+            )
+            l0a = BufferRegion(
+                l0a_names[slot], MemoryScope.L0A,
+                (storage_elements("l0a", (details["rows"], k_size), input_bytes),),
+                input_dtype, core_id=context.core_id,
+            )
+            l0b = BufferRegion(
+                l0b_names[slot], MemoryScope.L0B,
+                (storage_elements("l0b", (k_size, n_size), input_bytes),),
+                input_dtype, core_id=context.core_id,
             )
             load_a = self._emit_task(
                 "copy_l1_to_l0a", context,
-                metadata={**stage, "src": metadata["lhs"]},
-                extra_dependencies=slot_dependency,
+                metadata={**stage, "src": metadata["lhs"], "dst": l0a, "copy": {
+                    "layout_transform": True,
+                    "source_layout": "zn",
+                    "destination_layout": "l0a",
+                    "source_shape": details["shape_a"],
+                    "source_origin": origin_a,
+                    "source_window_shape": shape_a_source,
+                    "destination_shape": (details["rows"], k_size),
+                    "transpose_after_slice": details["transpose_a"],
+                }},
             )
             load_b = self._emit_task(
                 "copy_l1_to_l0b", context,
-                metadata={**stage, "src": metadata["rhs"]},
-                extra_dependencies=slot_dependency,
+                metadata={**stage, "src": metadata["rhs"], "dst": l0b, "copy": {
+                    "layout_transform": True,
+                    "source_layout": "zn",
+                    "destination_layout": "l0b",
+                    "source_shape": details["shape_b"],
+                    "source_origin": origin_b,
+                    "source_window_shape": shape_b_source,
+                    "destination_shape": (k_size, n_size),
+                    "transpose_after_slice": details["transpose_b"],
+                }},
             )
-            dependencies = [load_a.task_id, load_b.task_id]
-            if previous_mma is not None:
-                dependencies.append(previous_mma.task_id)
-            if step + 1 == step_count:
-                mma_metadata = dict(metadata)
-            else:
-                mma_metadata = dict(stage)
-            previous_mma = self._emit_task(
-                operation if step + 1 == step_count else "mma",
+            c_offset = metadata["dst"].byte_offset + (
+                n_start * ((details["rows"] + 15) // 16 * 16) * accumulator_bytes
+            )
+            l0c = replace(
+                metadata["dst"],
+                shape=(storage_elements("l0c", (details["rows"], n_size), accumulator_bytes),),
+                byte_offset=c_offset,
+                strides_bytes=None,
+            )
+            initialize = details["init"] and k_index == 0
+            mma_metadata = {**stage, "lhs": l0a, "rhs": l0b, "dst": l0c, "mma": {
+                "rows": details["rows"], "cols": n_size, "inner": k_size,
+                "init": initialize, "n_actual": n_size, "unit_flag": 0,
+            }}
+            if not initialize:
+                mma_metadata["accumulator"] = l0c
+            self._emit_task(
+                "mma",
                 context,
                 metadata=mma_metadata,
-                extra_dependencies=tuple(dependencies),
+                extra_dependencies=(load_a.task_id, load_b.task_id),
             )
-            last_mma_by_slot[slot] = previous_mma
 
     def _functional_metadata(
         self,

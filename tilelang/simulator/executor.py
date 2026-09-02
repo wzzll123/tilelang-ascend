@@ -245,10 +245,15 @@ class FunctionalSimulator:
                     values, copy_details["source_layout"], source_shape
                 )
                 source_row, source_col = copy_details.get("source_origin", (0, 0))
+                window_shape = tuple(
+                    copy_details.get("source_window_shape", destination_shape)
+                )
                 tile = logical[
-                    source_row:source_row + destination_shape[0],
-                    source_col:source_col + destination_shape[1],
+                    source_row:source_row + window_shape[0],
+                    source_col:source_col + window_shape[1],
                 ]
+                if copy_details.get("transpose_after_slice") is True:
+                    tile = tile.T
             if copy_details.get("relu") is True:
                 tile = np.maximum(tile, 0)
             values = pack_matrix(
