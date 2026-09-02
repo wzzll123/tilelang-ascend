@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 39%**。checkbox 裸计数约 54%，但未完成的完整
+- **完整 roadmap：约 40%**。checkbox 裸计数约 54%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 69%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 70%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -188,13 +188,14 @@ rectangle、float32→float16 转换和 ReLU；与 MMA 配对的非零 `unitFlag
 整条功能模拟路径不调用 BiSheng。partial `n_actual`、bias、非零 `unitFlag` 和其它 dtype
 仍 fail-closed。
 高层 half→float32 `gemm_v0` 也可直接执行，支持 A/B transpose、K-tail、init/accumulate，
-并已打通 GM→L1→gemm_v0→L0C→GM；当前把其内部 L1→L0、K/N 分块和同步视为一个 MATRIX
-task，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot capacity legality check；功能
-结果准确，但 trace/timing 尚未展开内部 pipeline。
-当 `gemm_v0` 有多个 K/N step 时，bridge 会展开每步 L0A/L0B MTE1 load 和 MATRIX stage，
+并已打通 GM→L1→gemm_v0→L0C→GM，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot
+capacity legality check。当 `gemm_v0` 有多个 K/N step 时，bridge 会展开每步 L0A/L0B
+MTE1 load 和 MATRIX stage，
 模拟双 slot ping-pong reuse dependency 与 copy/compute overlap；内部 stage 已物化真实
 L0A/L0B payload，逐 K tile 累加并按 N tile 写入对应 L0C column band。内部 load 的 L1
-窗口已拆为精确 zN C0 source regions；硬件 flag/timing 尚未细化。
+窗口已拆为精确 zN C0 source regions。各 stage 已有独立的 `gemm_v0.load_a/load_b/mma`
+timing key、transfer bytes/math ops 和 MTE1↔M event annotation；周期仍使用可替换的
+`uncalibrated-unit-cost` profile，annotation 尚不是显式硬件 flag task。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
@@ -342,7 +343,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~为 `gemm_v0` 内部 stages 物化双 slot L0A/L0B payload，执行 K-tile accumulate 和
   N-tile L0C column-band 写入；覆盖四种 transpose 组合。~~
 - [x] ~~为 `gemm_v0` 内部 K/N stages 建立精确 zN C0 source regions 和 offset golden。~~
-- [ ] 为 `gemm_v0` 内部 stages 建模硬件同步和 timing。
+- [x] ~~为 `gemm_v0` 内部 stages 提供独立 timing key、工作量 metadata 和 MTE1↔M
+  event annotation，并保持 calibration 状态进入 trace。~~
+- [ ] 校准 `gemm_v0` 的 A2/A3 stage timing；按实际 lowering contract 将 event annotation
+  升级为显式硬件 flag/wait task。
 - [x] ~~实现显式 half→float32 `mma`，支持 K-tail、init 和 accumulate。~~
 - [x] ~~实现多 MMA task 对同一 L0C 的 K 分块累加与 RAW dependency golden。~~
 - [ ] 实现 partial `n_actual` 和其它 MMA dtype。
@@ -439,7 +443,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 为已展开的 `gemm_v0` stages 建立硬件 event dependency 和 timing keys。
-2. 实现 partial `n_actual` 与 unitFlag/fixpipe 配对协议。
-3. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
-4. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
+1. 实现 partial `n_actual` 与 unitFlag/fixpipe 配对协议。
+2. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
+3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
+4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

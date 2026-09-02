@@ -572,35 +572,52 @@ class _TirBridge:
                 a_source_metadata["src_regions"] = a_regions
             if len(b_regions) > 1:
                 b_source_metadata["src_regions"] = b_regions
+            reuse_event = {"wait_event": "M_MTE1"} if step >= 2 else {}
             load_a = self._emit_task(
                 "copy_l1_to_l0a", context,
-                metadata={**stage, **a_source_metadata, "dst": l0a, "copy": {
-                    "layout_transform": True,
-                    "source_layout": "zn",
-                    "destination_layout": "l0a",
-                    "source_shape": details["shape_a"],
-                    "source_origin": origin_a,
-                    "source_window_shape": shape_a_source,
-                    "source_window_direct": len(a_regions) == 1,
-                    "source_region_axis": 1,
-                    "destination_shape": (details["rows"], k_size),
-                    "transpose_after_slice": details["transpose_a"],
-                }},
+                metadata={
+                    **stage,
+                    "timing_key": "gemm_v0.load_a",
+                    "transfer_bytes": details["rows"] * k_size * input_bytes,
+                    **reuse_event,
+                    **a_source_metadata,
+                    "dst": l0a,
+                    "copy": {
+                        "layout_transform": True,
+                        "source_layout": "zn",
+                        "destination_layout": "l0a",
+                        "source_shape": details["shape_a"],
+                        "source_origin": origin_a,
+                        "source_window_shape": shape_a_source,
+                        "source_window_direct": len(a_regions) == 1,
+                        "source_region_axis": 1,
+                        "destination_shape": (details["rows"], k_size),
+                        "transpose_after_slice": details["transpose_a"],
+                    },
+                },
             )
             load_b = self._emit_task(
                 "copy_l1_to_l0b", context,
-                metadata={**stage, **b_source_metadata, "dst": l0b, "copy": {
-                    "layout_transform": True,
-                    "source_layout": "zn",
-                    "destination_layout": "l0b",
-                    "source_shape": details["shape_b"],
-                    "source_origin": origin_b,
-                    "source_window_shape": shape_b_source,
-                    "source_window_direct": len(b_regions) == 1,
-                    "source_region_axis": 1,
-                    "destination_shape": (k_size, n_size),
-                    "transpose_after_slice": details["transpose_b"],
-                }},
+                metadata={
+                    **stage,
+                    "timing_key": "gemm_v0.load_b",
+                    "transfer_bytes": k_size * n_size * input_bytes,
+                    **reuse_event,
+                    **b_source_metadata,
+                    "dst": l0b,
+                    "copy": {
+                        "layout_transform": True,
+                        "source_layout": "zn",
+                        "destination_layout": "l0b",
+                        "source_shape": details["shape_b"],
+                        "source_origin": origin_b,
+                        "source_window_shape": shape_b_source,
+                        "source_window_direct": len(b_regions) == 1,
+                        "source_region_axis": 1,
+                        "destination_shape": (k_size, n_size),
+                        "transpose_after_slice": details["transpose_b"],
+                    },
+                },
             )
             c_offset = metadata["dst"].byte_offset + (
                 n_start * ((details["rows"] + 15) // 16 * 16) * accumulator_bytes
@@ -612,10 +629,24 @@ class _TirBridge:
                 strides_bytes=None,
             )
             initialize = details["init"] and k_index == 0
-            mma_metadata = {**stage, "lhs": l0a, "rhs": l0b, "dst": l0c, "mma": {
-                "rows": details["rows"], "cols": n_size, "inner": k_size,
-                "init": initialize, "n_actual": n_size, "unit_flag": 0,
-            }}
+            mma_metadata = {
+                **stage,
+                "timing_key": "gemm_v0.mma",
+                "math_ops": 2 * details["rows"] * n_size * k_size,
+                "wait_event": "MTE1_M",
+                "set_event": "M_MTE1",
+                "lhs": l0a,
+                "rhs": l0b,
+                "dst": l0c,
+                "mma": {
+                    "rows": details["rows"],
+                    "cols": n_size,
+                    "inner": k_size,
+                    "init": initialize,
+                    "n_actual": n_size,
+                    "unit_flag": 0,
+                },
+            }
             if not initialize:
                 mma_metadata["accumulator"] = l0c
             self._emit_task(
@@ -2534,8 +2565,12 @@ class _TirBridge:
             ) from error
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
         self.task_counter += 1
+        task_metadata = dict(metadata)
+        timing_key = str(task_metadata.get("timing_key", normalized))
+        task_metadata.setdefault("timing_key", timing_key)
+        task_metadata.setdefault("timing_calibration", self.timing_profile.calibration)
         dependencies = tuple(sorted(set(
-            self._memory_dependencies(metadata, context.core_id)
+            self._memory_dependencies(task_metadata, context.core_id)
         ).union(extra_dependencies)))
         task = Task(
             task_id,
@@ -2543,9 +2578,9 @@ class _TirBridge:
             context.core_id,
             lane,
             pipe,
-            self.timing_profile.estimate_cycles(normalized),
+            self.timing_profile.estimate_cycles(timing_key),
             dependencies=dependencies,
-            metadata=metadata,
+            metadata=task_metadata,
         )
         self.tasks[context.core_id].append(task)
         self._record_memory_accesses(task, context.core_id)

@@ -17,6 +17,7 @@ from tilelang.simulator import (  # noqa: E402
     Pipe,
     ProgramValidationError,
     SymbolicInt,
+    TimingProfile,
     UnsupportedSimOpError,
     build_kernel_program,
 )
@@ -1903,12 +1904,36 @@ def test_gemm_v0_expands_multi_k_steps_with_real_l0_payloads(
         transpose_a=transpose_a,
         transpose_b=transpose_b,
     )
-    program = build_kernel_program(prim_func, platform="A3")
+    timing = TimingProfile(
+        platform="A3",
+        operation_cycles={
+            "gemm_v0.load_a": 3,
+            "gemm_v0.load_b": 5,
+            "gemm_v0.mma": 11,
+        },
+    )
+    program = build_kernel_program(
+        prim_func, platform="A3", timing_profile=timing
+    )
     assert [task.operation for task in program.tasks] == [
         "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
         "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
         "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
     ]
+    assert [task.duration_cycles for task in program.tasks[:3]] == [3, 5, 11]
+    assert [task.metadata["timing_key"] for task in program.tasks[:3]] == [
+        "gemm_v0.load_a", "gemm_v0.load_b", "gemm_v0.mma",
+    ]
+    assert all(
+        task.metadata["timing_calibration"] == "uncalibrated-unit-cost"
+        for task in program.tasks
+    )
+    assert "wait_event" not in program.tasks[0].metadata
+    assert program.tasks[0].metadata["transfer_bytes"] == 16 * 16 * 2
+    assert program.tasks[2].metadata["math_ops"] == 2 * 16 * 16 * 16
+    assert program.tasks[2].metadata["wait_event"] == "MTE1_M"
+    assert program.tasks[2].metadata["set_event"] == "M_MTE1"
+    assert program.tasks[6].metadata["wait_event"] == "M_MTE1"
     final = program.tasks[-1]
     assert program.tasks[2].task_id in program.tasks[6].dependencies
     assert [program.tasks[index].metadata["src"].byte_offset for index in (0, 3, 6)] == [
