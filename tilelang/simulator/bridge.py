@@ -531,6 +531,8 @@ class _TirBridge:
             )
         if short == "copy_l0c_to_gm":
             return self._l0c_to_gm_metadata(normalized, arguments, context)
+        if short == "mma":
+            return self._mma_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -1050,6 +1052,122 @@ class _TirBridge:
                 "destination_cols": destination_cols,
             },
         }
+
+    def _mma_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final intrinsic ABI: tag, A, B, C, init, K[, n_actual, unitFlag].
+        if len(arguments) not in {6, 8}:
+            return {}
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or not tag.startswith("mma<") or not tag.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"functional mma supports the non-bias mma template, got {tag!r}"
+            )
+        parameters = [part.strip() for part in tag[4:-1].split(",")]
+        if len(parameters) != 4:
+            raise UnsupportedSimOpError(f"malformed mma template {tag!r}")
+        try:
+            rows, cols = (int(parameters[index]) for index in (2, 3))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "functional mma requires static M/N template extents"
+            ) from error
+        inner = self._runtime_int(arguments[5], context.environment)
+        if inner is None:
+            return {}
+        if not isinstance(inner, int):
+            raise UnsupportedSimOpError("functional mma requires a static K extent")
+        if min(rows, cols, inner) <= 0:
+            raise ProgramValidationError("mma M/N/K extents must be positive")
+        init_value = self._literal(self.analyzer.simplify(arguments[4]))
+        if not isinstance(init_value, (bool, int)):
+            raise UnsupportedSimOpError("functional mma requires a literal init flag")
+        initialize = bool(init_value)
+        actual_cols = cols
+        unit_flag = 0
+        if len(arguments) == 8:
+            actual_cols = self._runtime_int(arguments[6], context.environment)
+            unit_flag = self._runtime_int(arguments[7], context.environment)
+            if actual_cols != cols:
+                raise UnsupportedSimOpError(
+                    "functional mma does not yet support n_actual smaller than N"
+                )
+            if unit_flag != 0:
+                raise UnsupportedSimOpError(
+                    "functional mma supports standalone unitFlag=0 only"
+                )
+
+        input_dtype = _ascend_template_dtype(parameters[0])
+        accumulator_dtype = _ascend_template_dtype(parameters[1])
+        if (input_dtype, accumulator_dtype) != ("float16", "float32"):
+            raise UnsupportedSimOpError(
+                "functional mma currently supports half inputs and float accumulation"
+            )
+        a_elements = storage_elements(
+            "l0a", (rows, inner), dtype_size_bytes(input_dtype)
+        )
+        b_elements = storage_elements(
+            "l0b", (inner, cols), dtype_size_bytes(input_dtype)
+        )
+        c_elements = storage_elements(
+            "l0c", (rows, cols), dtype_size_bytes(accumulator_dtype)
+        )
+        left = self._access_buffer_region(arguments[1], (a_elements,), context)
+        right = self._access_buffer_region(arguments[2], (b_elements,), context)
+        destination = self._access_buffer_region(
+            arguments[3], (c_elements,), context
+        )
+        if left is None or right is None or destination is None:
+            return {}
+        if (
+            left.scope is not MemoryScope.L0A
+            or right.scope is not MemoryScope.L0B
+            or destination.scope is not MemoryScope.L0C
+        ):
+            raise ProgramValidationError("mma requires L0A, L0B, and L0C operands")
+        if (
+            left.dtype != input_dtype
+            or right.dtype != input_dtype
+            or destination.dtype != accumulator_dtype
+        ):
+            raise ProgramValidationError("mma buffer dtypes disagree with its template")
+        for label, region, elements in (
+            ("L0A", left, a_elements),
+            ("L0B", right, b_elements),
+            ("L0C", destination, c_elements),
+        ):
+            tile_bytes = elements * dtype_size_bytes(region.dtype)
+            if (
+                not isinstance(region.byte_offset, int)
+                or region.byte_offset % tile_bytes
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional mma requires a tile-base-aligned {label} operand"
+                )
+            buffer_size = _buffer_size_bytes(self.buffers[region.buffer])
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"mma {label} physical tile exceeds its buffer"
+                )
+        metadata: Dict[str, Any] = {
+            "lhs": left,
+            "rhs": right,
+            "dst": destination,
+            "mma": {
+                "rows": rows,
+                "cols": cols,
+                "inner": inner,
+                "init": initialize,
+                "n_actual": actual_cols,
+                "unit_flag": unit_flag,
+            },
+        }
+        if not initialize:
+            metadata["accumulator"] = destination
+        return metadata
 
     def _reduce_metadata(
         self,

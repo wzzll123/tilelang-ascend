@@ -148,6 +148,9 @@ class FunctionalSimulator:
         if operation == "axpy":
             self._axpy(task)
             return
+        if operation == "mma":
+            self._mma(task)
+            return
         if operation in _UNARY_OPERATIONS:
             self._unary(task, operation)
             return
@@ -283,6 +286,33 @@ class FunctionalSimulator:
         self.write(
             destination,
             scalar * source_values + accumulator_values,
+            task_core_id=task.core_id,
+        )
+
+    def _mma(self, task: Task) -> None:
+        left = _operand(task, "lhs")
+        right = _operand(task, "rhs")
+        destination = _operand(task, "dst")
+        details = task.metadata.get("mma", {})
+        shape_a = (details["rows"], details["inner"])
+        shape_b = (details["inner"], details["cols"])
+        shape_c = (details["rows"], details["cols"])
+        a_values = unpack_matrix(
+            self.read(left, task_core_id=task.core_id), "l0a", shape_a
+        )
+        b_values = unpack_matrix(
+            self.read(right, task_core_id=task.core_id), "l0b", shape_b
+        )
+        result = np.matmul(a_values.astype(np.float32), b_values.astype(np.float32))
+        if not details["init"]:
+            accumulator = _operand(task, "accumulator")
+            previous = unpack_matrix(
+                self.read(accumulator, task_core_id=task.core_id), "l0c", shape_c
+            )
+            result = previous + result
+        self.write(
+            destination,
+            pack_matrix(result.astype(np.float32), "l0c"),
             task_core_id=task.core_id,
         )
 
