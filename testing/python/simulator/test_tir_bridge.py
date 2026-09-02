@@ -1076,6 +1076,51 @@ def _compare_primfunc(mode, *, scalar=False):
     )
 
 
+def _compare_scalar_buffer_primfunc(mode, scalar_index=1):
+    left = tvm.tir.decl_buffer((8,), "float32", name="left", scope="global")
+    scalars = tvm.tir.decl_buffer(
+        (2,), "float32", name="scalars", scope="global"
+    )
+    output = tvm.tir.decl_buffer((1,), "uint8", name="output", scope="global")
+    ub_left = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_left", scope="shared.ub"
+    )
+    ub_scalars = tvm.tir.decl_buffer(
+        (2,), "float32", name="ub_scalars", scope="shared.ub"
+    )
+    ub_mask = tvm.tir.decl_buffer(
+        (1,), "uint8", name="ub_mask", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    statements = [
+        copy("copy_gm_to_ub", left, ub_left, 8),
+        copy("copy_gm_to_ub", scalars, ub_scalars, 2),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_compare_scalar", ub_mask.access_ptr("w"),
+            ub_left.access_ptr("r"), ub_scalars.access_ptr("r"), scalar_index,
+            mode, 8,
+        )),
+        copy("copy_ub_to_gm", ub_mask, output, 1),
+    ]
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_left, ub_scalars, ub_mask],
+    )
+    return tvm.tir.PrimFunc(
+        [left.data, scalars.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            left.data: left, scalars.data: scalars, output.data: output,
+        },
+    )
+
+
 def _compare_select_primfunc(*, scalar_select=False, with_scratch=False):
     left = tvm.tir.decl_buffer((8,), "float32", name="left", scope="global")
     right = tvm.tir.decl_buffer((8,), "float32", name="right", scope="global")
@@ -2824,6 +2869,38 @@ def test_real_tir_compare_packs_little_endian_predicate_bits(mode, scalar) -> No
     }[mode](left, rhs)
     expected = np.packbits(predicates, bitorder="little")
     np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize("mode", ["EQ", "NE", "GT", "GE", "LT", "LE"])
+def test_compare_scalar_reads_indexed_buffer_value(mode) -> None:
+    program = build_kernel_program(
+        _compare_scalar_buffer_primfunc(mode), platform="A2"
+    )
+    left_load, scalar_load, compare, store = program.tasks
+    assert compare.operation == "compare_scalar"
+    assert compare.metadata["scalar_src"].shape == (1,)
+    assert compare.metadata["scalar_src"].byte_offset == 4
+    assert compare.dependencies == (left_load.task_id, scalar_load.task_id)
+    assert store.dependencies == (compare.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    left = np.array([-2, -1, 0, 1, 2, 3, 4, 5], dtype=np.float32)
+    scalars = np.array([-100, 1], dtype=np.float32)
+    simulator.write(left_load.metadata["src"], left)
+    simulator.write(scalar_load.metadata["src"], scalars)
+    simulator.run()
+    predicates = {
+        "EQ": np.equal,
+        "NE": np.not_equal,
+        "GT": np.greater,
+        "GE": np.greater_equal,
+        "LT": np.less,
+        "LE": np.less_equal,
+    }[mode](left, scalars[1])
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.packbits(predicates, bitorder="little"),
+    )
 
 
 @pytest.mark.parametrize(

@@ -137,6 +137,18 @@ def _scale_runtime_int(value: Any, coefficient: int) -> Any:
     raise ProgramValidationError(f"cannot scale runtime integer {value!r}")
 
 
+def _add_runtime_int(left: Any, right: Any) -> Any:
+    if isinstance(left, int) and isinstance(right, int):
+        return left + right
+    if isinstance(left, (int, AffineInt, SymbolicInt)) and isinstance(
+        right, (int, AffineInt, SymbolicInt)
+    ):
+        return SymbolicInt("add", (left, right))
+    raise ProgramValidationError(
+        f"cannot add runtime integers {left!r} and {right!r}"
+    )
+
+
 def build_kernel_program(
     func_or_mod: Any,
     *,
@@ -2154,13 +2166,14 @@ class _TirBridge:
         arguments: Tuple[Any, ...],
         context: _Context,
     ) -> Dict[str, Any]:
-        if len(arguments) != 5:
-            # The six-argument compare_scalar form reads its scalar through a
-            # buffer plus index.  Keep it fail-closed until scalar BufferLoad
-            # addressing is represented explicitly in SimIR.
+        if len(arguments) not in {5, 6}:
             return {}
-        count = self._runtime_int(arguments[4], context.environment)
-        mode = getattr(arguments[3], "value", None)
+        if len(arguments) == 6 and operation != "compare_scalar":
+            return {}
+        mode_index = 4 if len(arguments) == 6 else 3
+        count_index = mode_index + 1
+        count = self._runtime_int(arguments[count_index], context.environment)
+        mode = getattr(arguments[mode_index], "value", None)
         if count is None or not isinstance(mode, str):
             return {}
         mode = mode.upper()
@@ -2188,6 +2201,30 @@ class _TirBridge:
             if right is None:
                 return {}
             metadata["rhs"] = right
+        elif len(arguments) == 6:
+            scalar_index = self._runtime_int(arguments[3], context.environment)
+            if not isinstance(scalar_index, (int, AffineInt, SymbolicInt)):
+                raise UnsupportedSimOpError(
+                    "functional compare_scalar requires an executable scalar index"
+                )
+            scalar_source = self._access_buffer_region(
+                arguments[2], (1,), context
+            )
+            if scalar_source is None:
+                return {}
+            if scalar_source.dtype != left.dtype:
+                raise ProgramValidationError(
+                    "compare_scalar buffer dtype must match its source dtype"
+                )
+            scalar_offset = _scale_runtime_int(
+                scalar_index, dtype_size_bytes(scalar_source.dtype)
+            )
+            metadata["scalar_src"] = replace(
+                scalar_source,
+                byte_offset=_add_runtime_int(
+                    scalar_source.byte_offset, scalar_offset
+                ),
+            )
         else:
             scalar = self._literal(self.analyzer.simplify(arguments[2]))
             if not isinstance(scalar, (bool, int, float)):
@@ -2738,7 +2775,11 @@ class _TirBridge:
         core_id: int,
     ) -> Tuple[str, ...]:
         reads = self._operand_regions(
-            metadata, ("src_regions", "src", "lhs", "rhs", "mask", "accumulator")
+            metadata,
+            (
+                "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
+                "scalar_src",
+            ),
         )
         writes = self._operand_regions(
             metadata, ("dst", "pad_dst", "scratch", "output_scratch")
@@ -2760,7 +2801,10 @@ class _TirBridge:
     def _record_memory_accesses(self, task: Task, core_id: int) -> None:
         reads = self._operand_regions(
             task.metadata,
-            ("src_regions", "src", "lhs", "rhs", "mask", "accumulator"),
+            (
+                "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
+                "scalar_src",
+            ),
         )
         writes = self._operand_regions(
             task.metadata, ("dst", "pad_dst", "scratch", "output_scratch")
