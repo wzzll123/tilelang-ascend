@@ -480,6 +480,14 @@ class FunctionalSimulator:
             "reduce_min": np.min,
         }[operation]
         result = implementation(values, axis=numpy_axis)
+        if not task.metadata.get("clear", True):
+            accumulator = _operand(task, "accumulator")
+            previous = self.read(accumulator, task_core_id=task.core_id)
+            result = {
+                "reduce_sum": np.add,
+                "reduce_max": np.maximum,
+                "reduce_min": np.minimum,
+            }[operation](previous, result)
         self.write(destination, result, task_core_id=task.core_id)
 
     def _resolve(self, region: BufferRegion, task_core_id: int) -> MemoryView:

@@ -1015,6 +1015,9 @@ def _tail_reduce_primfunc(kind, dimension=0, clear=1, dtype="float32"):
 def _reduce_primfunc(kind, axis, *, clear=True):
     source = tvm.tir.decl_buffer((3, 5), "float32", name="source", scope="global")
     output_count = 5 if axis == 0 else 3
+    initial = tvm.tir.decl_buffer(
+        (output_count,), "float32", name="initial", scope="global"
+    )
     output = tvm.tir.decl_buffer(
         (output_count,), "float32", name="output", scope="global"
     )
@@ -1027,6 +1030,9 @@ def _reduce_primfunc(kind, axis, *, clear=True):
     scratch = tvm.tir.decl_buffer(
         (15,), "float32", name="scratch", scope="shared.ub"
     )
+    output_scratch = tvm.tir.decl_buffer(
+        (output_count,), "float32", name="output_scratch", scope="shared.ub"
+    )
     load = tvm.tir.call_extern(
         "handle", "copy_gm_to_ub", source.access_ptr("r"),
         ub_source.access_ptr("w"), 15,
@@ -1037,6 +1043,8 @@ def _reduce_primfunc(kind, axis, *, clear=True):
     ]
     if axis == -1:
         arguments.append(scratch.access_ptr("w"))
+    if not clear:
+        arguments.append(output_scratch.access_ptr("w"))
     arguments.append(tvm.tir.const(clear, "bool"))
     reduce_call = tvm.tir.call_extern(
         "handle", "tl.ascend_reduce", *arguments
@@ -1045,18 +1053,26 @@ def _reduce_primfunc(kind, axis, *, clear=True):
         "handle", "copy_ub_to_gm", ub_output.access_ptr("r"),
         output.access_ptr("w"), output_count,
     )
+    statements = [tvm.tir.Evaluate(load)]
+    if not clear:
+        statements.append(tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_gm_to_ub", initial.access_ptr("r"),
+            ub_output.access_ptr("w"), output_count,
+        )))
+    statements.extend([
+        tvm.tir.Evaluate(reduce_call), tvm.tir.Evaluate(store),
+    ])
     root = tvm.tir.Block(
         [], [], [], "root",
-        tvm.tir.SeqStmt([
-            tvm.tir.Evaluate(load), tvm.tir.Evaluate(reduce_call),
-            tvm.tir.Evaluate(store),
-        ]),
-        alloc_buffers=[ub_source, ub_output, scratch],
+        tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_source, ub_output, scratch, output_scratch],
     )
     return tvm.tir.PrimFunc(
-        [source.data, output.data],
+        [source.data, initial.data, output.data],
         tvm.tir.BlockRealize([], True, root),
-        buffer_map={source.data: source, output.data: output},
+        buffer_map={
+            source.data: source, initial.data: initial, output.data: output,
+        },
     )
 
 
@@ -1805,11 +1821,42 @@ def test_real_tir_reduce_executes_both_axes(kind, reducer, axis) -> None:
     )
 
 
-def test_real_tir_reduce_clear_false_fails_closed() -> None:
-    with pytest.raises(UnsupportedSimOpError, match="clear=false"):
-        build_kernel_program(
-            _reduce_primfunc("reduce_sum", 0, clear=False), platform="A2"
-        )
+@pytest.mark.parametrize("axis", [0, -1])
+@pytest.mark.parametrize(
+    ("kind", "reducer", "merger"),
+    [
+        ("reduce_sum", np.sum, np.add),
+        ("reduce_max", np.max, np.maximum),
+        ("reduce_min", np.min, np.minimum),
+    ],
+)
+def test_real_tir_reduce_clear_false_merges_destination(
+    kind, reducer, merger, axis
+) -> None:
+    program = build_kernel_program(
+        _reduce_primfunc(kind, axis, clear=False), platform="A2"
+    )
+    source_load, initial_load, reduce, store = program.tasks
+    assert reduce.metadata["clear"] is False
+    assert reduce.metadata["accumulator"] == reduce.metadata["dst"]
+    assert set(reduce.dependencies) == {
+        source_load.task_id, initial_load.task_id,
+    }
+    assert "scratch" in reduce.metadata
+    assert ("output_scratch" in reduce.metadata) is (axis == -1)
+    assert store.dependencies == (reduce.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    values = np.arange(15, dtype=np.float32).reshape(3, 5) - 4
+    initial = np.linspace(-2, 2, 5 if axis == 0 else 3, dtype=np.float32)
+    simulator.write(source_load.metadata["src"], values.reshape(-1))
+    simulator.write(initial_load.metadata["src"], initial)
+    simulator.run()
+
+    reduced = reducer(values, axis=0 if axis == 0 else 1)
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), merger(initial, reduced)
+    )
 
 
 @pytest.mark.parametrize(

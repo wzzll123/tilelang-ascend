@@ -627,14 +627,21 @@ class _TirBridge:
                 return {}
             physical_cols = candidate
             cursor -= 1
-        clear = self._literal(arguments[cursor])
-        if clear not in {True, 1}:
-            raise UnsupportedSimOpError(
-                "functional reduce clear=false accumulation is not supported yet"
-            )
+        clear_value = self._literal(arguments[cursor])
+        if clear_value not in {False, True, 0, 1}:
+            return {}
+        clear = bool(clear_value)
         scratch_arguments = arguments[3:cursor]
         if len(scratch_arguments) > 2:
             return {}
+        if not clear:
+            expected_tmp_counts = {0: {1}, -1: {1, 2}}[axis]
+            if len(scratch_arguments) not in expected_tmp_counts:
+                raise UnsupportedSimOpError(
+                    f"reduce clear=false axis {axis} requires "
+                    f"{sorted(expected_tmp_counts)} tmp view count, got "
+                    f"{len(scratch_arguments)}"
+                )
         source = self._access_buffer_region(arguments[2], (rows, cols), context)
         output_count = cols if axis == 0 else rows
         destination = self._access_buffer_region(
@@ -647,11 +654,13 @@ class _TirBridge:
             "dst": destination,
             "reduce_kind": kind,
             "reduce_axis": axis,
-            "clear": True,
+            "clear": clear,
             "rows": rows,
             "cols": cols,
             "physical_cols": physical_cols,
         }
+        if not clear:
+            metadata["accumulator"] = destination
         for index, argument in enumerate(scratch_arguments):
             extent = self._access_ptr_extent(argument, context)
             if extent is None:
@@ -1591,7 +1600,9 @@ class _TirBridge:
         reads = self._operand_regions(
             metadata, ("src", "lhs", "rhs", "mask", "accumulator")
         )
-        writes = self._operand_regions(metadata, ("dst", "pad_dst", "scratch"))
+        writes = self._operand_regions(
+            metadata, ("dst", "pad_dst", "scratch", "output_scratch")
+        )
         dependencies = {
             task_id
             for region in reads
@@ -1610,7 +1621,9 @@ class _TirBridge:
         reads = self._operand_regions(
             task.metadata, ("src", "lhs", "rhs", "mask", "accumulator")
         )
-        writes = self._operand_regions(task.metadata, ("dst", "pad_dst", "scratch"))
+        writes = self._operand_regions(
+            task.metadata, ("dst", "pad_dst", "scratch", "output_scratch")
+        )
         for region in writes:
             self.last_writes = [
                 entry for entry in self.last_writes
