@@ -86,3 +86,50 @@ def run_test_subregion_2d(H, W, PT, PL, SWp, Hp, dtype):
 )
 def test_subregion_2d(H, W, PT, PL, SWp, Hp, dtype):
     run_test_subregion_2d(H, W, PT, PL, SWp, Hp, dtype)
+
+
+# =============================================================================
+# Group 2 - UB -> GM 2D sub-region store (symmetric dst-stride fix)
+# Store a sub-region of a wider UB buffer (physical row width SWp > W) out to
+# GM.  The src inter-block stride must use the buffer's physical row width.
+# =============================================================================
+def subregion_2d_store(H, W, PT, PL, SWp, Hp, dtype):
+    """Fill buf[PT:PT+H, PL:PL+W] = X, store buf[PT:PT+H, PL:PL+W] -> Y[0:H,0:W].
+
+    The UB->GM store reads a sub-region (col offset PL, width W) of the wider
+    buffer; the src rows must advance by SWp, not W."""
+
+    @T.prim_func
+    def main(X: T.Tensor((H, W), dtype), Y: T.Tensor((H, W), dtype)):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            buf = T.alloc_ub((Hp, SWp), dtype)
+            T.tile.clear(buf)
+            # Fill the sub-region via GM->UB (already fixed) so the store side
+            # is exercised in isolation.
+            T.copy(X[0:H, 0:W], buf[PT:PT + H, PL:PL + W])
+            T.copy(buf[PT:PT + H, PL:PL + W], Y[0:H, 0:W])
+
+    return main
+
+
+def run_test_subregion_2d_store(H, W, PT, PL, SWp, Hp, dtype):
+    torch.manual_seed(0)
+    func = subregion_2d_store(H, W, PT, PL, SWp, Hp, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=VEC_MIN_CONFIGS,
+                            target="ascendc")
+    td = _torch_dtype(dtype)
+    x = torch.randn(H, W, dtype=td).npu()
+    torch.npu.synchronize()
+    y = func(x).cpu()
+    torch.testing.assert_close(y, x.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "H,W,PT,PL,SWp,Hp,dtype",
+    [
+        (61, 61, 1, 8, 80, 63, "float"),
+        (16, 31, 2, 16, 64, 20, "float16"),
+    ],
+)
+def test_subregion_2d_store(H, W, PT, PL, SWp, Hp, dtype):
+    run_test_subregion_2d_store(H, W, PT, PL, SWp, Hp, dtype)

@@ -312,7 +312,14 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       // See copy_gm_to_ub above: a runtime inner-extent must use the buffer's
       // compile-time shape for the template col dim (runtime width is carried
       // by the maskShapeN function arg); const extents are byte-identical.
+      // For a 2D+ source the template col dim must be the buffer's PHYSICAL row
+      // width (src->shape[last]) so the helper's src inter-block stride
+      // (srcN - maskShapeN) advances rows correctly on a sub-region store
+      // (copy width < physical row width). 1D copies keep the extent.
       PrimExpr ub2gm_tmpl_n = src_extents[src->shape.size() - 1];
+      if (src->shape.size() > 1) {
+        ub2gm_tmpl_n = src->shape[src->shape.size() - 1];
+      }
       if (!ub2gm_tmpl_n->IsInstance<IntImmNode>()) {
         ub2gm_tmpl_n = src->shape[src->shape.size() - 1];
         // See copy_gm_to_ub: the shape fallback must itself be compile-time.
