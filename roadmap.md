@@ -162,7 +162,7 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `165 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `167 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -262,6 +262,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## P2：Cube MVP
 
+- [x] ~~实现显式 RowMajor `copy_gm_to_l1_linear` 的 valid rectangle、scope/dtype
+  contract 和 32-byte row alignment；默认 NZ/zN 路径继续 fail-closed。~~
 - [ ] 实现 GM→L1、L1→L0A/L0B 和 L0C→GM 的合法 copy 路径。
 - [ ] 实现 `gemm_v0`。
 - [ ] 实现显式 `mma`，支持 init、accumulate 和多 K tile 累加。
@@ -348,7 +350,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：165 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：167 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

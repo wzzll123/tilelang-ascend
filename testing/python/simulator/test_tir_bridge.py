@@ -70,6 +70,24 @@ def _strided_copy_primfunc(operation: str):
     )
 
 
+def _gm_to_l1_linear_primfunc(valid_cols=8):
+    source = tvm.tir.decl_buffer((2, 8), "float32", name="source", scope="global")
+    l1 = tvm.tir.decl_buffer((3, 8), "float32", name="l1", scope="shared.l1")
+    copy = tvm.tir.call_extern(
+        "handle", "tl::ascend::copy_gm_to_l1_linear<float, 3, 8>",
+        source.access_ptr("r"), l1.access_ptr("w"),
+        8, 2, valid_cols, 3, 8,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[l1]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source},
+    )
+
+
 def _vector_add_primfunc():
     x = tvm.tir.decl_buffer((8,), "float32", name="x", scope="global")
     y = tvm.tir.decl_buffer((8,), "float32", name="y", scope="global")
@@ -1110,6 +1128,36 @@ def test_real_tir_copy_executes_without_manual_task_metadata() -> None:
     simulator.run()
 
     np.testing.assert_array_equal(simulator.read(destination), values)
+
+
+def test_real_tir_row_major_gm_to_l1_copy_executes() -> None:
+    program = build_kernel_program(_gm_to_l1_linear_primfunc(), platform="A3")
+    task = program.tasks[0]
+    assert (task.operation, task.lane, task.pipe) == (
+        "copy_gm_to_l1_linear", Lane.CUBE, Pipe.MTE2,
+    )
+    assert task.metadata["src"].scope is MemoryScope.GM
+    assert task.metadata["dst"].scope is MemoryScope.L1
+    assert task.metadata["copy"] == {
+        "layout": "row_major",
+        "valid_rows": 2,
+        "valid_cols": 8,
+        "source_cols": 8,
+        "physical_rows": 3,
+        "physical_cols": 8,
+    }
+
+    simulator = FunctionalSimulator(program)
+    values = np.arange(16, dtype=np.float32).reshape(2, 8)
+    simulator.write(task.metadata["src"], values)
+    simulator.run()
+
+    np.testing.assert_array_equal(simulator.read(task.metadata["dst"]), values)
+
+
+def test_row_major_gm_to_l1_rejects_unaligned_rows() -> None:
+    with pytest.raises(ProgramValidationError, match="32-byte aligned"):
+        build_kernel_program(_gm_to_l1_linear_primfunc(valid_cols=7), platform="A2")
 
 
 @pytest.mark.parametrize(

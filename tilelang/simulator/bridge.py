@@ -520,6 +520,8 @@ class _TirBridge:
             return self._fill_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
+        if short == "copy_gm_to_l1_linear":
+            return self._gm_to_l1_linear_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -590,6 +592,66 @@ class _TirBridge:
             else:
                 metadata["pad_disabled_reason"] = "physical tile exceeds buffer view"
         return metadata
+
+    def _gm_to_l1_linear_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, realSrcN, validM, validN, dstM, dstN.
+        if len(arguments) != 7:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        source_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
+        if any(isinstance(value, int) and value < 0 for value in dimensions):
+            raise ProgramValidationError("GM-to-L1 linear extents must not be negative")
+        if all(isinstance(value, int) for value in dimensions):
+            if valid_rows > physical_rows or valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "GM-to-L1 valid rectangle must fit its physical L1 tile"
+                )
+            if valid_cols > source_cols:
+                raise ProgramValidationError(
+                    "GM-to-L1 valid columns exceed the GM row stride"
+                )
+        source = self._access_buffer_region(
+            arguments[0], (valid_rows, valid_cols), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.GM or destination.scope is not MemoryScope.L1:
+            raise ProgramValidationError(
+                "copy_gm_to_l1_linear requires GM source and L1 destination"
+            )
+        if source.dtype != destination.dtype:
+            raise ProgramValidationError(
+                "copy_gm_to_l1_linear requires matching source/destination dtype"
+            )
+        itemsize = dtype_size_bytes(source.dtype)
+        if isinstance(valid_cols, int) and (valid_cols * itemsize) % 32:
+            raise ProgramValidationError(
+                "copy_gm_to_l1_linear row width must be 32-byte aligned"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "row_major",
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "source_cols": source_cols,
+                "physical_rows": physical_rows,
+                "physical_cols": physical_cols,
+            },
+        }
 
     def _reduce_metadata(
         self,
