@@ -295,13 +295,19 @@ def _mma_chain_primfunc():
 
 
 def _gemm_v0_primfunc(
-    transpose_a=False, transpose_b=False, init=True, n_actual=None, k_l0_size=16
+    transpose_a=False, transpose_b=False, init=True, n_actual=None,
+    k_l0_size=16, inner=13,
 ):
-    rows, cols, inner = 16, 16, 13
+    rows, cols = 16, 16
     shape_a = (inner, rows) if transpose_a else (rows, inner)
     shape_b = (cols, inner) if transpose_b else (inner, cols)
-    l1a = tvm.tir.decl_buffer((256,), "float16", name="l1a", scope="shared.l1")
-    l1b = tvm.tir.decl_buffer((256,), "float16", name="l1b", scope="shared.l1")
+    input_elements = 16 * ((inner + 15) // 16 * 16)
+    l1a = tvm.tir.decl_buffer(
+        (input_elements,), "float16", name="l1a", scope="shared.l1"
+    )
+    l1b = tvm.tir.decl_buffer(
+        (input_elements,), "float16", name="l1b", scope="shared.l1"
+    )
     l0c = tvm.tir.decl_buffer(
         (256,), "float32", name="l0c", scope="wmma.accumulator"
     )
@@ -1877,6 +1883,37 @@ def test_gemm_v0_rejects_internal_l0_tile_overflow() -> None:
     prim_func, _, _ = _gemm_v0_primfunc(k_l0_size=4080)
     with pytest.raises(ProgramValidationError, match="L0A slot"):
         build_kernel_program(prim_func, platform="A2")
+
+
+def test_gemm_v0_expands_multi_k_steps_for_trace_and_executes_once() -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(inner=48, k_l0_size=16)
+    program = build_kernel_program(prim_func, platform="A3")
+    assert [task.operation for task in program.tasks] == [
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "gemm_v0",
+    ]
+    assert all(task.metadata.get("trace_only") for task in program.tasks[:-1])
+    final = program.tasks[-1]
+    assert program.tasks[2].task_id in program.tasks[6].dependencies
+    simulator = FunctionalSimulator(program)
+    left = np.arange(np.prod(shape_a), dtype=np.float16).reshape(shape_a) / 64
+    right = (
+        np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 100
+    ) / 128
+    simulator.write(final.metadata["lhs"], pack_matrix(left, "zn"))
+    simulator.write(final.metadata["rhs"], pack_matrix(right, "zn"))
+    result = simulator.run()
+    records = {record.task_id: record for record in result.schedule.records}
+    assert records[program.tasks[2].task_id].start_cycle == records[
+        program.tasks[3].task_id
+    ].start_cycle
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(final.metadata["dst"]), "l0c", (16, 16)),
+        left.astype(np.float32) @ right.astype(np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_real_tir_gemm_pipeline_executes_without_bisheng() -> None:

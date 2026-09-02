@@ -471,7 +471,59 @@ class _TirBridge:
         span = getattr(call, "span", None)
         if span is not None:
             metadata["span"] = str(span)
+        if (
+            _short_operation(operation) == "gemm_v0"
+            and metadata.get("gemm", {}).get("step_count", 1) > 1
+        ):
+            self._emit_gemm_v0_trace_tasks(operation, context, metadata)
+            return
         self._emit_task(operation, context, metadata=metadata)
+
+    def _emit_gemm_v0_trace_tasks(
+        self, operation: str, context: _Context, metadata: Mapping[str, Any]
+    ) -> None:
+        details = metadata["gemm"]
+        step_count = details["step_count"]
+        k_split = (details["inner"] + details["k_l0_size"] - 1) // details["k_l0_size"]
+        previous_mma = None
+        last_mma_by_slot = {}
+        for step in range(step_count):
+            n_index, k_index = divmod(step, k_split)
+            slot = step % 2
+            stage = {"trace_only": True, "gemm_stage": {
+                "step": step,
+                "n_index": n_index,
+                "k_index": k_index,
+                "ping_pong_slot": slot,
+            }}
+            slot_dependency = (
+                (last_mma_by_slot[slot].task_id,)
+                if slot in last_mma_by_slot else ()
+            )
+            load_a = self._emit_task(
+                "copy_l1_to_l0a", context,
+                metadata={**stage, "src": metadata["lhs"]},
+                extra_dependencies=slot_dependency,
+            )
+            load_b = self._emit_task(
+                "copy_l1_to_l0b", context,
+                metadata={**stage, "src": metadata["rhs"]},
+                extra_dependencies=slot_dependency,
+            )
+            dependencies = [load_a.task_id, load_b.task_id]
+            if previous_mma is not None:
+                dependencies.append(previous_mma.task_id)
+            if step + 1 == step_count:
+                mma_metadata = dict(metadata)
+            else:
+                mma_metadata = dict(stage)
+            previous_mma = self._emit_task(
+                operation if step + 1 == step_count else "mma",
+                context,
+                metadata=mma_metadata,
+                extra_dependencies=tuple(dependencies),
+            )
+            last_mma_by_slot[slot] = previous_mma
 
     def _functional_metadata(
         self,
@@ -2365,8 +2417,13 @@ class _TirBridge:
         )
 
     def _emit_task(
-        self, operation: str, context: _Context, *, metadata: Mapping[str, Any]
-    ) -> None:
+        self,
+        operation: str,
+        context: _Context,
+        *,
+        metadata: Mapping[str, Any],
+        extra_dependencies: Tuple[str, ...] = (),
+    ) -> Task:
         try:
             lane, pipe, normalized = classify_operation(operation, context.lane)
         except UnsupportedSimOpError as error:
@@ -2377,7 +2434,9 @@ class _TirBridge:
             ) from error
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
         self.task_counter += 1
-        dependencies = self._memory_dependencies(metadata, context.core_id)
+        dependencies = tuple(sorted(set(
+            self._memory_dependencies(metadata, context.core_id)
+        ).union(extra_dependencies)))
         task = Task(
             task_id,
             normalized,
@@ -2390,6 +2449,7 @@ class _TirBridge:
         )
         self.tasks[context.core_id].append(task)
         self._record_memory_accesses(task, context.core_id)
+        return task
 
     def _memory_dependencies(
         self,

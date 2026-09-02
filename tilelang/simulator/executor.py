@@ -135,6 +135,8 @@ class FunctionalSimulator:
         return FunctionalExecutionResult(schedule=schedule, memory=self.memory)
 
     def _execute(self, task: Task) -> None:
+        if task.metadata.get("trace_only") is True:
+            return
         operation = task.operation.lower()
         if "copy" in operation or "datacopy" in operation or "data_copy" in operation:
             self._copy(task)
