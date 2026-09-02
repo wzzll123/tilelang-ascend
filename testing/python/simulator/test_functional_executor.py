@@ -273,6 +273,40 @@ def test_axpy_reads_and_updates_destination_in_place() -> None:
     )
 
 
+def test_clamp_rejects_reversed_literal_bounds() -> None:
+    source = _region("source", MemoryScope.UB, 2)
+    destination = _region("destination", MemoryScope.UB, 2)
+    program = KernelProgram(
+        "invalid-clamp",
+        "A3",
+        (CoreProgram(0, (
+            Task(
+                "clamp",
+                "clamp",
+                0,
+                Lane.VECTOR_0,
+                Pipe.VECTOR,
+                1,
+                metadata={
+                    "src": source,
+                    "dst": destination,
+                    "min_value": 2.0,
+                    "max_value": -2.0,
+                },
+            ),
+        )),),
+        buffers=(
+            BufferSpec("source", MemoryScope.UB, (2,), "float32"),
+            BufferSpec("destination", MemoryScope.UB, (2,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(source, np.array([-1, 1], dtype=np.float32))
+
+    with pytest.raises(ProgramValidationError, match="minimum .* exceeds maximum"):
+        simulator.run()
+
+
 def test_dynamic_buffer_allocation_resolves_symbolic_shape() -> None:
     dynamic_extent = SymbolicInt(
         "max", (AffineInt.variable("element_count"), 4)

@@ -411,6 +411,76 @@ def _scratch_unary_primfunc(operation, *, with_scratch=False, in_place=False):
     )
 
 
+def _pow_clamp_primfunc(operation, *, with_scratch=False):
+    source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
+    exponent = tvm.tir.decl_buffer((5,), "float32", name="exponent", scope="global")
+    output = tvm.tir.decl_buffer((5,), "float32", name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_source", scope="shared.ub"
+    )
+    ub_exponent = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_exponent", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (5,), "float32", name="scratch", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), 5,
+        ))
+
+    statements = [copy("copy_gm_to_ub", source, ub_source)]
+    if operation == "pow":
+        statements.append(copy("copy_gm_to_ub", exponent, ub_exponent))
+        arguments = [
+            ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+            ub_exponent.access_ptr("r"),
+        ]
+        if with_scratch:
+            arguments.append(scratch.access_ptr("w"))
+    elif operation == "clamp":
+        arguments = [ub_output.access_ptr("w"), ub_source.access_ptr("r")]
+        if with_scratch:
+            arguments.append(scratch.access_ptr("w"))
+        arguments.extend([
+            tvm.tir.FloatImm("float32", -1.0),
+            tvm.tir.FloatImm("float32", 2.0),
+            5,
+        ])
+    else:
+        arguments = [ub_output.access_ptr("w"), ub_source.access_ptr("r")]
+        if with_scratch:
+            arguments.append(scratch.access_ptr("w"))
+        arguments.extend([tvm.tir.FloatImm("float32", 1.5), 5])
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_{operation}", *arguments
+        )),
+        copy("copy_ub_to_gm", ub_output, output),
+    ])
+    alloc_buffers = [ub_source, ub_exponent, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=alloc_buffers,
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, exponent.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            source.data: source,
+            exponent.data: exponent,
+            output.data: output,
+        },
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -928,6 +998,45 @@ def test_real_tir_scratch_unary_forms_execute(
 
     np.testing.assert_allclose(
         simulator.read(store.metadata["dst"]), expected(values), rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "with_scratch", "expected"),
+    [
+        ("pow", True, lambda x, y: np.power(x, y)),
+        ("clamp_max", False, lambda x, _: np.minimum(x, 1.5)),
+        ("clamp_min", True, lambda x, _: np.maximum(x, 1.5)),
+        ("clamp", True, lambda x, _: np.clip(x, -1.0, 2.0)),
+    ],
+)
+def test_real_tir_pow_and_clamp_forms_execute(operation, with_scratch, expected) -> None:
+    program = build_kernel_program(
+        _pow_clamp_primfunc(operation, with_scratch=with_scratch), platform="A3"
+    )
+    vector = next(task for task in program.tasks if task.operation == operation)
+    store = program.tasks[-1]
+    assert ("scratch" in vector.metadata) is with_scratch
+    assert store.dependencies == (vector.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    source_values = np.array([0.25, 1, 2, 4, 8], dtype=np.float32)
+    exponent_values = np.array([2, 3, 0.5, 1, -1], dtype=np.float32)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (5,), "float32"), source_values
+    )
+    if operation == "pow":
+        simulator.write(
+            BufferRegion("exponent", MemoryScope.GM, (5,), "float32"),
+            exponent_values,
+        )
+        assert len(vector.dependencies) == 2
+    simulator.run()
+
+    np.testing.assert_allclose(
+        simulator.read(store.metadata["dst"]),
+        expected(source_values, exponent_values),
+        rtol=1e-6,
     )
 
 

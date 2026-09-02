@@ -29,6 +29,7 @@ _BINARY_OPERATIONS = {
     "div": np.divide,
     "max": np.maximum,
     "min": np.minimum,
+    "pow": np.power,
 }
 
 _SCALAR_OPERATIONS = {
@@ -146,6 +147,9 @@ class FunctionalSimulator:
         if operation == "fill":
             self._fill(task)
             return
+        if operation in {"clamp", "clamp_max", "clamp_min"}:
+            self._clamp(task, operation)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -250,6 +254,37 @@ class FunctionalSimulator:
             )
         shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _clamp(self, task: Task, operation: str) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        if operation == "clamp":
+            minimum = task.metadata.get("min_value")
+            maximum = task.metadata.get("max_value")
+            if not isinstance(minimum, (bool, int, float)) or not isinstance(
+                maximum, (bool, int, float)
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional clamp requires literal bounds, got {minimum!r}, {maximum!r}"
+                )
+            if minimum > maximum:
+                raise ProgramValidationError(
+                    f"clamp minimum {minimum} exceeds maximum {maximum}"
+                )
+            result = np.clip(values, minimum, maximum)
+        else:
+            scalar = task.metadata.get("scalar")
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"functional {operation} requires a literal bound, got {scalar!r}"
+                )
+            result = (
+                np.minimum(values, scalar)
+                if operation == "clamp_max"
+                else np.maximum(values, scalar)
+            )
         self.write(destination, result, task_core_id=task.core_id)
 
     def _reduce(self, task: Task, operation: str) -> None:

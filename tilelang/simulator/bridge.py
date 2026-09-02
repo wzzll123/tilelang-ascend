@@ -498,6 +498,10 @@ class _TirBridge:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
         if short in {"sigmoid", "silu", "sin", "cos"}:
             return self._scratch_unary_metadata(arguments, context)
+        if short == "pow":
+            return self._pow_metadata(arguments, context)
+        if short in {"clamp", "clamp_max", "clamp_min"}:
+            return self._clamp_metadata(short, arguments, context)
         if short == "cast":
             return self._cast_metadata(arguments, context)
         if short == "fill":
@@ -655,6 +659,90 @@ class _TirBridge:
                 return {}
             metadata["scratch"] = scratch
         return metadata
+
+    def _pow_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {3, 4}:
+            return {}
+        count = self._access_ptr_extent(arguments[0], context)
+        if count is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        left = self._access_buffer_region(arguments[1], (count,), context)
+        right = self._access_buffer_region(arguments[2], (count,), context)
+        if destination is None or left is None or right is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "lhs": left, "rhs": right}
+        if len(arguments) == 4:
+            scratch = self._access_buffer_region(arguments[3], (count,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _clamp_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        offset = (
+            1
+            if arguments and isinstance(getattr(arguments[0], "value", None), str)
+            else 0
+        )
+        operands = arguments[offset:]
+        scalar_count = 2 if operation == "clamp" else 1
+        base_count = 2 + scalar_count + 1
+        if len(operands) not in {base_count, base_count + 1}:
+            return {}
+        has_scratch = len(operands) == base_count + 1
+        destination_arg, source_arg = operands[:2]
+        scalar_start = 3 if has_scratch else 2
+        scalar_args = operands[scalar_start:scalar_start + scalar_count]
+        count_arg = operands[scalar_start + scalar_count]
+        count = self._runtime_int(count_arg, context.environment)
+        scalars = tuple(self._literal(self.analyzer.simplify(arg)) for arg in scalar_args)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("clamp count must not be negative")
+        if any(not isinstance(value, (bool, int, float)) for value in scalars):
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires literal bounds, got {scalars!r}"
+            )
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        source = self._access_buffer_region(source_arg, (count,), context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        if operation == "clamp":
+            metadata.update(min_value=scalars[0], max_value=scalars[1])
+        else:
+            metadata["scalar"] = scalars[0]
+        if has_scratch:
+            scratch = self._access_buffer_region(operands[2], (count,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _access_ptr_extent(
+        self,
+        pointer: Any,
+        context: _Context,
+    ) -> Optional[Any]:
+        if isinstance(pointer, self.tir.Call) and str(pointer.op.name) == "tir.tvm_access_ptr":
+            if len(pointer.args) < 4:
+                return None
+            extent = self._runtime_int(pointer.args[3], context.environment)
+            if isinstance(extent, int) and extent < 0:
+                raise ProgramValidationError("access pointer extent must not be negative")
+            return extent
+        return None
 
     def _scalar_metadata(
         self,
