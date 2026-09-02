@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .errors import ProgramValidationError, UnsupportedSimOpError
+from .layout import BYTE_PER_C0, C0_NUM_PER_FRACTAL, storage_elements
 from .memory import contiguous_strides_bytes, dtype_size_bytes
 from .profile import TimingProfile, default_timing_profile, normalize_platform
 from .program import (
@@ -522,6 +523,8 @@ class _TirBridge:
             return self._reduce_metadata(arguments, context)
         if short == "copy_gm_to_l1_linear":
             return self._gm_to_l1_linear_metadata(arguments, context)
+        if short == "copy_gm_to_l1":
+            return self._gm_to_l1_zn_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -650,6 +653,111 @@ class _TirBridge:
                 "source_cols": source_cols,
                 "physical_rows": physical_rows,
                 "physical_cols": physical_cols,
+            },
+        }
+
+    def _gm_to_l1_zn_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, realSrcN, validM, validN, dstM, dstN.
+        if len(arguments) != 7:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires static source and tile extents"
+            )
+        source_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
+        if any(value < 0 for value in dimensions):
+            raise ProgramValidationError("GM-to-L1 zN extents must not be negative")
+        if physical_rows == 0 or physical_cols == 0:
+            raise ProgramValidationError(
+                "GM-to-L1 zN physical tile extents must be positive"
+            )
+        if valid_rows > physical_rows or valid_cols > physical_cols:
+            raise ProgramValidationError(
+                "GM-to-L1 valid rectangle must fit its physical L1 tile"
+            )
+        if valid_cols > source_cols:
+            raise ProgramValidationError(
+                "GM-to-L1 valid columns exceed the GM row stride"
+            )
+
+        source = self._access_buffer_region(
+            arguments[0], (valid_rows, valid_cols), context
+        )
+        destination_name = self._access_ptr_data_name(arguments[1])
+        if source is None or destination_name is None:
+            return {}
+        destination_buffer = self.buffer_name_by_data_var.get(destination_name)
+        if destination_buffer is None:
+            return {}
+        destination_spec = self.buffers[destination_buffer]
+        if (
+            source.scope is not MemoryScope.GM
+            or destination_spec.scope is not MemoryScope.L1
+        ):
+            raise ProgramValidationError(
+                "copy_gm_to_l1 requires GM source and L1 destination"
+            )
+        if source.dtype != destination_spec.dtype:
+            raise ProgramValidationError(
+                "copy_gm_to_l1 requires matching source/destination dtype"
+            )
+
+        itemsize = dtype_size_bytes(source.dtype)
+        elements_per_c0 = BYTE_PER_C0 // itemsize
+        if (
+            physical_rows % C0_NUM_PER_FRACTAL
+            or physical_cols % elements_per_c0
+        ):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a fractal/C0-aligned physical tile"
+            )
+        physical_elements = storage_elements(
+            "zN", (physical_rows, physical_cols), itemsize
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (physical_elements,), context
+        )
+        if destination is None:
+            return {}
+        tile_bytes = physical_elements * itemsize
+        if (
+            not isinstance(destination.byte_offset, int)
+            or destination.byte_offset % tile_bytes
+        ):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a tile-base-aligned destination"
+            )
+        destination_size = _buffer_size_bytes(destination_spec)
+        if (
+            destination_size is not None
+            and destination.byte_offset + tile_bytes > destination_size
+        ):
+            raise ProgramValidationError(
+                "GM-to-L1 zN physical tile exceeds the destination buffer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "zN",
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "source_cols": source_cols,
+                "physical_rows": physical_rows,
+                "physical_cols": physical_cols,
+                "need_clear": (
+                    valid_rows != physical_rows or valid_cols != physical_cols
+                ),
             },
         }
 

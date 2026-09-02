@@ -20,6 +20,7 @@ from tilelang.simulator import (  # noqa: E402
     UnsupportedSimOpError,
     build_kernel_program,
 )
+from tilelang.simulator.layout import unpack_matrix  # noqa: E402
 
 
 @T.prim_func
@@ -77,6 +78,32 @@ def _gm_to_l1_linear_primfunc(valid_cols=8):
         "handle", "tl::ascend::copy_gm_to_l1_linear<float, 3, 8>",
         source.access_ptr("r"), l1.access_ptr("w"),
         8, 2, valid_cols, 3, 8,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[l1]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source},
+    )
+
+
+def _gm_to_l1_zn_primfunc(physical_rows=16):
+    source = tvm.tir.decl_buffer((16, 16), "float16", name="source", scope="global")
+    l1 = tvm.tir.decl_buffer(
+        (physical_rows * 16,), "float16", name="l1", scope="shared.l1"
+    )
+    copy = tvm.tir.call_extern(
+        "handle",
+        f"tl::ascend::copy_gm_to_l1<half, {physical_rows}, 16>",
+        source.access_ptr("r"),
+        l1.access_ptr("w"),
+        16,
+        13,
+        15,
+        physical_rows,
+        16,
     )
     root = tvm.tir.Block(
         [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[l1]
@@ -1158,6 +1185,39 @@ def test_real_tir_row_major_gm_to_l1_copy_executes() -> None:
 def test_row_major_gm_to_l1_rejects_unaligned_rows() -> None:
     with pytest.raises(ProgramValidationError, match="32-byte aligned"):
         build_kernel_program(_gm_to_l1_linear_primfunc(valid_cols=7), platform="A2")
+
+
+def test_real_tir_zn_gm_to_l1_copy_packs_and_clears_tail() -> None:
+    program = build_kernel_program(_gm_to_l1_zn_primfunc(), platform="A3")
+    task = program.tasks[0]
+    assert (task.operation, task.lane, task.pipe) == (
+        "copy_gm_to_l1", Lane.CUBE, Pipe.MTE2,
+    )
+    assert task.metadata["copy"] == {
+        "layout": "zN",
+        "valid_rows": 13,
+        "valid_cols": 15,
+        "source_cols": 16,
+        "physical_rows": 16,
+        "physical_cols": 16,
+        "need_clear": True,
+    }
+
+    simulator = FunctionalSimulator(program)
+    values = np.arange(13 * 15, dtype=np.float16).reshape(13, 15)
+    simulator.write(task.metadata["src"], values)
+    simulator.run()
+
+    physical = simulator.read(task.metadata["dst"])
+    logical = unpack_matrix(physical, "zN", (16, 16))
+    expected = np.zeros((16, 16), dtype=np.float16)
+    expected[:13, :15] = values
+    np.testing.assert_array_equal(logical, expected)
+
+
+def test_zn_gm_to_l1_rejects_non_fractal_physical_tile() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="fractal/C0-aligned"):
+        build_kernel_program(_gm_to_l1_zn_primfunc(physical_rows=15), platform="A2")
 
 
 @pytest.mark.parametrize(

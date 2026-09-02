@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import SimulatorConfig
 from .errors import ProgramValidationError, UnsupportedSimOpError
+from .layout import pack_matrix
 from .memory import MemoryRuntime, MemoryView
 from .program import (
     AffineInt,
@@ -213,6 +214,16 @@ class FunctionalSimulator:
                 task_core_id=task.core_id,
             )
         values = self.read(source, task_core_id=task.core_id)
+        if copy_details.get("layout") == "zN":
+            physical_shape = (
+                _resolve_int(copy_details["physical_rows"], self.bindings),
+                _resolve_int(copy_details["physical_cols"], self.bindings),
+            )
+            logical = np.zeros(
+                physical_shape, dtype=_numpy_dtype(destination.dtype)
+            )
+            logical[:values.shape[0], :values.shape[1]] = values
+            values = pack_matrix(logical, "zN")
         self.write(destination, values, task_core_id=task.core_id)
 
     def _binary(self, task: Task, operation: str) -> None:
