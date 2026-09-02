@@ -150,6 +150,9 @@ class FunctionalSimulator:
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
+        if operation == "broadcast":
+            self._broadcast(task)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -293,6 +296,21 @@ class FunctionalSimulator:
                 if operation == "clamp_max"
                 else np.maximum(values, scalar)
             )
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _broadcast(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        destination_shape = tuple(
+            _resolve_int(value, self.bindings) for value in destination.shape
+        )
+        try:
+            result = np.broadcast_to(values, destination_shape)
+        except ValueError as error:
+            raise ProgramValidationError(
+                f"cannot broadcast source shape {values.shape} to {destination_shape}"
+            ) from error
         self.write(destination, result, task_core_id=task.core_id)
 
     def _reduce(self, task: Task, operation: str) -> None:

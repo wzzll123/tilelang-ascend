@@ -136,6 +136,8 @@ sigmoid、silu、sin 和 cos 已支持普通及显式/隐藏 scratch 签名；sc
 参与 alias 和 dependency，in-place silu 保留 source read 与 destination write。
 pow 和 clamp/max/min 已支持普通与 scratch forms；pow 的 count 来自真实 access_ptr extent，
 clamp 会验证 literal bounds 和 min/max 顺序。
+broadcast 已支持 rank-1/2、两条二维广播轴、普通/scratch forms、shape legality 和动态
+region；执行器严格按结构化 source/destination shape 广播。
 tail reduction 已贯通仓库当前验证的 float32、axis 0、clear=true contract，支持
 sum/max/min 对二维 valid rectangle 按列归约；workspace、axis 1 和 accumulate 仍待实现。
 
@@ -158,7 +160,7 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `128 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `130 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -235,7 +237,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 pow 和 clamp/max/min 的普通与 scratch forms。~~
 - [x] ~~实现 CAST_FLOOR、CAST_CEIL、CAST_ROUND ties-away-from-zero 和 CAST_TRUNC。~~
 - [ ] 实现 duplicate；确认 CAST_ODD，并为已有 unary/cast 补齐 dtype/异常值语义。
-- [ ] 实现 broadcast、compare、compare_scalar、select 和 tail/mask 语义。
+- [x] ~~实现 rank-1/2 broadcast、两条二维广播轴和普通/scratch forms。~~
+- [ ] 实现 compare、compare_scalar、select 和 tail/mask 语义。
 - [x] ~~实现真实 `tail_reduce` 的 float32 axis-0 clear=true sum/max/min，并覆盖
   valid rectangle、dependency 和非法 dim/clear contract。~~
 - [ ] 实现普通 reduce、axis 1、accumulate/workspace，以及 whole/block reduction。
@@ -330,7 +333,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：128 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：130 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

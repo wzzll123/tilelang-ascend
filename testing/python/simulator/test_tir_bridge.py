@@ -481,6 +481,54 @@ def _pow_clamp_primfunc(operation, *, with_scratch=False):
     )
 
 
+def _broadcast_primfunc(source_shape, *, with_scratch=False):
+    destination_shape = (2, 3)
+    source = tvm.tir.decl_buffer(
+        source_shape, "float32", name="source", scope="global"
+    )
+    output = tvm.tir.decl_buffer(
+        destination_shape, "float32", name="output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        source_shape, "float32", name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        destination_shape, "float32", name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (6,), "float32", name="scratch", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    arguments = [ub_output.access_ptr("w"), ub_source.access_ptr("r")]
+    if with_scratch:
+        arguments.append(scratch.access_ptr("w"))
+    arguments.extend([2, *destination_shape, *source_shape])
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, int(np.prod(source_shape))),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_broadcast", *arguments
+        )),
+        copy("copy_ub_to_gm", ub_output, output, 6),
+    ])
+    alloc_buffers = [ub_source, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=alloc_buffers
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -1064,6 +1112,33 @@ def test_real_tir_pow_and_clamp_forms_execute(operation, with_scratch, expected)
         simulator.read(store.metadata["dst"]),
         expected(source_values, exponent_values),
         rtol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "with_scratch"),
+    [((1, 3), False), ((2, 1), True)],
+)
+def test_real_tir_broadcast_executes_both_axes(source_shape, with_scratch) -> None:
+    program = build_kernel_program(
+        _broadcast_primfunc(source_shape, with_scratch=with_scratch), platform="A2"
+    )
+    load, broadcast, store = program.tasks
+    assert broadcast.operation == "broadcast"
+    assert broadcast.metadata["src"].shape == source_shape
+    assert broadcast.metadata["dst"].shape == (2, 3)
+    assert broadcast.dependencies == (load.task_id,)
+    assert store.dependencies == (broadcast.task_id,)
+    assert ("scratch" in broadcast.metadata) is with_scratch
+
+    simulator = FunctionalSimulator(program)
+    values = np.arange(1, int(np.prod(source_shape)) + 1, dtype=np.float32)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.broadcast_to(values.reshape(source_shape), (2, 3)).reshape(-1),
     )
 
 

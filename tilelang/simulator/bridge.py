@@ -502,6 +502,8 @@ class _TirBridge:
             return self._pow_metadata(arguments, context)
         if short in {"clamp", "clamp_max", "clamp_min"}:
             return self._clamp_metadata(short, arguments, context)
+        if short == "broadcast":
+            return self._broadcast_metadata(arguments, context)
         if short == "cast":
             return self._cast_metadata(arguments, context)
         if short == "fill":
@@ -743,6 +745,82 @@ class _TirBridge:
                 raise ProgramValidationError("access pointer extent must not be negative")
             return extent
         return None
+
+    def _broadcast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        offset = (
+            1
+            if arguments and isinstance(getattr(arguments[0], "value", None), str)
+            else 0
+        )
+        operands = arguments[offset:]
+        if len(operands) < 5:
+            return {}
+        destination_arg, source_arg = operands[:2]
+        cursor = 2
+        scratch_arg = None
+        if (
+            isinstance(operands[cursor], self.tir.Call)
+            and str(operands[cursor].op.name) == "tir.tvm_access_ptr"
+        ):
+            scratch_arg = operands[cursor]
+            cursor += 1
+        dimension = self._const_int(operands[cursor], context.environment)
+        if dimension not in {1, 2}:
+            raise UnsupportedSimOpError(
+                f"functional broadcast supports only rank 1 or 2, got {dimension!r}"
+            )
+        cursor += 1
+        if len(operands) != cursor + 2 * dimension:
+            return {}
+        destination_shape = tuple(
+            self._runtime_int(value, context.environment)
+            for value in operands[cursor:cursor + dimension]
+        )
+        source_shape = tuple(
+            self._runtime_int(value, context.environment)
+            for value in operands[cursor + dimension:]
+        )
+        if any(value is None for value in destination_shape + source_shape):
+            return {}
+        if any(
+            isinstance(value, int) and value < 0
+            for value in destination_shape + source_shape
+        ):
+            raise ProgramValidationError("broadcast extents must not be negative")
+        if all(isinstance(value, int) for value in destination_shape + source_shape):
+            for source_extent, destination_extent in zip(
+                source_shape, destination_shape
+            ):
+                if source_extent not in {1, destination_extent}:
+                    raise ProgramValidationError(
+                        f"cannot broadcast source shape {source_shape} to {destination_shape}"
+                    )
+        destination = self._access_buffer_region(
+            destination_arg, destination_shape, context
+        )
+        source = self._access_buffer_region(source_arg, source_shape, context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "broadcast": {"dimension": dimension},
+        }
+        if scratch_arg is not None:
+            scratch_extent = self._access_ptr_extent(scratch_arg, context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                scratch_arg, (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
 
     def _scalar_metadata(
         self,
