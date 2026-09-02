@@ -1603,6 +1603,7 @@ def test_real_tir_transposed_l1_to_l0b_reinterprets_zn_as_nz() -> None:
         "source_shape": (32, 16),
         "destination_shape": (32, 16),
         "source_origin": (0, 0),
+        "source_window_direct": False,
         "transpose": True,
     }
 
@@ -1626,9 +1627,20 @@ def test_l1_to_l0_rejects_destination_larger_than_logical_source() -> None:
         )
 
 
-def test_real_tir_l1_to_l0_decodes_aligned_source_window() -> None:
+@pytest.mark.parametrize(
+    "transpose,destination_scope,destination_layout",
+    [
+        (False, "wmma.matrix_a", "l0a"),
+        (True, "wmma.matrix_b", "l0b"),
+    ],
+)
+def test_real_tir_l1_to_l0_decodes_aligned_source_window(
+    transpose, destination_scope, destination_layout
+) -> None:
     program = build_kernel_program(
         _l1_to_l0_primfunc(
+            destination_scope=destination_scope,
+            transpose=transpose,
             source_rows=32,
             source_cols=32,
             destination_rows=16,
@@ -1639,13 +1651,28 @@ def test_real_tir_l1_to_l0_decodes_aligned_source_window() -> None:
     )
     task = program.tasks[0]
     assert task.metadata["copy"]["source_origin"] == (16, 16)
+    assert task.metadata["copy"]["source_window_direct"] is True
+    assert task.metadata["src"].shape == (16, 16)
+    assert task.metadata["src"].byte_offset == 768 * 2
+    expected_strides = (2, 16 * 2) if transpose else (16 * 2, 2)
+    assert task.metadata["src"].strides_bytes == expected_strides
     simulator = FunctionalSimulator(program)
     logical = np.arange(32 * 32, dtype=np.float16).reshape(32, 32)
-    simulator.write(task.metadata["src"], pack_matrix(logical, "zN"))
+    whole_l1 = BufferRegion(
+        task.metadata["src"].buffer,
+        MemoryScope.L1,
+        (32 * 32,),
+        "float16",
+        core_id=task.core_id,
+    )
+    simulator.write(whole_l1, pack_matrix(logical, "zN"))
     simulator.run()
+    source_logical = logical.T if transpose else logical
     np.testing.assert_array_equal(
-        unpack_matrix(simulator.read(task.metadata["dst"]), "l0a", (16, 16)),
-        logical[16:32, 16:32],
+        unpack_matrix(
+            simulator.read(task.metadata["dst"]), destination_layout, (16, 16)
+        ),
+        source_logical[16:32, 16:32],
     )
 
 

@@ -169,7 +169,8 @@ Cube copy 已有两条 GM→L1 路径：显式 RowMajor 路径按二维 stride �
 L1→L0 已支持 tile-base 路径：L0A 执行 zN→zZ，L0B 执行 zN→nZ；transpose 路径利用
 zN(A) 与 nZ(Aᵀ) 的物理等价关系，并保留 L1 写入到 L0 读取的 RAW dependency。
 L1→L0 还支持 32-byte 对齐的 L1 source window：从 zN/nZ 物理 offset 反解逻辑 origin，
-在完整 backing 上解码 slice；当前 hazard footprint 保守覆盖完整 L1 tile。
+单 C0 窗口使用真实二维 physical stride 直接读取并生成收窄后的 hazard footprint；跨 C0
+窗口在完整 backing 上解码 slice，hazard footprint 暂时保守覆盖完整 L1 tile。
 standalone L0C→GM 已支持固定 16×16 accumulator fractal 到 RowMajor GM 的 valid
 rectangle、float32→float16 转换和 ReLU；与 MMA 配对的非零 `unitFlag` 仍严格拒绝。
 显式 half→float32 MMA 已支持 L0A/L0B 物理 payload 解码、K-tail、`init=true` 覆盖和
@@ -200,13 +201,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `202 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `203 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 202 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 203 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -315,7 +316,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 standalone L0C→RowMajor GM 的固定 accumulator layout、valid rectangle、
   dtype conversion、ReLU 和 `unitFlag=0` fixpipe。~~
 - [x] ~~实现 32-byte 对齐、可映射为逻辑 origin 的 sliced L1→L0A/L0B source window。~~
-- [ ] 实现非对齐/子 tile GM→L1、精确 sliced L1 hazard footprint 和其它 L0C→GM variants。
+- [x] ~~为单 C0 zN/nZ source window 建立二维 strided region，收窄实际 memory access 和
+  hazard footprint。~~
+- [ ] 实现非对齐/子 tile GM→L1、跨 C0 多段 sliced L1 footprint 和其它 L0C→GM variants。
 - [x] ~~实现 half→float32 `gemm_v0` 功能语义，覆盖 A/B transpose、K-tail、
   init/accumulate 和无 BiSheng 端到端路径。~~
 - [ ] 展开 `gemm_v0` 内部 K/N tiling、L0 ping-pong、同步和 trace/timing task。
@@ -405,7 +408,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：202 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：203 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -415,7 +418,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 以 EasyASC footprint guards 将 sliced L1→L0 的保守整 tile dependency 收窄为精确窗口。
+1. 将跨 C0 sliced L1→L0 表示为多段 physical regions，消除剩余整 tile 保守 dependency。
 2. 将 `gemm_v0` 内部 K/N tiling 和 L0 ping-pong 展开为可诊断 trace task。
 3. 实现 partial `n_actual` 与 unitFlag/fixpipe 配对协议。
 4. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。

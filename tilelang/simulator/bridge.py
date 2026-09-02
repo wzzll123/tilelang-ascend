@@ -902,12 +902,32 @@ class _TirBridge:
             raise ProgramValidationError(
                 f"{operation} source window exceeds its logical L1 tile"
             )
-        source = replace(
-            source,
-            shape=(source_elements,),
-            byte_offset=0,
-            strides_bytes=None,
-        )
+        elements_per_c0 = BYTE_PER_C0 // itemsize
+        if source_layout == "zN":
+            direct_window = (
+                source_origin[1] // elements_per_c0
+                == (source_origin[1] + destination_cols - 1) // elements_per_c0
+            )
+            source_strides = (elements_per_c0 * itemsize, itemsize)
+        else:
+            direct_window = (
+                source_origin[0] // elements_per_c0
+                == (source_origin[0] + destination_rows - 1) // elements_per_c0
+            )
+            source_strides = (itemsize, elements_per_c0 * itemsize)
+        if direct_window:
+            source = replace(
+                source,
+                shape=destination_shape,
+                strides_bytes=source_strides,
+            )
+        else:
+            source = replace(
+                source,
+                shape=(source_elements,),
+                byte_offset=0,
+                strides_bytes=None,
+            )
         for label, region, elements, spec in (
             ("destination", destination, destination_elements, destination_spec),
         ):
@@ -934,6 +954,7 @@ class _TirBridge:
                 "source_shape": source_shape,
                 "destination_shape": destination_shape,
                 "source_origin": source_origin,
+                "source_window_direct": direct_window,
                 "transpose": transpose,
             },
         }
