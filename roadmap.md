@@ -198,13 +198,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `200 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `201 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 200 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 201 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -317,7 +317,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   init/accumulate 和无 BiSheng 端到端路径。~~
 - [ ] 展开 `gemm_v0` 内部 K/N tiling、L0 ping-pong、同步和 trace/timing task。
 - [x] ~~实现显式 half→float32 `mma`，支持 K-tail、init 和 accumulate。~~
-- [ ] 实现 partial `n_actual`、其它 MMA dtype 和多 K tile 的端到端累加用例。
+- [x] ~~实现多 MMA task 对同一 L0C 的 K 分块累加与 RAW dependency golden。~~
+- [ ] 实现 partial `n_actual` 和其它 MMA dtype。
 - [ ] 实现 MMA/fixpipe 配对 unitFlag、quant、非 RowMajor 输出和其它 fixpipe variants。
 - [ ] 支持 A/B transpose，以及 NZ、ZN、fractal 等核心 layout。
 - [ ] 使用 NumPy/PyTorch golden 覆盖 M/N/K tail、多 core 分块和 pipeline overlap。
@@ -401,7 +402,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：200 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：201 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -413,5 +414,5 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 1. 以 EasyASC footprint guards 扩展 sliced L1→L0 和非 tile-base 合法路径。
 2. 将 `gemm_v0` 内部 K/N tiling 和 L0 ping-pong 展开为可诊断 trace task。
-3. 实现多 MMA task 的 K 分块累加、partial `n_actual` 与 unitFlag/fixpipe 配对协议。
+3. 实现 partial `n_actual` 与 unitFlag/fixpipe 配对协议。
 4. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。

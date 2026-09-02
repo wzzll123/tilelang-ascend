@@ -266,6 +266,33 @@ def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0):
     return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
 
 
+def _mma_chain_primfunc():
+    inputs = [
+        tvm.tir.decl_buffer(
+            (256,), "float16", name=f"l0{role}{index}",
+            scope=f"wmma.matrix_{role}",
+        )
+        for index in range(2)
+        for role in ("a", "b")
+    ]
+    l0c = tvm.tir.decl_buffer(
+        (256,), "float32", name="l0c", scope="wmma.accumulator"
+    )
+    calls = []
+    for index in range(2):
+        l0a, l0b = inputs[index * 2:index * 2 + 2]
+        calls.append(tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_mma", "mma<half, float, 16, 16>",
+            l0a.access_ptr("r"), l0b.access_ptr("r"),
+            l0c.access_ptr("w" if index == 0 else "rw"), index == 0, 13,
+        )))
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(calls),
+        alloc_buffers=[*inputs, l0c],
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
 def _gemm_v0_primfunc(
     transpose_a=False, transpose_b=False, init=True, n_actual=None, k_l0_size=16
 ):
@@ -1686,6 +1713,31 @@ def test_mma_rejects_partial_n_actual_until_partial_l0c_is_modeled() -> None:
         build_kernel_program(
             _mma_primfunc(n_actual=8), platform="A3"
         )
+
+
+def test_real_tir_mma_chain_accumulates_k_tiles_with_raw_dependency() -> None:
+    program = build_kernel_program(_mma_chain_primfunc(), platform="A3")
+    first, second = program.tasks
+    assert second.dependencies == (first.task_id,)
+    simulator = FunctionalSimulator(program)
+    expected = np.zeros((16, 16), dtype=np.float32)
+    for index, task in enumerate(program.tasks):
+        left = (
+            np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 40 + index
+        ) / 32
+        right = (
+            np.arange(13 * 16, dtype=np.float16).reshape(13, 16) - 60 - index
+        ) / 64
+        simulator.write(task.metadata["lhs"], pack_matrix(left, "l0a"))
+        simulator.write(task.metadata["rhs"], pack_matrix(right, "l0b"))
+        expected += left.astype(np.float32) @ right.astype(np.float32)
+    simulator.run()
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(second.metadata["dst"]), "l0c", (16, 16)),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 @pytest.mark.parametrize(
