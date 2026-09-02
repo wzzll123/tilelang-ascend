@@ -1604,6 +1604,7 @@ def test_real_tir_transposed_l1_to_l0b_reinterprets_zn_as_nz() -> None:
         "destination_shape": (32, 16),
         "source_origin": (0, 0),
         "source_window_direct": False,
+        "source_region_axis": 0,
         "transpose": True,
     }
 
@@ -1673,6 +1674,34 @@ def test_real_tir_l1_to_l0_decodes_aligned_source_window(
             simulator.read(task.metadata["dst"]), destination_layout, (16, 16)
         ),
         source_logical[16:32, 16:32],
+    )
+
+
+def test_real_tir_l1_to_l0_uses_multiple_regions_across_c0_blocks() -> None:
+    program = build_kernel_program(
+        _l1_to_l0_primfunc(
+            source_rows=32,
+            source_cols=32,
+            destination_rows=16,
+            destination_cols=32,
+            source_offset=256,
+        ),
+        platform="A3",
+    )
+    task = program.tasks[0]
+    regions = task.metadata["src_regions"]
+    assert task.metadata["copy"]["source_origin"] == (16, 0)
+    assert task.metadata["copy"]["source_region_axis"] == 1
+    assert [region.shape for region in regions] == [(16, 16), (16, 16)]
+    assert [region.byte_offset for region in regions] == [256 * 2, 768 * 2]
+
+    simulator = FunctionalSimulator(program)
+    logical = np.arange(32 * 32, dtype=np.float16).reshape(32, 32)
+    simulator.write(task.metadata["src"], pack_matrix(logical, "zN"))
+    simulator.run()
+    np.testing.assert_array_equal(
+        unpack_matrix(simulator.read(task.metadata["dst"]), "l0a", (16, 32)),
+        logical[16:32, :],
     )
 
 

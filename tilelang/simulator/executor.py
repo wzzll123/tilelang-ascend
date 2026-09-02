@@ -219,11 +219,24 @@ class FunctionalSimulator:
                 np.full(pad_shape, pad_value, dtype=_numpy_dtype(pad_destination.dtype)),
                 task_core_id=task.core_id,
             )
-        values = self.read(source, task_core_id=task.core_id)
+        source_regions = task.metadata.get("src_regions")
+        if isinstance(source_regions, (tuple, list)):
+            fragments = [
+                self.read(region, task_core_id=task.core_id)
+                for region in source_regions
+            ]
+            values = np.concatenate(
+                fragments, axis=copy_details["source_region_axis"]
+            )
+        else:
+            values = self.read(source, task_core_id=task.core_id)
         if copy_details.get("layout_transform") is True:
             source_shape = tuple(copy_details["source_shape"])
             destination_shape = tuple(copy_details["destination_shape"])
-            if copy_details.get("source_window_direct") is True:
+            if (
+                copy_details.get("source_window_direct") is True
+                or isinstance(source_regions, (tuple, list))
+            ):
                 tile = values
             else:
                 logical = unpack_matrix(
