@@ -37,7 +37,7 @@
 │       │   内存: GM→L1→L0C→片上直连→UB→GM（默认无 workspace 中转）
 │       │   pass_configs: AUTO_SYNC + AUTO_CV_COMBINE + AUTO_CV_SYNC
 │       │   同步: AUTO_SYNC + AUTO_CV_SYNC 自动处理
-│       │   V 核: threads=2 自动并行（消 vid）；复杂场景才回退 workspace+vid
+│       │   V 核: threads=2 自动并行（消 vid，**仅此 CV 融合路径成立**）；复杂场景才回退 workspace+vid
 │       │   写法: 见 tilelang-programming-model-guide mode-examples.md §6
 │       │
 │       ├─ Expert 模式（极致性能）
@@ -51,6 +51,15 @@
 │   ├─ 单步运算 → Developer 模式
 │   │   API: T.Parallel + 算术符号
 │   │   内存: T.alloc_shared（编译器映射到 UB）
+│   │
+│   ├─ ⚠️ vid 与 grid（纯 V/无 CV 融合时必读，2026-09 RoPE 实战）：
+│   │   DSL launch 语义统一，块内恒有两个 AIV 工作者，任务索引必须显式
+│   │   (cid, vid) 联合寻址（task = cid*2+vid 形态，参考
+│   │   examples/cann-bench/transpose）。"threads=2 消 vid" 仅 CV 融合
+│   │   Developer 路径成立，纯 V 不适用；get_core_num("vector") 语义上不是
+│   │   grid 单位（DSL 无 AIV_ONLY 可选），禁止拿它定 grid 后不切 vid。
+│   │   不写 vid = 同核两 AIV 重复同一任务（功能不错——写两遍同值，纯 V
+│   │   吞吐腰斩；自检：vid 绑定后引用数必须 ≥2）
 │   │
 │   └─ 多步运算（如 softmax、layer_norm）
 │       参考: examples/softmax/*.py, examples/normalization/*.py

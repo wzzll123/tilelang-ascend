@@ -114,7 +114,7 @@ description: "根据算子需求生成 TileLang-Ascend 算子设计文档（desi
    按这些动态切片裁剪搬运，**不代表尾块无需设计**；host 侧不允许 padding + crop）
 6. 循环与调度结构
 7. 同步策略
-8. CV 融合设计（**按模式分支**：Developer 默认消除 workspace/vid——`threads=2` + 片上直连，不产出 workspace 规格；仅 Expert/混合或复杂场景回退才设计 workspace + `workspace_idx`。详见 design-template.md §8.2）
+8. CV 融合设计（**按模式分支**：Developer 默认消除 workspace/vid——`threads=2` + 片上直连，不产出 workspace 规格；仅 Expert/混合或复杂场景回退才设计 workspace + `workspace_idx`。详见 design-template.md §8.2）。**注意："消 vid" 仅限 CV 融合 Developer 路径；纯 V（无 AUTO_CV_COMBINE）kernel 必须显式 (cid, vid) 联合寻址切分任务（decision-tree.md 纯 element-wise 分支）**
 9. 验证方案（Golden + **L0 门槛测试计划** + **性能可行性哨兵**；除规则
    shape 外，至少包含每条路径最坏 dtype/最大任务数的用户关键 case，并给出单 case 超时预算；
    完整分层套件 L1/L2/Boundary 交由 `tilelang-op-test-design`）。若算子支持
