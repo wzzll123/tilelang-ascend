@@ -529,6 +529,8 @@ class _TirBridge:
             return self._l1_to_l0_metadata(
                 short, normalized, arguments, context
             )
+        if short == "copy_l0c_to_gm":
+            return self._l0c_to_gm_metadata(normalized, arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -776,12 +778,15 @@ class _TirBridge:
         # flag are compile-time template arguments on the operation name.
         if len(arguments) != 4:
             return {}
-        template = operation_tag.rsplit("::", 1)[-1]
-        if "<" not in template or not template.endswith(">"):
+        marker = f"{operation}<"
+        marker_start = operation_tag.find(marker)
+        if marker_start < 0 or not operation_tag.endswith(">"):
             return {}
         parameters = [
             parameter.strip()
-            for parameter in template.split("<", 1)[1][:-1].split(",")
+            for parameter in operation_tag[
+                marker_start + len(marker):-1
+            ].split(",")
         ]
         if len(parameters) != 4:
             raise UnsupportedSimOpError(
@@ -893,6 +898,156 @@ class _TirBridge:
                 "source_shape": source_shape,
                 "destination_shape": destination_shape,
                 "transpose": transpose,
+            },
+        }
+
+    def _l0c_to_gm_metadata(
+        self,
+        operation_tag: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: src, dst, dstStrideN, validM, validN, srcM, srcN,
+        # enableRelu, unitFlag.
+        if len(arguments) != 9:
+            return {}
+        marker = "copy_l0c_to_gm<"
+        marker_start = operation_tag.find(marker)
+        if marker_start < 0 or not operation_tag.endswith(">"):
+            return {}
+        parameters = [
+            parameter.strip()
+            for parameter in operation_tag[
+                marker_start + len(marker):-1
+            ].split(",")
+        ]
+        if len(parameters) != 6:
+            raise UnsupportedSimOpError(
+                f"malformed copy_l0c_to_gm template {operation_tag!r}"
+            )
+        if parameters[2] not in {"layout::rowmajor", "layout::row_major"}:
+            raise UnsupportedSimOpError(
+                f"functional copy_l0c_to_gm requires RowMajor GM, got {parameters[2]!r}"
+            )
+        try:
+            template_rows, template_cols = (int(parameters[index]) for index in (3, 4))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires static source template extents"
+            ) from error
+        if parameters[5] not in {"true", "false"}:
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires a literal ReLU template flag"
+            )
+        template_relu = parameters[5] == "true"
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm requires static dimensions"
+            )
+        destination_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
+        if min(destination_cols, physical_rows, physical_cols) <= 0:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical extents and GM stride must be positive"
+            )
+        if valid_rows < 0 or valid_cols < 0:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid extents must not be negative"
+            )
+        if valid_rows > physical_rows or valid_cols > physical_cols:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid rectangle must fit its physical L0C tile"
+            )
+        if valid_cols > destination_cols:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid columns exceed the GM row stride"
+            )
+        if (physical_rows, physical_cols) != (template_rows, template_cols):
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical extents disagree with its template"
+            )
+        relu_argument = self._literal(self.analyzer.simplify(arguments[7]))
+        if not isinstance(relu_argument, (bool, int)):
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires a literal enable_relu argument"
+            )
+        if bool(relu_argument) != template_relu:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm ReLU argument disagrees with its template"
+            )
+        unit_flag = self._runtime_int(arguments[8], context.environment)
+        if unit_flag != 0:
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm supports standalone unitFlag=0 only"
+            )
+
+        source_name = self._access_ptr_data_name(arguments[0])
+        if source_name is None:
+            return {}
+        source_buffer = self.buffer_name_by_data_var.get(source_name)
+        if source_buffer is None:
+            return {}
+        source_spec = self.buffers[source_buffer]
+        source_elements = storage_elements(
+            "l0c",
+            (physical_rows, physical_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source = self._access_buffer_region(
+            arguments[0], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.L0C or destination.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm requires L0C source and GM destination"
+            )
+        source_template_dtype = _ascend_template_dtype(parameters[0])
+        destination_template_dtype = _ascend_template_dtype(parameters[1])
+        if source_template_dtype is None or destination_template_dtype is None:
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm uses an unsupported template dtype"
+            )
+        if (
+            source.dtype != source_template_dtype
+            or destination.dtype != destination_template_dtype
+        ):
+            raise ProgramValidationError(
+                "copy_l0c_to_gm buffer dtypes disagree with its template"
+            )
+        source_bytes = source_elements * dtype_size_bytes(source.dtype)
+        if (
+            not isinstance(source.byte_offset, int)
+            or source.byte_offset % source_bytes
+        ):
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm requires a tile-base-aligned source"
+            )
+        source_size = _buffer_size_bytes(source_spec)
+        if source_size is not None and source.byte_offset + source_bytes > source_size:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical source tile exceeds its buffer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout_transform": True,
+                "source_layout": "l0c",
+                "destination_layout": "row_major",
+                "source_shape": (physical_rows, physical_cols),
+                "destination_shape": (valid_rows, valid_cols),
+                "relu": template_relu,
+                "unit_flag": unit_flag,
+                "destination_cols": destination_cols,
             },
         }
 
@@ -2187,3 +2342,19 @@ def _buffer_size_bytes(spec: BufferSpec) -> Optional[int]:
     for extent in spec.shape:
         size *= extent
     return size
+
+
+def _ascend_template_dtype(token: str) -> Optional[str]:
+    return {
+        "half": "float16",
+        "float": "float32",
+        "bfloat16_t": "bfloat16",
+        "int8_t": "int8",
+        "int16_t": "int16",
+        "int": "int32",
+        "int64_t": "int64",
+        "uint8_t": "uint8",
+        "uint16_t": "uint16",
+        "uint32_t": "uint32",
+        "uint64_t": "uint64",
+    }.get(token.strip().lower())

@@ -220,10 +220,15 @@ class FunctionalSimulator:
             logical = unpack_matrix(
                 values, copy_details["source_layout"], source_shape
             )
+            tile = logical[:destination_shape[0], :destination_shape[1]]
+            if copy_details.get("relu") is True:
+                tile = np.maximum(tile, 0)
             values = pack_matrix(
-                logical[:destination_shape[0], :destination_shape[1]],
+                tile,
                 copy_details["destination_layout"],
             )
+            if len(destination.shape) > 1:
+                values = values.reshape(destination_shape)
         elif copy_details.get("layout") == "zN":
             physical_shape = (
                 _resolve_int(copy_details["physical_rows"], self.bindings),

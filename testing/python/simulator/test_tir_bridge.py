@@ -196,6 +196,37 @@ def _gm_l1_l0_primfunc():
     )
 
 
+def _l0c_to_gm_primfunc(enable_relu=True, unit_flag=0):
+    l0c = tvm.tir.decl_buffer(
+        (16 * 32,), "float32", name="l0c", scope="wmma.accumulator"
+    )
+    output = tvm.tir.decl_buffer(
+        (16, 32), "float16", name="output", scope="global"
+    )
+    copy = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_l0c_to_gm<float, half, layout::RowMajor, "
+        f"16, 32, {str(enable_relu).lower()}>",
+        l0c.access_ptr("r"),
+        output.access_ptr("w"),
+        32,
+        13,
+        17,
+        16,
+        32,
+        enable_relu,
+        unit_flag,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[l0c]
+    )
+    return tvm.tir.PrimFunc(
+        [output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
 def _vector_add_primfunc():
     x = tvm.tir.decl_buffer((8,), "float32", name="x", scope="global")
     y = tvm.tir.decl_buffer((8,), "float32", name="y", scope="global")
@@ -1387,6 +1418,37 @@ def test_real_tir_gm_l1_l0a_pipeline_executes_with_raw_dependency() -> None:
 
     physical = simulator.read(program.tasks[1].metadata["dst"])
     np.testing.assert_array_equal(unpack_matrix(physical, "zZ", (32, 32)), logical)
+
+
+def test_real_tir_l0c_to_gm_executes_relu_tail_and_dtype_conversion() -> None:
+    program = build_kernel_program(_l0c_to_gm_primfunc(), platform="A3")
+    task = program.tasks[0]
+    assert (task.operation, task.lane, task.pipe) == (
+        "copy_l0c_to_gm", Lane.CUBE, Pipe.FIX,
+    )
+    assert task.metadata["copy"] == {
+        "layout_transform": True,
+        "source_layout": "l0c",
+        "destination_layout": "row_major",
+        "source_shape": (16, 32),
+        "destination_shape": (13, 17),
+        "relu": True,
+        "unit_flag": 0,
+        "destination_cols": 32,
+    }
+
+    simulator = FunctionalSimulator(program)
+    logical = np.linspace(-4, 4, 16 * 32, dtype=np.float32).reshape(16, 32)
+    simulator.write(task.metadata["src"], pack_matrix(logical, "l0c"))
+    simulator.run()
+
+    expected = np.maximum(logical[:13, :17], 0).astype(np.float16)
+    np.testing.assert_array_equal(simulator.read(task.metadata["dst"]), expected)
+
+
+def test_l0c_to_gm_rejects_paired_unit_flag_until_mma_is_supported() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="unitFlag=0 only"):
+        build_kernel_program(_l0c_to_gm_primfunc(unit_flag=3), platform="A2")
 
 
 @pytest.mark.parametrize(

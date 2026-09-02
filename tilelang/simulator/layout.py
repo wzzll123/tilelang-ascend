@@ -1,6 +1,6 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""Physical A2/A3 zN, zZ, and nZ matrix-layout codecs for Cube simulation."""
+"""Physical A2/A3 matrix-layout codecs used by Cube simulation."""
 
 from __future__ import annotations
 
@@ -40,6 +40,10 @@ def storage_elements(layout: str, shape: Tuple[int, int], itemsize: int) -> int:
     normalized = layout.strip().lower()
     if normalized == "row_major":
         return rows * cols
+    if normalized == "l0c":
+        return _round_up(rows, C0_NUM_PER_FRACTAL) * _round_up(
+            cols, C0_NUM_PER_FRACTAL
+        )
     if normalized in {"zn", "zz"}:
         return _round_up(rows, C0_NUM_PER_FRACTAL) * _round_up(cols, elements_per_c0)
     if normalized == "nz":
@@ -56,8 +60,8 @@ def physical_index(
 ) -> int:
     """Map one logical matrix coordinate to its physical element offset.
 
-    zN/nZ follow ``tilelang/intrinsics/ascend_layout.py``; zZ follows the
-    Catlass ``layout::zZ::MakeLayout`` shape and stride construction.
+    zN/nZ follow ``tilelang/intrinsics/ascend_layout.py``; zZ and L0C follow
+    the Catlass ``layout::zZ::MakeLayout`` and ``tla::MakeLayoutL0C`` strides.
     """
     rows, cols, elements_per_c0 = _validate(shape, itemsize)
     if not (0 <= row < rows and 0 <= col < cols):
@@ -68,6 +72,17 @@ def physical_index(
     normalized = layout.strip().lower()
     if normalized == "row_major":
         return row * cols + col
+    if normalized == "l0c":
+        return (
+            row // C0_NUM_PER_FRACTAL
+            * C0_NUM_PER_FRACTAL
+            * C0_NUM_PER_FRACTAL
+            + col // C0_NUM_PER_FRACTAL
+            * _round_up(rows, C0_NUM_PER_FRACTAL)
+            * C0_NUM_PER_FRACTAL
+            + row % C0_NUM_PER_FRACTAL * C0_NUM_PER_FRACTAL
+            + col % C0_NUM_PER_FRACTAL
+        )
     if normalized == "zn":
         return (
             row // C0_NUM_PER_FRACTAL * elements_per_fractal

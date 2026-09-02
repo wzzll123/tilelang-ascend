@@ -16,7 +16,12 @@ from tilelang.simulator.layout import (
 
 @pytest.mark.parametrize(
     ("layout", "shape", "expected_elements"),
-    [("zN", (17, 9), 512), ("zZ", (17, 9), 512), ("nZ", (9, 17), 512)],
+    [
+        ("zN", (17, 9), 512),
+        ("zZ", (17, 9), 512),
+        ("nZ", (9, 17), 512),
+        ("l0c", (17, 9), 512),
+    ],
 )
 def test_fractal_layout_round_trip(layout, shape, expected_elements) -> None:
     values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
@@ -35,6 +40,11 @@ def test_zn_and_nz_use_repository_coordinate_formulas() -> None:
 def test_zz_uses_catlass_make_layout_strides() -> None:
     assert physical_index("zZ", 16, 0, (32, 32), 2) == 512
     assert physical_index("zZ", 0, 16, (32, 32), 2) == 256
+
+
+def test_l0c_uses_fixed_16_by_16_accumulator_fractals() -> None:
+    assert physical_index("l0c", 16, 0, (17, 17), 4) == 256
+    assert physical_index("l0c", 0, 16, (17, 17), 4) == 512
 
 
 def test_layout_codec_rejects_unknown_layout_and_short_storage() -> None:
