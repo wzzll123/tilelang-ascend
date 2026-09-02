@@ -35,7 +35,7 @@ _VECTOR_OPS = frozenset({
     "init_sort_buf", "leaky_relu", "ln", "max", "maxs", "merge_sort", "min", "mins",
     "mul", "muls", "pow", "reciprocal", "reduce", "reduce_max", "reduce_min",
     "reduce_sum", "relu", "round", "rsqrt", "select",
-    "sigmoid", "sin", "sort", "sort32", "sqrt", "sub", "subs", "tail_binary",
+    "sigmoid", "silu", "sin", "sort", "sort32", "sqrt", "sub", "subs", "tail_binary",
     "tail_broadcast", "tail_compare", "tail_compare_scalar", "tail_reduce", "tail_scalar",
     "tail_select", "tail_unary", "topk", "transpose", "wholereducemax",
     "wholereducemin", "wholereducesum", "abs_experiment", "brcb_experiment",
@@ -496,6 +496,8 @@ class _TirBridge:
             return metadata
         if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
+        if short in {"sigmoid", "silu", "sin", "cos"}:
+            return self._scratch_unary_metadata(arguments, context)
         if short == "cast":
             return self._cast_metadata(arguments, context)
         if short == "fill":
@@ -628,6 +630,30 @@ class _TirBridge:
         metadata: Dict[str, Any] = {"dst": destination, "src": source}
         if tail:
             metadata["tail"] = self._tail_details(arguments, context, 2)
+        return metadata
+
+    def _scratch_unary_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {3, 4}:
+            return {}
+        count = self._runtime_int(arguments[-1], context.environment)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("vector count must not be negative")
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        if len(arguments) == 4:
+            scratch = self._access_buffer_region(arguments[2], (count,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
         return metadata
 
     def _scalar_metadata(
@@ -896,7 +922,7 @@ class _TirBridge:
         core_id: int,
     ) -> Tuple[str, ...]:
         reads = self._operand_regions(metadata, ("src", "lhs", "rhs", "accumulator"))
-        writes = self._operand_regions(metadata, ("dst", "pad_dst"))
+        writes = self._operand_regions(metadata, ("dst", "pad_dst", "scratch"))
         dependencies = {
             task_id
             for region in reads
@@ -915,7 +941,7 @@ class _TirBridge:
         reads = self._operand_regions(
             task.metadata, ("src", "lhs", "rhs", "accumulator")
         )
-        writes = self._operand_regions(task.metadata, ("dst", "pad_dst"))
+        writes = self._operand_regions(task.metadata, ("dst", "pad_dst", "scratch"))
         for region in writes:
             self.last_writes = [
                 entry for entry in self.last_writes

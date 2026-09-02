@@ -127,6 +127,10 @@ def test_binary_task_requires_explicit_operands() -> None:
         ("relu", lambda value: np.maximum(value, 0)),
         ("rsqrt", lambda value: 1 / np.sqrt(value)),
         ("sqrt", lambda value: np.sqrt(value)),
+        ("sigmoid", lambda value: np.exp(-np.logaddexp(0, -value))),
+        ("silu", lambda value: value * np.exp(-np.logaddexp(0, -value))),
+        ("sin", lambda value: np.sin(value)),
+        ("cos", lambda value: np.cos(value)),
     ],
 )
 def test_unary_vector_operations(operation, expected) -> None:

@@ -49,6 +49,10 @@ _UNARY_OPERATIONS = {
     "relu": lambda value: np.maximum(value, 0),
     "rsqrt": lambda value: np.divide(1, np.sqrt(value)),
     "sqrt": np.sqrt,
+    "sigmoid": lambda value: np.exp(-np.logaddexp(0, -value)),
+    "silu": lambda value: value * np.exp(-np.logaddexp(0, -value)),
+    "sin": np.sin,
+    "cos": np.cos,
 }
 
 _REDUCE_OPERATIONS = {

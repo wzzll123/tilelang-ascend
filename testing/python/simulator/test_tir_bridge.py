@@ -361,6 +361,56 @@ def _scalar_vector_primfunc(operation):
     )
 
 
+def _scratch_unary_primfunc(operation, *, with_scratch=False, in_place=False):
+    source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
+    output = tvm.tir.decl_buffer((5,), "float32", name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (5,), "float32", name="scratch", scope="shared.ub"
+    )
+    destination = ub_source if in_place else ub_output
+
+    def copy(name, source_buffer, destination_buffer):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            name,
+            source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"),
+            5,
+        ))
+
+    operation_arguments = [
+        destination.access_ptr("w"),
+        ub_source.access_ptr("r"),
+    ]
+    if with_scratch:
+        operation_arguments.append(scratch.access_ptr("w"))
+    operation_arguments.append(5)
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_{operation}", *operation_arguments
+        )),
+        copy("copy_ub_to_gm", destination, output),
+    ])
+    alloc_buffers = [ub_source, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=alloc_buffers
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -838,6 +888,47 @@ def test_real_tir_scalar_activation_builds_operands_and_executes(operation) -> N
     simulator.run()
 
     np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize(
+    ("operation", "with_scratch", "in_place", "expected"),
+    [
+        ("sigmoid", False, False, lambda x: np.exp(-np.logaddexp(0, -x))),
+        ("sin", True, False, np.sin),
+        ("cos", False, False, np.cos),
+        (
+            "silu",
+            True,
+            True,
+            lambda x: x * np.exp(-np.logaddexp(0, -x)),
+        ),
+    ],
+)
+def test_real_tir_scratch_unary_forms_execute(
+    operation, with_scratch, in_place, expected
+) -> None:
+    program = build_kernel_program(
+        _scratch_unary_primfunc(
+            operation, with_scratch=with_scratch, in_place=in_place
+        ),
+        platform="A2",
+    )
+    unary = next(task for task in program.tasks if task.operation == operation)
+    load, store = program.tasks[0], program.tasks[-1]
+    assert unary.dependencies == (load.task_id,)
+    assert store.dependencies == (unary.task_id,)
+    assert ("scratch" in unary.metadata) is with_scratch
+
+    simulator = FunctionalSimulator(program)
+    values = np.array([-4, -1, 0, 2, 8], dtype=np.float32)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (5,), "float32"), values
+    )
+    simulator.run()
+
+    np.testing.assert_allclose(
+        simulator.read(store.metadata["dst"]), expected(values), rtol=1e-6
+    )
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:
