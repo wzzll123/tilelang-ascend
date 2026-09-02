@@ -266,7 +266,44 @@ def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0):
     return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
 
 
-def _gemm_pipeline_primfunc():
+def _gemm_v0_primfunc(
+    transpose_a=False, transpose_b=False, init=True, n_actual=None, k_l0_size=16
+):
+    rows, cols, inner = 16, 16, 13
+    shape_a = (inner, rows) if transpose_a else (rows, inner)
+    shape_b = (cols, inner) if transpose_b else (inner, cols)
+    l1a = tvm.tir.decl_buffer((256,), "float16", name="l1a", scope="shared.l1")
+    l1b = tvm.tir.decl_buffer((256,), "float16", name="l1b", scope="shared.l1")
+    l0c = tvm.tir.decl_buffer(
+        (256,), "float32", name="l0c", scope="wmma.accumulator"
+    )
+    call = tvm.tir.call_extern(
+        "handle",
+        "tl.ascend_gemm_v0",
+        f"gemm_v0<half, float, {rows}, {cols}, {inner}, "
+        f"{str(transpose_a).lower()}, {str(transpose_b).lower()}, {k_l0_size}>",
+        l1a.access_ptr("r"),
+        l1b.access_ptr("r"),
+        l0c.access_ptr("w" if init else "rw"),
+        init,
+        cols if n_actual is None else n_actual,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.Evaluate(call),
+        alloc_buffers=[l1a, l1b, l0c],
+    )
+    return (
+        tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root)),
+        shape_a,
+        shape_b,
+    )
+
+
+def _gemm_pipeline_primfunc(use_gemm_v0=False):
     shape = (16, 16)
     left = tvm.tir.decl_buffer(shape, "float16", name="left", scope="global")
     right = tvm.tir.decl_buffer(shape, "float16", name="right", scope="global")
@@ -284,43 +321,98 @@ def _gemm_pipeline_primfunc():
     )
 
     def gm_to_l1(source, destination):
-        return tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle",
-            "tl::ascend::copy_gm_to_l1<half, 16, 16>",
-            source.access_ptr("r"),
-            destination.access_ptr("w"),
-            16, 16, 16, 16, 16,
-        ))
+        return tvm.tir.Evaluate(
+            tvm.tir.call_extern(
+                "handle",
+                "tl::ascend::copy_gm_to_l1<half, 16, 16>",
+                source.access_ptr("r"),
+                destination.access_ptr("w"),
+                16,
+                16,
+                16,
+                16,
+                16,
+            )
+        )
 
-    body = tvm.tir.SeqStmt([
+    operations = [
         gm_to_l1(left, l1a),
         gm_to_l1(right, l1b),
-        tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle",
-            "tl::ascend::copy_l1_to_l0a<half, 16, 16, false>",
-            l1a.access_ptr("r"), l0a.access_ptr("w"), 16, 16,
-        )),
-        tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle",
-            "tl::ascend::copy_l1_to_l0b<half, 16, 16, false>",
-            l1b.access_ptr("r"), l0b.access_ptr("w"), 16, 16,
-        )),
-        tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle", "tl.ascend_mma", "mma<half, float, 16, 16>",
-            l0a.access_ptr("r"), l0b.access_ptr("r"),
-            l0c.access_ptr("w"), True, 16,
-        )),
-        tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle",
-            "tl::ascend::copy_l0c_to_gm<float, float, layout::RowMajor, "
-            "16, 16, false>",
-            l0c.access_ptr("r"), output.access_ptr("w"),
-            16, 16, 16, 16, 16, False, 0,
-        )),
-    ])
-    root = tvm.tir.Block(
-        [], [], [], "root", body, alloc_buffers=[l1a, l1b, l0a, l0b, l0c]
+    ]
+    allocations = [l1a, l1b, l0c]
+    if use_gemm_v0:
+        operations.append(
+            tvm.tir.Evaluate(
+                tvm.tir.call_extern(
+                    "handle",
+                    "tl.ascend_gemm_v0",
+                    "gemm_v0<half, float, 16, 16, 16, false, false, 16>",
+                    l1a.access_ptr("r"),
+                    l1b.access_ptr("r"),
+                    l0c.access_ptr("w"),
+                    True,
+                    16,
+                )
+            )
+        )
+    else:
+        operations.extend(
+            [
+                tvm.tir.Evaluate(
+                    tvm.tir.call_extern(
+                        "handle",
+                        "tl::ascend::copy_l1_to_l0a<half, 16, 16, false>",
+                        l1a.access_ptr("r"),
+                        l0a.access_ptr("w"),
+                        16,
+                        16,
+                    )
+                ),
+                tvm.tir.Evaluate(
+                    tvm.tir.call_extern(
+                        "handle",
+                        "tl::ascend::copy_l1_to_l0b<half, 16, 16, false>",
+                        l1b.access_ptr("r"),
+                        l0b.access_ptr("w"),
+                        16,
+                        16,
+                    )
+                ),
+                tvm.tir.Evaluate(
+                    tvm.tir.call_extern(
+                        "handle",
+                        "tl.ascend_mma",
+                        "mma<half, float, 16, 16>",
+                        l0a.access_ptr("r"),
+                        l0b.access_ptr("r"),
+                        l0c.access_ptr("w"),
+                        True,
+                        16,
+                    )
+                ),
+            ]
+        )
+        allocations.extend([l0a, l0b])
+    operations.append(
+        tvm.tir.Evaluate(
+            tvm.tir.call_extern(
+                "handle",
+                "tl::ascend::copy_l0c_to_gm<float, float, layout::RowMajor, "
+                "16, 16, false>",
+                l0c.access_ptr("r"),
+                output.access_ptr("w"),
+                16,
+                16,
+                16,
+                16,
+                16,
+                False,
+                0,
+            )
+        )
     )
+    body = tvm.tir.SeqStmt(operations)
+    root = tvm.tir.Block([], [], [], "root", body, alloc_buffers=allocations)
     return tvm.tir.PrimFunc(
         [left.data, right.data, output.data],
         tvm.tir.BlockRealize([], True, root),
@@ -1596,6 +1688,64 @@ def test_mma_rejects_partial_n_actual_until_partial_l0c_is_modeled() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "transpose_a,transpose_b",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+@pytest.mark.parametrize("initialize", [True, False])
+def test_real_tir_gemm_v0_executes_transpose_and_accumulation(
+    transpose_a, transpose_b, initialize
+) -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(
+        transpose_a=transpose_a,
+        transpose_b=transpose_b,
+        init=initialize,
+    )
+    program = build_kernel_program(prim_func, platform="A2")
+    task = program.tasks[0]
+    assert (task.operation, task.lane, task.pipe) == (
+        "gemm_v0",
+        Lane.CUBE,
+        Pipe.MATRIX,
+    )
+    assert task.metadata["gemm"]["step_count"] == 1
+    simulator = FunctionalSimulator(program)
+    left = (np.arange(np.prod(shape_a), dtype=np.float16).reshape(shape_a) - 50) / 32
+    right = (
+        np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 70
+    ) / 64
+    simulator.write(task.metadata["lhs"], pack_matrix(left, "zn"))
+    simulator.write(task.metadata["rhs"], pack_matrix(right, "zn"))
+    expected = (left.T if transpose_a else left).astype(np.float32) @ (
+        right.T if transpose_b else right
+    ).astype(np.float32)
+    if not initialize:
+        previous = np.arange(256, dtype=np.float32).reshape(16, 16) / 17
+        simulator.write(
+            task.metadata["accumulator"], pack_matrix(previous, "l0c")
+        )
+        expected += previous
+    simulator.run()
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(task.metadata["dst"]), "l0c", (16, 16)),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_gemm_v0_rejects_partial_n_actual_until_partial_l0c_is_modeled() -> None:
+    prim_func, _, _ = _gemm_v0_primfunc(transpose_b=True, n_actual=8)
+    with pytest.raises(UnsupportedSimOpError, match="partial n_actual"):
+        build_kernel_program(prim_func, platform="A3")
+
+
+def test_gemm_v0_rejects_internal_l0_tile_overflow() -> None:
+    prim_func, _, _ = _gemm_v0_primfunc(k_l0_size=4080)
+    with pytest.raises(ProgramValidationError, match="L0A slot"):
+        build_kernel_program(prim_func, platform="A2")
+
+
 def test_real_tir_gemm_pipeline_executes_without_bisheng() -> None:
     program = build_kernel_program(_gemm_pipeline_primfunc(), platform="A3")
     assert [task.operation for task in program.tasks] == [
@@ -1604,6 +1754,32 @@ def test_real_tir_gemm_pipeline_executes_without_bisheng() -> None:
         "copy_l1_to_l0a",
         "copy_l1_to_l0b",
         "mma",
+        "copy_l0c_to_gm",
+    ]
+    simulator = FunctionalSimulator(program)
+    left = (np.arange(256, dtype=np.float16).reshape(16, 16) - 80) / 32
+    right = (np.arange(256, dtype=np.float16).reshape(16, 16) - 120) / 64
+    simulator.write(program.tasks[0].metadata["src"], left)
+    simulator.write(program.tasks[1].metadata["src"], right)
+    simulator.run()
+
+    expected = left.astype(np.float32) @ right.astype(np.float32)
+    np.testing.assert_allclose(
+        simulator.read(program.tasks[-1].metadata["dst"]),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_real_tir_gemm_v0_pipeline_executes_without_bisheng() -> None:
+    program = build_kernel_program(
+        _gemm_pipeline_primfunc(use_gemm_v0=True), platform="A3"
+    )
+    assert [task.operation for task in program.tasks] == [
+        "copy_gm_to_l1",
+        "copy_gm_to_l1",
+        "gemm_v0",
         "copy_l0c_to_gm",
     ]
     simulator = FunctionalSimulator(program)

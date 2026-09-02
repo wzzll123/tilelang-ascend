@@ -151,6 +151,9 @@ class FunctionalSimulator:
         if operation == "mma":
             self._mma(task)
             return
+        if operation == "gemm_v0":
+            self._gemm_v0(task)
+            return
         if operation in _UNARY_OPERATIONS:
             self._unary(task, operation)
             return
@@ -308,6 +311,40 @@ class FunctionalSimulator:
             accumulator = _operand(task, "accumulator")
             previous = unpack_matrix(
                 self.read(accumulator, task_core_id=task.core_id), "l0c", shape_c
+            )
+            result = previous + result
+        self.write(
+            destination,
+            pack_matrix(result.astype(np.float32), "l0c"),
+            task_core_id=task.core_id,
+        )
+
+    def _gemm_v0(self, task: Task) -> None:
+        left = _operand(task, "lhs")
+        right = _operand(task, "rhs")
+        destination = _operand(task, "dst")
+        details = task.metadata.get("gemm", {})
+        a_values = unpack_matrix(
+            self.read(left, task_core_id=task.core_id),
+            "zn",
+            tuple(details["shape_a"]),
+        )
+        b_values = unpack_matrix(
+            self.read(right, task_core_id=task.core_id),
+            "zn",
+            tuple(details["shape_b"]),
+        )
+        if details["transpose_a"]:
+            a_values = a_values.T
+        if details["transpose_b"]:
+            b_values = b_values.T
+        result = np.matmul(a_values.astype(np.float32), b_values.astype(np.float32))
+        if not details["init"]:
+            accumulator = _operand(task, "accumulator")
+            previous = unpack_matrix(
+                self.read(accumulator, task_core_id=task.core_id),
+                "l0c",
+                (details["rows"], details["cols"]),
             )
             result = previous + result
         self.write(

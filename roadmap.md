@@ -174,6 +174,10 @@ rectangle、float32→float16 转换和 ReLU；与 MMA 配对的非零 `unitFlag
 `init=false` 累加；已有 GM→L1→L0A/L0B→MMA→L0C→GM 的真实 final-TIR NumPy golden，
 整条功能模拟路径不调用 BiSheng。partial `n_actual`、bias、非零 `unitFlag` 和其它 dtype
 仍 fail-closed。
+高层 half→float32 `gemm_v0` 也可直接执行，支持 A/B transpose、K-tail、init/accumulate，
+并已打通 GM→L1→gemm_v0→L0C→GM；当前把其内部 L1→L0、K/N 分块和同步视为一个 MATRIX
+task，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot capacity legality check；功能
+结果准确，但 trace/timing 尚未展开内部 pipeline。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
@@ -194,13 +198,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `189 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `200 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 189 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 200 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -309,7 +313,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 standalone L0C→RowMajor GM 的固定 accumulator layout、valid rectangle、
   dtype conversion、ReLU 和 `unitFlag=0` fixpipe。~~
 - [ ] 实现非对齐/子 tile GM→L1、sliced L1→L0A/L0B 和其它 L0C→GM copy variants。
-- [ ] 实现 `gemm_v0`。
+- [x] ~~实现 half→float32 `gemm_v0` 功能语义，覆盖 A/B transpose、K-tail、
+  init/accumulate 和无 BiSheng 端到端路径。~~
+- [ ] 展开 `gemm_v0` 内部 K/N tiling、L0 ping-pong、同步和 trace/timing task。
 - [x] ~~实现显式 half→float32 `mma`，支持 K-tail、init 和 accumulate。~~
 - [ ] 实现 partial `n_actual`、其它 MMA dtype 和多 K tile 的端到端累加用例。
 - [ ] 实现 MMA/fixpipe 配对 unitFlag、quant、非 RowMajor 输出和其它 fixpipe variants。
@@ -395,7 +401,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：189 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：200 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -405,8 +411,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 接入 `gemm_v0`，验证其 lowering 能直接进入已贯通的
-   GM→L1→L0→MMA→L0C→GM final-TIR 模拟路径。
-2. 以 EasyASC footprint guards 扩展 sliced L1→L0 和非 tile-base 合法路径。
+1. 以 EasyASC footprint guards 扩展 sliced L1→L0 和非 tile-base 合法路径。
+2. 将 `gemm_v0` 内部 K/N tiling 和 L0 ping-pong 展开为可诊断 trace task。
 3. 实现多 MMA task 的 K 分块累加、partial `n_actual` 与 unitFlag/fixpipe 配对协议。
 4. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。

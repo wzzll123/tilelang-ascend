@@ -533,6 +533,8 @@ class _TirBridge:
             return self._l0c_to_gm_metadata(normalized, arguments, context)
         if short == "mma":
             return self._mma_metadata(arguments, context)
+        if short == "gemm_v0":
+            return self._gemm_v0_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -1163,6 +1165,155 @@ class _TirBridge:
                 "init": initialize,
                 "n_actual": actual_cols,
                 "unit_flag": unit_flag,
+            },
+        }
+        if not initialize:
+            metadata["accumulator"] = destination
+        return metadata
+
+    def _gemm_v0_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # ABI: tag, A(L1), B(L1), C(L0C), init[, n_actual].
+        if len(arguments) not in {5, 6}:
+            return {}
+        tag = self._literal(arguments[0])
+        if (
+            not isinstance(tag, str)
+            or not tag.startswith("gemm_v0<")
+            or not tag.endswith(">")
+        ):
+            raise UnsupportedSimOpError(f"malformed gemm_v0 template {tag!r}")
+        parameters = [part.strip() for part in tag[8:-1].split(",")]
+        if len(parameters) != 8:
+            raise UnsupportedSimOpError(f"malformed gemm_v0 template {tag!r}")
+        try:
+            rows, cols, inner, k_l0_size = (
+                int(parameters[index]) for index in (2, 3, 4, 7)
+            )
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 requires static M/N/K/kL0Size"
+            ) from error
+        if min(rows, cols, inner, k_l0_size) <= 0:
+            raise ProgramValidationError("gemm_v0 extents must be positive")
+        if k_l0_size % 16 or k_l0_size > 4095:
+            raise ProgramValidationError(
+                "gemm_v0 kL0Size must be a multiple of 16 and at most 4095"
+            )
+        if parameters[5] not in {"true", "false"} or parameters[6] not in {
+            "true", "false",
+        }:
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 requires literal transpose flags"
+            )
+        transpose_a = parameters[5] == "true"
+        transpose_b = parameters[6] == "true"
+        init_value = self._literal(self.analyzer.simplify(arguments[4]))
+        if not isinstance(init_value, (bool, int)):
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 requires a literal init flag"
+            )
+        initialize = bool(init_value)
+        actual_cols = cols
+        if len(arguments) == 6:
+            actual_cols = self._runtime_int(arguments[5], context.environment)
+            if actual_cols != cols:
+                raise UnsupportedSimOpError(
+                    "functional gemm_v0 does not yet support partial n_actual"
+                )
+
+        input_dtype = _ascend_template_dtype(parameters[0])
+        accumulator_dtype = _ascend_template_dtype(parameters[1])
+        if (input_dtype, accumulator_dtype) != ("float16", "float32"):
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 currently supports half inputs and float accumulation"
+            )
+        input_bytes = dtype_size_bytes(input_dtype)
+        max_n_by_l0b = (32 * 1024) // (k_l0_size * input_bytes)
+        n_tile = cols if transpose_b or cols <= max_n_by_l0b else max_n_by_l0b
+        if n_tile <= 0 or cols % n_tile:
+            raise ProgramValidationError(
+                "gemm_v0 N tiling does not evenly divide the output columns"
+            )
+        n_l0_split = cols // n_tile
+        step_count = ((inner + k_l0_size - 1) // k_l0_size) * n_l0_split
+        l0_slot_budget = (64 * 1024) // (2 if step_count > 1 else 1)
+        if n_tile * k_l0_size * input_bytes > l0_slot_budget:
+            raise ProgramValidationError("gemm_v0 B tile exceeds its L0B slot")
+        if rows * k_l0_size * input_bytes > l0_slot_budget:
+            raise ProgramValidationError("gemm_v0 A tile exceeds its L0A slot")
+        shape_a = (inner, rows) if transpose_a else (rows, inner)
+        shape_b = (cols, inner) if transpose_b else (inner, cols)
+        shape_c = (rows, cols)
+        a_elements = storage_elements(
+            "zn", shape_a, dtype_size_bytes(input_dtype)
+        )
+        b_elements = storage_elements(
+            "zn", shape_b, dtype_size_bytes(input_dtype)
+        )
+        c_elements = storage_elements(
+            "l0c", shape_c, dtype_size_bytes(accumulator_dtype)
+        )
+        left = self._access_buffer_region(arguments[1], (a_elements,), context)
+        right = self._access_buffer_region(arguments[2], (b_elements,), context)
+        destination = self._access_buffer_region(
+            arguments[3], (c_elements,), context
+        )
+        if left is None or right is None or destination is None:
+            return {}
+        if (
+            left.scope is not MemoryScope.L1
+            or right.scope is not MemoryScope.L1
+            or destination.scope is not MemoryScope.L0C
+        ):
+            raise ProgramValidationError("gemm_v0 requires L1, L1, and L0C operands")
+        if (
+            left.dtype != input_dtype
+            or right.dtype != input_dtype
+            or destination.dtype != accumulator_dtype
+        ):
+            raise ProgramValidationError(
+                "gemm_v0 buffer dtypes disagree with its template"
+            )
+        for label, region, elements in (
+            ("A", left, a_elements),
+            ("B", right, b_elements),
+            ("C", destination, c_elements),
+        ):
+            tile_bytes = elements * dtype_size_bytes(region.dtype)
+            if (
+                not isinstance(region.byte_offset, int)
+                or region.byte_offset % tile_bytes
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional gemm_v0 requires a tile-base-aligned {label} operand"
+                )
+            buffer_size = _buffer_size_bytes(self.buffers[region.buffer])
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"gemm_v0 {label} physical tile exceeds its buffer"
+                )
+        metadata: Dict[str, Any] = {
+            "lhs": left,
+            "rhs": right,
+            "dst": destination,
+            "gemm": {
+                "rows": rows,
+                "cols": cols,
+                "inner": inner,
+                "shape_a": shape_a,
+                "shape_b": shape_b,
+                "transpose_a": transpose_a,
+                "transpose_b": transpose_b,
+                "init": initialize,
+                "n_actual": actual_cols,
+                "k_l0_size": k_l0_size,
+                "n_tile": n_tile,
+                "n_l0_split": n_l0_split,
+                "step_count": step_count,
             },
         }
         if not initialize:
