@@ -312,6 +312,55 @@ def _fill_primfunc(count=5, scalar=-3.5):
     )
 
 
+def _scalar_vector_primfunc(operation):
+    source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
+    initial = tvm.tir.decl_buffer((5,), "float32", name="initial", scope="global")
+    output = tvm.tir.decl_buffer((5,), "float32", name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (5,), "float32", name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            name,
+            source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"),
+            5,
+        ))
+
+    statements = [copy("copy_gm_to_ub", source, ub_source)]
+    if operation == "axpy":
+        statements.append(copy("copy_gm_to_ub", initial, ub_output))
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            f"tl.ascend_{operation}",
+            ub_output.access_ptr("w"),
+            ub_source.access_ptr("r"),
+            tvm.tir.FloatImm("float32", 0.25),
+            5,
+        )),
+        copy("copy_ub_to_gm", ub_output, output),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_source, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, initial.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            source.data: source,
+            initial.data: initial,
+            output.data: output,
+        },
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -760,6 +809,35 @@ def test_real_tir_fill_initializes_offset_region_and_builds_dependency() -> None
 def test_real_tir_fill_rejects_negative_count() -> None:
     with pytest.raises(ProgramValidationError, match="fill count must not be negative"):
         build_kernel_program(_fill_primfunc(count=-1), platform="A2")
+
+
+@pytest.mark.parametrize("operation", ["leaky_relu", "axpy"])
+def test_real_tir_scalar_activation_builds_operands_and_executes(operation) -> None:
+    program = build_kernel_program(_scalar_vector_primfunc(operation), platform="A3")
+    scalar_task = next(task for task in program.tasks if task.operation == operation)
+    store = program.tasks[-1]
+    assert scalar_task.metadata["scalar"] == 0.25
+    assert store.dependencies == (scalar_task.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    source_values = np.array([-4, -1, 0, 2, 8], dtype=np.float32)
+    initial_values = np.array([1, 2, 3, 4, 5], dtype=np.float32)
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (5,), "float32"), source_values
+    )
+    if operation == "axpy":
+        simulator.write(
+            BufferRegion("initial", MemoryScope.GM, (5,), "float32"),
+            initial_values,
+        )
+        assert len(scalar_task.dependencies) == 2
+        expected = initial_values + 0.25 * source_values
+    else:
+        expected = np.where(source_values >= 0, source_values, 0.25 * source_values)
+
+    simulator.run()
+
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:

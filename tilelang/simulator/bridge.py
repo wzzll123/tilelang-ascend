@@ -485,8 +485,15 @@ class _TirBridge:
         short = _short_operation(normalized)
         if short in {"add", "sub", "mul", "div", "min", "max"}:
             return self._binary_metadata(arguments, context, tail=tail_kind is not None)
-        if short in {"adds", "subs", "muls", "divs", "mins", "maxs"}:
+        if short in {
+            "adds", "subs", "muls", "divs", "mins", "maxs", "leaky_relu",
+        }:
             return self._scalar_metadata(arguments, context, tail=tail_kind is not None)
+        if short == "axpy":
+            metadata = self._scalar_metadata(arguments, context, tail=False)
+            if isinstance(metadata.get("dst"), BufferRegion):
+                metadata["accumulator"] = metadata["dst"]
+            return metadata
         if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
         if short == "cast":
@@ -888,7 +895,7 @@ class _TirBridge:
         metadata: Mapping[str, Any],
         core_id: int,
     ) -> Tuple[str, ...]:
-        reads = self._operand_regions(metadata, ("src", "lhs", "rhs"))
+        reads = self._operand_regions(metadata, ("src", "lhs", "rhs", "accumulator"))
         writes = self._operand_regions(metadata, ("dst", "pad_dst"))
         dependencies = {
             task_id
@@ -905,7 +912,9 @@ class _TirBridge:
         return tuple(sorted(dependencies))
 
     def _record_memory_accesses(self, task: Task, core_id: int) -> None:
-        reads = self._operand_regions(task.metadata, ("src", "lhs", "rhs"))
+        reads = self._operand_regions(
+            task.metadata, ("src", "lhs", "rhs", "accumulator")
+        )
         writes = self._operand_regions(task.metadata, ("dst", "pad_dst"))
         for region in writes:
             self.last_writes = [

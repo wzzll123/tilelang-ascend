@@ -38,6 +38,7 @@ _SCALAR_OPERATIONS = {
     "divs": np.divide,
     "maxs": np.maximum,
     "mins": np.minimum,
+    "leaky_relu": lambda value, slope: np.where(value >= 0, value, value * slope),
 }
 
 _UNARY_OPERATIONS = {
@@ -129,6 +130,9 @@ class FunctionalSimulator:
         if operation in _SCALAR_OPERATIONS:
             self._binary(task, operation)
             return
+        if operation == "axpy":
+            self._axpy(task)
+            return
         if operation in _UNARY_OPERATIONS:
             self._unary(task, operation)
             return
@@ -200,6 +204,23 @@ class FunctionalSimulator:
         values = self.read(source, task_core_id=task.core_id)
         result = _UNARY_OPERATIONS[operation](values)
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _axpy(self, task: Task) -> None:
+        source = _operand(task, "lhs")
+        destination = _operand(task, "dst")
+        accumulator = _operand(task, "accumulator")
+        scalar = task.metadata.get("scalar")
+        if not isinstance(scalar, (bool, int, float)):
+            raise UnsupportedSimOpError(
+                f"functional axpy requires a literal scalar, got {scalar!r}"
+            )
+        source_values = self.read(source, task_core_id=task.core_id)
+        accumulator_values = self.read(accumulator, task_core_id=task.core_id)
+        self.write(
+            destination,
+            scalar * source_values + accumulator_values,
+            task_core_id=task.core_id,
+        )
 
     def _cast(self, task: Task) -> None:
         source = _operand(task, "src")

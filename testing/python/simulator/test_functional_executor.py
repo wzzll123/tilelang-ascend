@@ -169,6 +169,7 @@ def test_unary_vector_operations(operation, expected) -> None:
         ("divs", lambda value: value / 2),
         ("maxs", lambda value: np.maximum(value, 2)),
         ("mins", lambda value: np.minimum(value, 2)),
+        ("leaky_relu", lambda value: np.where(value >= 0, value, value * 2)),
     ],
 )
 def test_scalar_vector_operations(operation, expected) -> None:
@@ -228,6 +229,43 @@ def test_fill_initializes_poisoned_ub_memory() -> None:
 
     np.testing.assert_array_equal(
         simulator.read(destination), np.full((5,), -2.5, dtype=np.float32)
+    )
+
+
+def test_axpy_reads_and_updates_destination_in_place() -> None:
+    source = _region("source", MemoryScope.UB, 4)
+    destination = _region("destination", MemoryScope.UB, 4)
+    task = Task(
+        "axpy",
+        "axpy",
+        0,
+        Lane.VECTOR_0,
+        Pipe.VECTOR,
+        1,
+        metadata={
+            "lhs": source,
+            "dst": destination,
+            "accumulator": destination,
+            "scalar": 0.5,
+        },
+    )
+    program = KernelProgram(
+        "axpy",
+        "A2",
+        (CoreProgram(0, (task,)),),
+        buffers=(
+            BufferSpec("source", MemoryScope.UB, (4,), "float32"),
+            BufferSpec("destination", MemoryScope.UB, (4,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(source, np.array([2, 4, 6, 8], dtype=np.float32))
+    simulator.write(destination, np.array([1, 1, 1, 1], dtype=np.float32))
+
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(destination), np.array([2, 3, 4, 5], dtype=np.float32)
     )
 
 
