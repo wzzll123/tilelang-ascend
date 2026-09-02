@@ -504,6 +504,8 @@ class _TirBridge:
             return self._clamp_metadata(short, arguments, context)
         if short == "broadcast":
             return self._broadcast_metadata(arguments, context)
+        if short == "tail_broadcast":
+            return self._tail_broadcast_metadata(arguments, context)
         if short in {"compare", "compare_scalar"}:
             return self._compare_metadata(short, arguments, context)
         if short in {"tail_compare", "tail_compare_scalar"}:
@@ -824,6 +826,112 @@ class _TirBridge:
                 return {}
             scratch = self._access_buffer_region(
                 scratch_arg, (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _tail_broadcast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Original broadcast ABI, including its name and optional tmp, plus
+        # output/input valid rows and columns appended by tail propagation.
+        if len(arguments) not in {12, 13}:
+            return {}
+        name = self._literal(arguments[0])
+        if not isinstance(name, str):
+            return {}
+        has_scratch = len(arguments) == 13
+        dimension_index = 4 if has_scratch else 3
+        if self._const_int(arguments[dimension_index], context.environment) != 2:
+            raise UnsupportedSimOpError("tail broadcast supports only rank 2")
+        shape_index = dimension_index + 1
+        physical_shape = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[shape_index:shape_index + 4]
+        )
+        valid_shape = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[-4:]
+        )
+        if any(value is None for value in physical_shape + valid_shape):
+            return {}
+        if any(
+            isinstance(value, int) and value < 0
+            for value in physical_shape + valid_shape
+        ):
+            raise ProgramValidationError("tail broadcast extents must not be negative")
+        dst_rows, dst_cols, src_rows, src_cols = physical_shape
+        valid_rows, valid_cols, src_valid_rows, src_valid_cols = valid_shape
+        if all(isinstance(value, int) for value in physical_shape + valid_shape):
+            if valid_rows > dst_rows or valid_cols > dst_cols:
+                raise ProgramValidationError(
+                    "tail broadcast valid output must fit its physical tile"
+                )
+            if src_valid_rows > src_rows or src_valid_cols > src_cols:
+                raise ProgramValidationError(
+                    "tail broadcast valid source must fit its physical tile"
+                )
+            if src_cols == 1 and src_rows != 1:
+                axis = 1
+                if valid_rows > src_valid_rows or src_valid_cols != 1:
+                    raise ProgramValidationError(
+                        "row tail broadcast requires one valid source column"
+                    )
+                source_shape = (valid_rows, 1)
+            elif src_rows == 1 and src_cols != 1:
+                axis = 0
+                if valid_cols > src_valid_cols or src_valid_rows != 1:
+                    raise ProgramValidationError(
+                        "column tail broadcast requires one valid source row"
+                    )
+                source_shape = (1, valid_cols)
+            else:
+                raise UnsupportedSimOpError(
+                    f"tail broadcast requires [M,1] or [1,N], got {(src_rows, src_cols)}"
+                )
+        else:
+            # The propagation pass chooses the axis from static physical shape.
+            raise UnsupportedSimOpError(
+                "dynamic physical shape is not supported for tail broadcast"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        source = self._access_buffer_region(arguments[2], source_shape, context)
+        if destination is None or source is None:
+            return {}
+        if axis == 1:
+            itemsize = dtype_size_bytes(source.dtype)
+            elements_per_block = 32 // itemsize
+            aligned_cols = (
+                (src_cols + elements_per_block - 1) // elements_per_block
+            ) * elements_per_block
+            source = replace(
+                source, strides_bytes=(aligned_cols * itemsize, itemsize)
+            )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "broadcast": {"dimension": 2, "axis": axis, "tail": True},
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "src_valid_rows": src_valid_rows,
+            "src_valid_cols": src_valid_cols,
+            "physical_rows": dst_rows,
+            "physical_cols": dst_cols,
+            "src_physical_rows": src_rows,
+            "src_physical_cols": src_cols,
+        }
+        if has_scratch:
+            scratch_extent = self._access_ptr_extent(arguments[3], context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                arguments[3], (scratch_extent,), context
             )
             if scratch is None:
                 return {}

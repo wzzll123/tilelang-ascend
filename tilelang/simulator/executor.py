@@ -159,7 +159,7 @@ class FunctionalSimulator:
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
-        if operation == "broadcast":
+        if operation in {"broadcast", "tail_broadcast"}:
             self._broadcast(task)
             return
         if operation in {"compare", "compare_scalar"}:

@@ -752,6 +752,51 @@ def _tail_compare_select_primfunc(
     )
 
 
+def _tail_broadcast_primfunc(axis, *, with_scratch=False):
+    output = tvm.tir.decl_buffer((3, 5), "float32", name="output", scope="global")
+    ub_output = tvm.tir.decl_buffer(
+        (3, 5), "float32", name="ub_output", scope="shared.ub"
+    )
+    source_shape = (3, 8) if axis == 1 else (1, 5)
+    logical_source_shape = (3, 1) if axis == 1 else (1, 5)
+    ub_source = tvm.tir.decl_buffer(
+        source_shape, "float32", name="ub_source", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (15,), "float32", name="scratch", scope="shared.ub"
+    )
+    valid_shape = (2, 5, 2, 1) if axis == 1 else (3, 4, 1, 4)
+    arguments = [
+        f"Broadcast<float32, 2, {axis}, false>",
+        ub_output.access_ptr("w"),
+        ub_source.access_ptr("r", extent=int(np.prod(logical_source_shape))),
+    ]
+    if with_scratch:
+        arguments.append(scratch.access_ptr("w"))
+    arguments.extend([2, 3, 5, *logical_source_shape, *valid_shape])
+    broadcast = tvm.tir.call_extern(
+        "handle", "tl.ascend_tail_broadcast", *arguments
+    )
+    store = tvm.tir.call_extern(
+        "handle", "copy_ub_to_gm", ub_output.access_ptr("r"),
+        output.access_ptr("w"), 5, valid_shape[0], valid_shape[1],
+        0, 3, 5,
+    )
+    alloc_buffers = [ub_source, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root",
+        tvm.tir.SeqStmt([tvm.tir.Evaluate(broadcast), tvm.tir.Evaluate(store)]),
+        alloc_buffers=alloc_buffers,
+    )
+    return tvm.tir.PrimFunc(
+        [output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -1535,6 +1580,31 @@ def test_tail_select_rejects_kind_and_source_type_mismatch() -> None:
             ),
             platform="A2",
         )
+
+
+@pytest.mark.parametrize(
+    ("axis", "with_scratch"), [(0, False), (1, True)]
+)
+def test_real_tail_broadcast_executes_valid_rectangle(axis, with_scratch) -> None:
+    program = build_kernel_program(
+        _tail_broadcast_primfunc(axis, with_scratch=with_scratch), platform="A2"
+    )
+    broadcast, store = program.tasks
+    assert broadcast.operation == "tail_broadcast"
+    assert broadcast.metadata["broadcast"]["axis"] == axis
+    assert ("scratch" in broadcast.metadata) is with_scratch
+    assert store.dependencies == (broadcast.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    source = (
+        np.array([[1, 2, 3, 4]], dtype=np.float32)
+        if axis == 0 else np.array([[2], [5]], dtype=np.float32)
+    )
+    simulator.write(broadcast.metadata["src"], source)
+    simulator.run()
+
+    expected = np.broadcast_to(source, broadcast.metadata["dst"].shape)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:
