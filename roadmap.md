@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 42%**。checkbox 裸计数约 54%，但未完成的完整
+- **完整 roadmap：约 43%**。checkbox 裸计数约 54%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 74%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 76%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -189,7 +189,8 @@ L0C region、有效列数一致的 MMA release 配对，fixpipe source footprint
 整条功能模拟路径不调用 BiSheng。显式 MMA 已支持静态、16 列粒度的 partial `n_actual`，
 并将 L0B/L0C footprint 收窄到有效列；还支持 MMA `0b10` hold、累加 MMA `0b11`
 release、fixpipe `0b11` consume 的配对链，pair task id/role 会进入 trace metadata。
-bias、runtime BufferLoad 和其它 dtype 仍 fail-closed。
+bias 和其它 dtype 仍 fail-closed。整数 `BufferLoad` 形式的 `n_actual` 会保留为稳定绑定名
+（如 `nact[0]`），在 `FunctionalSimulator(bindings=...)` 创建时解析并检查范围和对齐。
 高层 half→float32 `gemm_v0` 也可直接执行，支持 A/B transpose、K-tail、init/accumulate，
 并已打通 GM→L1→gemm_v0→L0C→GM，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot
 capacity legality check。当 `gemm_v0` 有多个 K/N step 时，bridge 会展开每步 L0A/L0B
@@ -201,7 +202,8 @@ timing key、transfer bytes/math ops 和 MTE1↔M event annotation；周期仍�
 `uncalibrated-unit-cost` profile，annotation 尚不是显式硬件 flag task。
 `gemm_v0` 还支持仓库 AscendC contract 中 `transpose_B=true` 的静态 partial `n_actual`：
 只加载/计算 16 列对齐的输出前缀，并在多 K tile 下保持正确 zN stride 和 L0C 累加；
-非 transpose-B partial-N、runtime BufferLoad 和尾部 fixpipe 配对仍拒绝。
+非 transpose-B partial-N 仍拒绝；transpose-B 的整数 `BufferLoad n_actual` 已支持，并让
+符号 L1→L0B、MMA 和 L0C footprint 在运行时使用同一个绑定值。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
@@ -222,13 +224,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `224 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `233 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 224 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 233 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -357,7 +359,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现多 MMA task 对同一 L0C 的 K 分块累加与 RAW dependency golden。~~
 - [x] ~~实现显式 MMA 及 transpose-B `gemm_v0` 的静态、16 列粒度 partial `n_actual`，
   收窄 L0B/L0C footprint，并覆盖 init/accumulate 与多 K tile。~~
-- [ ] 实现 runtime BufferLoad `n_actual` 和其它 MMA dtype。
+- [x] ~~实现 explicit MMA 与 transpose-B `gemm_v0` 的整数 BufferLoad `n_actual`，通过
+  simulator bindings 解析符号 footprint，并在执行前校验范围和 16 列粒度。~~
+- [ ] 实现其它 MMA dtype。
 - [x] ~~实现 MMA/fixpipe `unitFlag` 配对协议，覆盖 `0b10` hold、`0b11` release/consume、
   partial-N source footprint、同 L0C region/列数校验和 trace pair metadata。~~
 - [ ] 实现 quant、非 RowMajor 输出和其它 fixpipe variants。
@@ -443,7 +447,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：224 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：233 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -453,7 +457,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 实现 runtime BufferLoad `n_actual`。
-2. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
+1. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
+2. 实现其它 MMA dtype 与 quant/fixpipe variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

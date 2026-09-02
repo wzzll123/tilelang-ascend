@@ -268,6 +268,32 @@ def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0, cols=16):
     return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
 
 
+def _mma_runtime_n_primfunc(nact_index=0):
+    nact = tvm.tir.decl_buffer((1,), "int32", name="nact", scope="global")
+    l0a = tvm.tir.decl_buffer(
+        (16 * 16,), "float16", name="l0a", scope="wmma.matrix_a"
+    )
+    l0b = tvm.tir.decl_buffer(
+        (16 * 32,), "float16", name="l0b", scope="wmma.matrix_b"
+    )
+    l0c = tvm.tir.decl_buffer(
+        (16 * 32,), "float32", name="l0c", scope="wmma.accumulator"
+    )
+    mma = tvm.tir.call_extern(
+        "handle", "tl.ascend_mma", "mma<half, float, 16, 32>",
+        l0a.access_ptr("r"), l0b.access_ptr("r"), l0c.access_ptr("w"),
+        True, 13, nact[nact_index], 0,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(mma),
+        alloc_buffers=[l0a, l0b, l0c],
+    )
+    return tvm.tir.PrimFunc(
+        [nact.data], tvm.tir.BlockRealize([], True, root),
+        buffer_map={nact.data: nact},
+    )
+
+
 def _mma_chain_primfunc():
     inputs = [
         tvm.tir.decl_buffer(
@@ -398,6 +424,34 @@ def _gemm_v0_primfunc(
         tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root)),
         shape_a,
         shape_b,
+    )
+
+
+def _gemm_v0_runtime_n_primfunc():
+    rows, cols, inner, k_l0_size = 16, 32, 48, 16
+    nact = tvm.tir.decl_buffer((1,), "int32", name="nact", scope="global")
+    l1a = tvm.tir.decl_buffer(
+        (rows * inner,), "float16", name="l1a", scope="shared.l1"
+    )
+    l1b = tvm.tir.decl_buffer(
+        (cols * inner,), "float16", name="l1b", scope="shared.l1"
+    )
+    l0c = tvm.tir.decl_buffer(
+        (rows * cols,), "float32", name="l0c", scope="wmma.accumulator"
+    )
+    call = tvm.tir.call_extern(
+        "handle", "tl.ascend_gemm_v0",
+        "gemm_v0<half, float, 16, 32, 48, false, true, 16>",
+        l1a.access_ptr("r"), l1b.access_ptr("r"), l0c.access_ptr("w"),
+        True, nact[0],
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(call),
+        alloc_buffers=[l1a, l1b, l0c],
+    )
+    return tvm.tir.PrimFunc(
+        [nact.data], tvm.tir.BlockRealize([], True, root),
+        buffer_map={nact.data: nact},
     )
 
 
@@ -1983,6 +2037,41 @@ def test_mma_rejects_illegal_partial_n_actual(n_actual) -> None:
         )
 
 
+@pytest.mark.parametrize("n_actual", [16, 32])
+def test_real_tir_mma_resolves_buffer_load_n_actual(n_actual) -> None:
+    program = build_kernel_program(_mma_runtime_n_primfunc(), platform="A2")
+    task = program.tasks[0]
+    assert task.metadata["mma"]["n_actual"] == AffineInt.variable("nact[0]")
+    simulator = FunctionalSimulator(program, bindings={"nact[0]": n_actual})
+    left = (np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 50) / 32
+    right = (
+        np.arange(13 * n_actual, dtype=np.float16).reshape(13, n_actual) - 70
+    ) / 64
+    simulator.write(task.metadata["lhs"], pack_matrix(left, "l0a"))
+    simulator.write(task.metadata["rhs"], pack_matrix(right, "l0b"))
+    simulator.run()
+    np.testing.assert_allclose(
+        unpack_matrix(
+            simulator.read(task.metadata["dst"]), "l0c", (16, n_actual)
+        ),
+        left.astype(np.float32) @ right.astype(np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("bindings", [{}, {"nact[0]": 0}, {"nact[0]": 8}, {"nact[0]": 48}])
+def test_mma_rejects_invalid_runtime_n_actual_binding(bindings) -> None:
+    program = build_kernel_program(_mma_runtime_n_primfunc(), platform="A3")
+    with pytest.raises(ProgramValidationError, match="nact|n_actual"):
+        FunctionalSimulator(program, bindings=bindings)
+
+
+def test_mma_rejects_out_of_bounds_runtime_scalar_load() -> None:
+    with pytest.raises(ProgramValidationError, match="outside its buffer"):
+        build_kernel_program(_mma_runtime_n_primfunc(nact_index=1), platform="A2")
+
+
 def test_real_tir_mma_chain_accumulates_k_tiles_with_raw_dependency() -> None:
     program = build_kernel_program(_mma_chain_primfunc(), platform="A3")
     first, second = program.tasks
@@ -2123,6 +2212,37 @@ def test_gemm_v0_rejects_illegal_partial_n_actual(n_actual) -> None:
     error = ProgramValidationError if n_actual in {0, 48} else UnsupportedSimOpError
     with pytest.raises(error, match="n_actual"):
         build_kernel_program(prim_func, platform="A3")
+
+
+@pytest.mark.parametrize("n_actual", [16, 32])
+def test_gemm_v0_resolves_buffer_load_n_actual(n_actual) -> None:
+    program = build_kernel_program(_gemm_v0_runtime_n_primfunc(), platform="A3")
+    assert program.tasks[2].metadata["mma"]["n_actual"] == AffineInt.variable(
+        "nact[0]"
+    )
+    simulator = FunctionalSimulator(program, bindings={"nact[0]": n_actual})
+    left = (np.arange(16 * 48, dtype=np.float16).reshape(16, 48) - 50) / 32
+    right = (np.arange(32 * 48, dtype=np.float16).reshape(32, 48) - 70) / 64
+    for task, values in zip(program.tasks[:2], (left, right)):
+        payload = pack_matrix(values, "zn")
+        source = task.metadata["src"]
+        simulator.write(
+            BufferRegion(
+                source.buffer, MemoryScope.L1, (payload.size,), source.dtype,
+                core_id=task.core_id,
+            ),
+            payload,
+        )
+    simulator.run()
+    final = program.tasks[-1]
+    np.testing.assert_allclose(
+        unpack_matrix(
+            simulator.read(final.metadata["dst"]), "l0c", (16, n_actual)
+        ),
+        left.astype(np.float32) @ right[:n_actual].T.astype(np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_gemm_v0_rejects_internal_l0_tile_overflow() -> None:

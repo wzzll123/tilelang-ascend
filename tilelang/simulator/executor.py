@@ -97,11 +97,29 @@ class FunctionalSimulator:
                 "functional simulator config platform does not match the program"
             )
         self.bindings = dict(bindings or {})
+        self._validate_runtime_contracts()
         self.memory = MemoryRuntime.from_program(
             program,
             hazard_check=self.config.hazard_check,
             bindings=self.bindings,
         )
+
+    def _validate_runtime_contracts(self) -> None:
+        for task in self.program.tasks:
+            details = task.metadata.get("mma")
+            if not isinstance(details, Mapping):
+                continue
+            actual_cols = _resolve_int(details["n_actual"], self.bindings)
+            template_cols = _resolve_int(details["cols"], self.bindings)
+            if actual_cols <= 0 or actual_cols > template_cols:
+                raise ProgramValidationError(
+                    f"mma n_actual must be in [1, {template_cols}], got {actual_cols}"
+                )
+            if actual_cols % 16:
+                raise ProgramValidationError(
+                    "mma n_actual must be a multiple of 16, "
+                    f"got {actual_cols}"
+                )
 
     def write(self, region: BufferRegion, values: Any, *, task_core_id: int = 0) -> None:
         """Initialize a concrete region from an array-like CPU value."""
@@ -324,7 +342,7 @@ class FunctionalSimulator:
         right = _operand(task, "rhs")
         destination = _operand(task, "dst")
         details = task.metadata.get("mma", {})
-        actual_cols = details["n_actual"]
+        actual_cols = _resolve_int(details["n_actual"], self.bindings)
         shape_a = (details["rows"], details["inner"])
         shape_b = (details["inner"], actual_cols)
         shape_c = (details["rows"], actual_cols)

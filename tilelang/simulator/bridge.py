@@ -129,6 +129,14 @@ def _vector_lane(lane: Lane) -> Lane:
     return lane if lane in {Lane.VECTOR_0, Lane.VECTOR_1} else Lane.VECTOR_0
 
 
+def _scale_runtime_int(value: Any, coefficient: int) -> Any:
+    if isinstance(value, int):
+        return value * coefficient
+    if isinstance(value, (AffineInt, SymbolicInt)):
+        return value.scaled(coefficient)
+    raise ProgramValidationError(f"cannot scale runtime integer {value!r}")
+
+
 def build_kernel_program(
     func_or_mod: Any,
     *,
@@ -562,7 +570,14 @@ class _TirBridge:
             )
             l0b = BufferRegion(
                 l0b_names[slot], MemoryScope.L0B,
-                (storage_elements("l0b", (k_size, n_size), input_bytes),),
+                (
+                    storage_elements("l0b", (k_size, n_size), input_bytes)
+                    if isinstance(n_size, int)
+                    else _scale_runtime_int(
+                        n_size,
+                        ((k_size + 15) // 16) * 16,
+                    ),
+                ),
                 input_dtype, core_id=context.core_id,
             )
             a_regions = source_window_regions(
@@ -610,7 +625,9 @@ class _TirBridge:
                 metadata={
                     **stage,
                     "timing_key": "gemm_v0.load_b",
-                    "transfer_bytes": k_size * n_size * input_bytes,
+                    "transfer_bytes": _scale_runtime_int(
+                        n_size, k_size * input_bytes
+                    ),
                     **reuse_event,
                     **b_source_metadata,
                     "dst": l0b,
@@ -633,7 +650,16 @@ class _TirBridge:
             )
             l0c = replace(
                 metadata["dst"],
-                shape=(storage_elements("l0c", (details["rows"], n_size), accumulator_bytes),),
+                shape=(
+                    storage_elements(
+                        "l0c", (details["rows"], n_size), accumulator_bytes
+                    )
+                    if isinstance(n_size, int)
+                    else _scale_runtime_int(
+                        n_size,
+                        ((details["rows"] + 15) // 16) * 16,
+                    ),
+                ),
                 byte_offset=c_offset,
                 strides_bytes=None,
             )
@@ -641,7 +667,9 @@ class _TirBridge:
             mma_metadata = {
                 **stage,
                 "timing_key": "gemm_v0.mma",
-                "math_ops": 2 * details["rows"] * n_size * k_size,
+                "math_ops": _scale_runtime_int(
+                    n_size, 2 * details["rows"] * k_size
+                ),
                 "wait_event": "MTE1_M",
                 "set_event": "M_MTE1",
                 "lhs": l0a,
@@ -1360,18 +1388,19 @@ class _TirBridge:
         if len(arguments) == 8:
             actual_cols = self._runtime_int(arguments[6], context.environment)
             unit_flag = self._runtime_int(arguments[7], context.environment)
-            if not isinstance(actual_cols, int):
+            if not isinstance(actual_cols, (int, AffineInt, SymbolicInt)):
                 raise UnsupportedSimOpError(
-                    "functional mma requires a static n_actual"
+                    "functional mma requires an executable n_actual"
                 )
-            if actual_cols <= 0 or actual_cols > cols:
-                raise ProgramValidationError(
-                    f"mma n_actual must be in [1, {cols}], got {actual_cols}"
-                )
-            if actual_cols % 16:
-                raise UnsupportedSimOpError(
-                    "functional mma requires n_actual to be a multiple of 16"
-                )
+            if isinstance(actual_cols, int):
+                if actual_cols <= 0 or actual_cols > cols:
+                    raise ProgramValidationError(
+                        f"mma n_actual must be in [1, {cols}], got {actual_cols}"
+                    )
+                if actual_cols % 16:
+                    raise UnsupportedSimOpError(
+                        "functional mma requires n_actual to be a multiple of 16"
+                    )
             if not isinstance(unit_flag, int) or unit_flag not in {0, 2, 3}:
                 raise UnsupportedSimOpError(
                     "functional mma supports unitFlag 0, 0b10, or 0b11"
@@ -1392,12 +1421,20 @@ class _TirBridge:
         c_capacity_elements = storage_elements(
             "l0c", (rows, cols), dtype_size_bytes(accumulator_dtype)
         )
-        b_elements = storage_elements(
-            "l0b", (inner, actual_cols), dtype_size_bytes(input_dtype)
-        )
-        c_elements = storage_elements(
-            "l0c", (rows, actual_cols), dtype_size_bytes(accumulator_dtype)
-        )
+        if isinstance(actual_cols, int):
+            b_elements = storage_elements(
+                "l0b", (inner, actual_cols), dtype_size_bytes(input_dtype)
+            )
+            c_elements = storage_elements(
+                "l0c", (rows, actual_cols), dtype_size_bytes(accumulator_dtype)
+            )
+        else:
+            b_elements = _scale_runtime_int(
+                actual_cols, ((inner + 15) // 16) * 16
+            )
+            c_elements = _scale_runtime_int(
+                actual_cols, ((rows + 15) // 16) * 16
+            )
         left = self._access_buffer_region(arguments[1], (a_elements,), context)
         right = self._access_buffer_region(arguments[2], (b_elements,), context)
         destination = self._access_buffer_region(
@@ -1567,19 +1604,22 @@ class _TirBridge:
         actual_cols = cols
         if len(arguments) == 6:
             actual_cols = self._runtime_int(arguments[5], context.environment)
-            if not isinstance(actual_cols, int):
+            if not isinstance(actual_cols, (int, AffineInt, SymbolicInt)):
                 raise UnsupportedSimOpError(
-                    "functional gemm_v0 requires a static n_actual"
+                    "functional gemm_v0 requires an executable n_actual"
                 )
-            if actual_cols <= 0 or actual_cols > cols:
-                raise ProgramValidationError(
-                    f"gemm_v0 n_actual must be in [1, {cols}], got {actual_cols}"
-                )
-            if actual_cols % 16:
-                raise UnsupportedSimOpError(
-                    "functional gemm_v0 requires n_actual to be a multiple of 16"
-                )
-            if actual_cols != cols and not transpose_b:
+            if isinstance(actual_cols, int):
+                if actual_cols <= 0 or actual_cols > cols:
+                    raise ProgramValidationError(
+                        f"gemm_v0 n_actual must be in [1, {cols}], got {actual_cols}"
+                    )
+                if actual_cols % 16:
+                    raise UnsupportedSimOpError(
+                        "functional gemm_v0 requires n_actual to be a multiple of 16"
+                    )
+            if not transpose_b and (
+                not isinstance(actual_cols, int) or actual_cols != cols
+            ):
                 raise UnsupportedSimOpError(
                     "functional gemm_v0 supports partial n_actual only with transpose_B"
                 )
@@ -2908,6 +2948,28 @@ class _TirBridge:
             }
             substituted = self.tir.stmt_functor.substitute(value, replacements)
         simplified = self.analyzer.simplify(substituted)
+        if isinstance(simplified, self.tir.BufferLoad):
+            dtype = str(simplified.dtype)
+            if not (dtype.startswith("int") or dtype.startswith("uint")):
+                return None
+            if len(simplified.indices) != 1:
+                return None
+            index = self._const_int(simplified.indices[0], {})
+            if index is None or index < 0:
+                return None
+            name = str(simplified.buffer.name)
+            spec = self.buffers.get(name)
+            if spec is None or spec.scope is not MemoryScope.GM:
+                return None
+            if (
+                len(spec.shape) != 1
+                or not isinstance(spec.shape[0], int)
+                or index >= spec.shape[0]
+            ):
+                raise ProgramValidationError(
+                    f"runtime scalar BufferLoad {name}[{index}] is outside its buffer"
+                )
+            return AffineInt.variable(f"{name}[{index}]")
         operation = type(simplified).__name__
         binary_operations = {
             "Add": "add",
