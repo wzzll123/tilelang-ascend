@@ -171,6 +171,9 @@ class FunctionalSimulator:
         if operation == "select":
             self._select(task)
             return
+        if operation == "tail_select":
+            self._tail_select(task)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -420,6 +423,40 @@ class FunctionalSimulator:
         self.write(
             destination,
             np.packbits(predicate, axis=1, bitorder="little"),
+            task_core_id=task.core_id,
+        )
+
+    def _tail_select(self, task: Task) -> None:
+        mask = _operand(task, "mask")
+        left = _operand(task, "lhs")
+        destination = _operand(task, "dst")
+        mask_values = self.read(mask, task_core_id=task.core_id)
+        left_values = self.read(left, task_core_id=task.core_id)
+        if mask_values.ndim != 2 or left_values.ndim != 2:
+            raise ProgramValidationError(
+                "tail select requires 2D mask and source valid rectangles"
+            )
+        unpacked = np.unpackbits(
+            np.asarray(mask_values, dtype=np.uint8), axis=1, bitorder="little"
+        )
+        if unpacked.shape[1] < left_values.shape[1]:
+            raise ProgramValidationError(
+                f"tail select mask row provides {unpacked.shape[1]} bits for "
+                f"{left_values.shape[1]} values"
+            )
+        predicate = unpacked[:, :left_values.shape[1]].astype(bool)
+        right = task.metadata.get("rhs")
+        if isinstance(right, BufferRegion):
+            right_values: Any = self.read(right, task_core_id=task.core_id)
+        elif "scalar" in task.metadata:
+            right_values = task.metadata["scalar"]
+        else:
+            raise ProgramValidationError(
+                f"tail select task {task.task_id!r} requires rhs or scalar metadata"
+            )
+        self.write(
+            destination,
+            np.where(predicate, left_values, right_values),
             task_core_id=task.core_id,
         )
 

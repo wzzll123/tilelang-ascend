@@ -508,6 +508,8 @@ class _TirBridge:
             return self._compare_metadata(short, arguments, context)
         if short in {"tail_compare", "tail_compare_scalar"}:
             return self._tail_compare_metadata(short, arguments, context)
+        if short == "tail_select":
+            return self._tail_select_metadata(arguments, context)
         if short == "select":
             return self._select_metadata(arguments, context)
         if short == "cast":
@@ -1031,6 +1033,114 @@ class _TirBridge:
                 return {}
             metadata["rhs"] = right
         return metadata
+
+    def _tail_select_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Internal contract emitted by AscendTailMaskPropagation:
+        # kind, dst, mask, src0, tmp, src1Type, src1, mode, validRow,
+        # validCol, physRow, physCol, storageCol.
+        if len(arguments) != 13:
+            return {}
+        kind = self._literal(arguments[0])
+        source_type = self._const_int(arguments[5], context.environment)
+        expected = {
+            "Scalar": (1, "VSEL_TENSOR_SCALAR_MODE"),
+            "Tensor": (2, "VSEL_TENSOR_TENSOR_MODE"),
+        }.get(kind)
+        mode = getattr(arguments[7], "value", None)
+        if expected is None or (source_type, mode) != expected:
+            raise UnsupportedSimOpError(
+                f"unsupported tail select kind/type/mode: "
+                f"{kind!r}/{source_type!r}/{mode!r}"
+            )
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[8:13]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        valid_rows, valid_cols, physical_rows, physical_cols, storage_cols = dimensions
+        if any(isinstance(value, int) and value < 0 for value in dimensions):
+            raise ProgramValidationError("tail select dimensions must not be negative")
+        if all(isinstance(value, int) for value in dimensions):
+            if valid_rows > physical_rows or valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "tail select valid rectangle must fit its physical tile"
+                )
+            if storage_cols < (physical_cols + 7) // 8:
+                raise ProgramValidationError(
+                    "tail select packed storage width is too small"
+                )
+        if isinstance(valid_cols, int):
+            packed_valid_cols: Any = (valid_cols + 7) // 8
+        else:
+            packed_valid_cols = SymbolicInt(
+                "floordiv", (SymbolicInt("add", (valid_cols, 7)), 8)
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        mask = self._access_buffer_region(
+            arguments[2], (valid_rows, packed_valid_cols), context
+        )
+        source = self._access_buffer_region(
+            arguments[3], (valid_rows, valid_cols), context
+        )
+        if destination is None or mask is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "mask": mask,
+            "lhs": source,
+            "select_kind": kind,
+            "select_mode": mode,
+            "source_type": source_type,
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "physical_rows": physical_rows,
+            "physical_cols": physical_cols,
+            "storage_cols": storage_cols,
+        }
+        if source_type == 1:
+            scalar = self._literal(self.analyzer.simplify(arguments[6]))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"tail scalar select requires a literal, got {scalar!r}"
+                )
+            metadata["scalar"] = scalar
+        else:
+            right = self._access_buffer_region(
+                arguments[6], (valid_rows, valid_cols), context
+            )
+            if right is None:
+                return {}
+            metadata["rhs"] = right
+
+        mask_data = self._access_ptr_data_name(arguments[2])
+        scratch_data = self._access_ptr_data_name(arguments[4])
+        if scratch_data is not None and scratch_data != mask_data:
+            scratch_extent = self._access_ptr_extent(arguments[4], context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                arguments[4], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _access_ptr_data_name(self, pointer: Any) -> Optional[str]:
+        if (
+            isinstance(pointer, self.tir.Call)
+            and str(pointer.op.name) == "tir.tvm_access_ptr"
+            and len(pointer.args) >= 2
+        ):
+            return self._var_name(pointer.args[1])
+        return None
 
     def _scalar_metadata(
         self,
