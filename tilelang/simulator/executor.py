@@ -165,6 +165,9 @@ class FunctionalSimulator:
         if operation in {"compare", "compare_scalar"}:
             self._compare(task)
             return
+        if operation == "select":
+            self._select(task)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -357,6 +360,35 @@ class FunctionalSimulator:
         self.write(
             destination,
             result.reshape(destination_shape),
+            task_core_id=task.core_id,
+        )
+
+    def _select(self, task: Task) -> None:
+        mask = _operand(task, "mask")
+        left = _operand(task, "lhs")
+        destination = _operand(task, "dst")
+        mask_values = self.read(mask, task_core_id=task.core_id)
+        left_values = self.read(left, task_core_id=task.core_id)
+        unpacked = np.unpackbits(
+            np.asarray(mask_values, dtype=np.uint8).reshape(-1), bitorder="little"
+        )
+        if unpacked.size < left_values.size:
+            raise ProgramValidationError(
+                f"select mask provides {unpacked.size} bits for {left_values.size} values"
+            )
+        predicate = unpacked[:left_values.size].reshape(left_values.shape).astype(bool)
+        right = task.metadata.get("rhs")
+        if isinstance(right, BufferRegion):
+            right_values: Any = self.read(right, task_core_id=task.core_id)
+        elif "scalar" in task.metadata:
+            right_values = task.metadata["scalar"]
+        else:
+            raise ProgramValidationError(
+                f"select task {task.task_id!r} requires rhs or scalar metadata"
+            )
+        self.write(
+            destination,
+            np.where(predicate, left_values, right_values),
             task_core_id=task.core_id,
         )
 

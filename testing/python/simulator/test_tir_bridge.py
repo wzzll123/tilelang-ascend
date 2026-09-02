@@ -574,6 +574,73 @@ def _compare_primfunc(mode, *, scalar=False):
     )
 
 
+def _compare_select_primfunc(*, scalar_select=False, with_scratch=False):
+    left = tvm.tir.decl_buffer((8,), "float32", name="left", scope="global")
+    right = tvm.tir.decl_buffer((8,), "float32", name="right", scope="global")
+    output = tvm.tir.decl_buffer((8,), "float32", name="output", scope="global")
+    ub_left = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_left", scope="shared.ub"
+    )
+    ub_right = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_right", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_output", scope="shared.ub"
+    )
+    ub_mask = tvm.tir.decl_buffer(
+        (1,), "uint8", name="ub_mask", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (8,), "float32", name="scratch", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    select_arguments = [
+        ub_output.access_ptr("w"), ub_mask.access_ptr("r"),
+        ub_left.access_ptr("r"),
+    ]
+    if with_scratch:
+        select_arguments.append(scratch.access_ptr("w"))
+    if scalar_select:
+        select_arguments.extend([
+            1, tvm.tir.FloatImm("float32", 10.0),
+            "VSEL_TENSOR_SCALAR_MODE", 8, "float32", "uint8",
+        ])
+    else:
+        select_arguments.extend([
+            2, ub_right.access_ptr("r"), "VSEL_TENSOR_TENSOR_MODE", 8,
+        ])
+    statements = [
+        copy("copy_gm_to_ub", left, ub_left, 8),
+        copy("copy_gm_to_ub", right, ub_right, 8),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_compare", ub_mask.access_ptr("w"),
+            ub_left.access_ptr("r"), ub_right.access_ptr("r"), "LT", 8,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_select", *select_arguments
+        )),
+        copy("copy_ub_to_gm", ub_output, output, 8),
+    ]
+    alloc_buffers = [ub_left, ub_right, ub_output, ub_mask]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=alloc_buffers,
+    )
+    return tvm.tir.PrimFunc(
+        [left.data, right.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={left.data: left, right.data: right, output.data: output},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -1224,6 +1291,42 @@ def test_real_tir_compare_packs_little_endian_predicate_bits(mode, scalar) -> No
     }[mode](left, rhs)
     expected = np.packbits(predicates, bitorder="little")
     np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize(
+    ("scalar_select", "with_scratch"), [(False, False), (True, True)]
+)
+def test_real_tir_select_reads_packed_compare_mask(
+    scalar_select, with_scratch
+) -> None:
+    program = build_kernel_program(
+        _compare_select_primfunc(
+            scalar_select=scalar_select, with_scratch=with_scratch
+        ),
+        platform="A3",
+    )
+    left_load, right_load, compare, select, store = program.tasks
+    assert select.operation == "select"
+    assert select.metadata["source_type"] == (1 if scalar_select else 2)
+    assert compare.task_id in select.dependencies
+    assert left_load.task_id in select.dependencies
+    if not scalar_select:
+        assert right_load.task_id in select.dependencies
+    assert store.dependencies == (select.task_id,)
+    assert ("scratch" in select.metadata) is with_scratch
+
+    simulator = FunctionalSimulator(program)
+    left = np.array([-2, 4, 0, 7, 2, 3, 9, 5], dtype=np.float32)
+    right = np.array([-1, 3, 1, 6, 3, 2, 8, 6], dtype=np.float32)
+    simulator.write(left_load.metadata["src"], left)
+    simulator.write(right_load.metadata["src"], right)
+    simulator.run()
+
+    fallback = 10.0 if scalar_select else right
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.where(left < right, left, fallback),
+    )
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:

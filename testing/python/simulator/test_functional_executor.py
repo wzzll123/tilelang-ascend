@@ -307,6 +307,43 @@ def test_clamp_rejects_reversed_literal_bounds() -> None:
         simulator.run()
 
 
+def test_select_rejects_mask_with_too_few_bits() -> None:
+    mask = BufferRegion("mask", MemoryScope.UB, (1,), "uint8")
+    source = _region("source", MemoryScope.UB, 9)
+    destination = _region("destination", MemoryScope.UB, 9)
+    program = KernelProgram(
+        "invalid-select-mask",
+        "A2",
+        (CoreProgram(0, (
+            Task(
+                "select",
+                "select",
+                0,
+                Lane.VECTOR_0,
+                Pipe.VECTOR,
+                1,
+                metadata={
+                    "mask": mask,
+                    "lhs": source,
+                    "scalar": 0.0,
+                    "dst": destination,
+                },
+            ),
+        )),),
+        buffers=(
+            BufferSpec("mask", MemoryScope.UB, (1,), "uint8"),
+            BufferSpec("source", MemoryScope.UB, (9,), "float32"),
+            BufferSpec("destination", MemoryScope.UB, (9,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(mask, np.array([0xff], dtype=np.uint8))
+    simulator.write(source, np.arange(9, dtype=np.float32))
+
+    with pytest.raises(ProgramValidationError, match="provides 8 bits for 9 values"):
+        simulator.run()
+
+
 def test_dynamic_buffer_allocation_resolves_symbolic_shape() -> None:
     dynamic_extent = SymbolicInt(
         "max", (AffineInt.variable("element_count"), 4)

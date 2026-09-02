@@ -506,6 +506,8 @@ class _TirBridge:
             return self._broadcast_metadata(arguments, context)
         if short in {"compare", "compare_scalar"}:
             return self._compare_metadata(short, arguments, context)
+        if short == "select":
+            return self._select_metadata(arguments, context)
         if short == "cast":
             return self._cast_metadata(arguments, context)
         if short == "fill":
@@ -873,6 +875,88 @@ class _TirBridge:
             metadata["scalar"] = scalar
         return metadata
 
+    def _select_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) < 7:
+            return {}
+        destination_arg, mask_arg, source_arg = arguments[:3]
+        cursor = 3
+        scratch_arg = None
+        if (
+            isinstance(arguments[cursor], self.tir.Call)
+            and str(arguments[cursor].op.name) == "tir.tvm_access_ptr"
+        ):
+            scratch_arg = arguments[cursor]
+            cursor += 1
+        source_type = self._const_int(arguments[cursor], context.environment)
+        cursor += 1
+        if source_type == 1:
+            if len(arguments) != cursor + 5:
+                return {}
+            source1_arg, mode_arg, count_arg = arguments[cursor:cursor + 3]
+            scalar = self._literal(self.analyzer.simplify(source1_arg))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"functional scalar select requires a literal, got {scalar!r}"
+                )
+            expected_mode = "VSEL_TENSOR_SCALAR_MODE"
+        elif source_type == 2:
+            if len(arguments) != cursor + 3:
+                return {}
+            source1_arg, mode_arg, count_arg = arguments[cursor:cursor + 3]
+            scalar = None
+            expected_mode = "VSEL_TENSOR_TENSOR_MODE"
+        else:
+            raise UnsupportedSimOpError(
+                f"functional select supports source type 1 or 2, got {source_type!r}"
+            )
+        mode = getattr(mode_arg, "value", None)
+        if mode != expected_mode:
+            raise UnsupportedSimOpError(
+                f"select source type {source_type} requires {expected_mode}, got {mode!r}"
+            )
+        count = self._runtime_int(count_arg, context.environment)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("select count must not be negative")
+        mask_extent = self._access_ptr_extent(mask_arg, context)
+        if mask_extent is None:
+            return {}
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        mask = self._access_buffer_region(mask_arg, (mask_extent,), context)
+        source = self._access_buffer_region(source_arg, (count,), context)
+        if destination is None or mask is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "mask": mask,
+            "lhs": source,
+            "select_mode": mode,
+            "source_type": source_type,
+        }
+        if source_type == 1:
+            metadata["scalar"] = scalar
+        else:
+            source1 = self._access_buffer_region(source1_arg, (count,), context)
+            if source1 is None:
+                return {}
+            metadata["rhs"] = source1
+        if scratch_arg is not None:
+            scratch_extent = self._access_ptr_extent(scratch_arg, context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                scratch_arg, (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
     def _scalar_metadata(
         self,
         arguments: Tuple[Any, ...],
@@ -1138,7 +1222,9 @@ class _TirBridge:
         metadata: Mapping[str, Any],
         core_id: int,
     ) -> Tuple[str, ...]:
-        reads = self._operand_regions(metadata, ("src", "lhs", "rhs", "accumulator"))
+        reads = self._operand_regions(
+            metadata, ("src", "lhs", "rhs", "mask", "accumulator")
+        )
         writes = self._operand_regions(metadata, ("dst", "pad_dst", "scratch"))
         dependencies = {
             task_id
@@ -1156,7 +1242,7 @@ class _TirBridge:
 
     def _record_memory_accesses(self, task: Task, core_id: int) -> None:
         reads = self._operand_regions(
-            task.metadata, ("src", "lhs", "rhs", "accumulator")
+            task.metadata, ("src", "lhs", "rhs", "mask", "accumulator")
         )
         writes = self._operand_regions(task.metadata, ("dst", "pad_dst", "scratch"))
         for region in writes:
