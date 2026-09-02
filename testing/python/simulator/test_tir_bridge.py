@@ -122,6 +122,7 @@ def _l1_to_l0_primfunc(
     source_cols=32,
     destination_rows=None,
     destination_cols=None,
+    source_offset=0,
 ):
     destination_rows = destination_rows or (source_cols if transpose else source_rows)
     destination_cols = destination_cols or (source_rows if transpose else source_cols)
@@ -142,7 +143,7 @@ def _l1_to_l0_primfunc(
         "handle",
         f"tl::ascend::copy_l1_to_l0{suffix}<half, {source_rows}, "
         f"{source_cols}, {str(transpose).lower()}>",
-        l1.access_ptr("r"),
+        l1.access_ptr("r", offset=source_offset),
         l0.access_ptr("w"),
         destination_rows,
         destination_cols,
@@ -1601,6 +1602,7 @@ def test_real_tir_transposed_l1_to_l0b_reinterprets_zn_as_nz() -> None:
         "destination_layout": "l0b",
         "source_shape": (32, 16),
         "destination_shape": (32, 16),
+        "source_origin": (0, 0),
         "transpose": True,
     }
 
@@ -1622,6 +1624,29 @@ def test_l1_to_l0_rejects_destination_larger_than_logical_source() -> None:
         build_kernel_program(
             _l1_to_l0_primfunc(destination_rows=48), platform="A3"
         )
+
+
+def test_real_tir_l1_to_l0_decodes_aligned_source_window() -> None:
+    program = build_kernel_program(
+        _l1_to_l0_primfunc(
+            source_rows=32,
+            source_cols=32,
+            destination_rows=16,
+            destination_cols=16,
+            source_offset=768,
+        ),
+        platform="A2",
+    )
+    task = program.tasks[0]
+    assert task.metadata["copy"]["source_origin"] == (16, 16)
+    simulator = FunctionalSimulator(program)
+    logical = np.arange(32 * 32, dtype=np.float16).reshape(32, 32)
+    simulator.write(task.metadata["src"], pack_matrix(logical, "zN"))
+    simulator.run()
+    np.testing.assert_array_equal(
+        unpack_matrix(simulator.read(task.metadata["dst"]), "l0a", (16, 16)),
+        logical[16:32, 16:32],
+    )
 
 
 def test_real_tir_gm_l1_l0a_pipeline_executes_with_raw_dependency() -> None:

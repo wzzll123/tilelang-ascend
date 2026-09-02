@@ -226,7 +226,11 @@ class FunctionalSimulator:
             logical = unpack_matrix(
                 values, copy_details["source_layout"], source_shape
             )
-            tile = logical[:destination_shape[0], :destination_shape[1]]
+            source_row, source_col = copy_details.get("source_origin", (0, 0))
+            tile = logical[
+                source_row:source_row + destination_shape[0],
+                source_col:source_col + destination_shape[1],
+            ]
             if copy_details.get("relu") is True:
                 tile = np.maximum(tile, 0)
             values = pack_matrix(

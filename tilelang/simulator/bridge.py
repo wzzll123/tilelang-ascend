@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .errors import ProgramValidationError, UnsupportedSimOpError
-from .layout import BYTE_PER_C0, C0_NUM_PER_FRACTAL, storage_elements
+from .layout import BYTE_PER_C0, C0_NUM_PER_FRACTAL, physical_index, storage_elements
 from .memory import contiguous_strides_bytes, dtype_size_bytes
 from .profile import TimingProfile, default_timing_profile, normalize_platform
 from .program import (
@@ -875,8 +875,40 @@ class _TirBridge:
         )
         if source is None or destination is None:
             return {}
+        if not isinstance(source.byte_offset, int) or source.byte_offset % BYTE_PER_C0:
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires a 32-byte-aligned source"
+            )
+        source_element_offset = source.byte_offset // itemsize
+        source_origin = next(
+            (
+                (row, col)
+                for row in range(source_shape[0])
+                for col in range(source_shape[1])
+                if physical_index(
+                    source_layout, row, col, source_shape, itemsize
+                ) == source_element_offset
+            ),
+            None,
+        )
+        if source_origin is None:
+            raise UnsupportedSimOpError(
+                f"functional {operation} cannot map its source offset to a logical tile"
+            )
+        if (
+            source_origin[0] + destination_rows > source_shape[0]
+            or source_origin[1] + destination_cols > source_shape[1]
+        ):
+            raise ProgramValidationError(
+                f"{operation} source window exceeds its logical L1 tile"
+            )
+        source = replace(
+            source,
+            shape=(source_elements,),
+            byte_offset=0,
+            strides_bytes=None,
+        )
         for label, region, elements, spec in (
-            ("source", source, source_elements, source_spec),
             ("destination", destination, destination_elements, destination_spec),
         ):
             tile_bytes = elements * itemsize
@@ -901,6 +933,7 @@ class _TirBridge:
                 "destination_layout": destination_layout,
                 "source_shape": source_shape,
                 "destination_shape": destination_shape,
+                "source_origin": source_origin,
                 "transpose": transpose,
             },
         }
