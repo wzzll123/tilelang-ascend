@@ -525,6 +525,10 @@ class _TirBridge:
             return self._gm_to_l1_linear_metadata(arguments, context)
         if short == "copy_gm_to_l1":
             return self._gm_to_l1_zn_metadata(arguments, context)
+        if short in {"copy_l1_to_l0a", "copy_l1_to_l0b"}:
+            return self._l1_to_l0_metadata(
+                short, normalized, arguments, context
+            )
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -758,6 +762,137 @@ class _TirBridge:
                 "need_clear": (
                     valid_rows != physical_rows or valid_cols != physical_cols
                 ),
+            },
+        }
+
+    def _l1_to_l0_metadata(
+        self,
+        operation: str,
+        operation_tag: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, dstM, dstN. The source shape and transpose
+        # flag are compile-time template arguments on the operation name.
+        if len(arguments) != 4:
+            return {}
+        template = operation_tag.rsplit("::", 1)[-1]
+        if "<" not in template or not template.endswith(">"):
+            return {}
+        parameters = [
+            parameter.strip()
+            for parameter in template.split("<", 1)[1][:-1].split(",")
+        ]
+        if len(parameters) != 4:
+            raise UnsupportedSimOpError(
+                f"malformed {operation} template {operation_tag!r}"
+            )
+        try:
+            source_rows, source_cols = (int(parameters[index]) for index in (1, 2))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                f"{operation} requires static source template extents"
+            ) from error
+        if parameters[3] not in {"true", "false"}:
+            raise UnsupportedSimOpError(
+                f"{operation} requires a literal transpose template flag"
+            )
+        transpose = parameters[3] == "true"
+        destination_dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:4]
+        )
+        if any(value is None for value in destination_dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in destination_dimensions):
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires static destination extents"
+            )
+        destination_rows, destination_cols = destination_dimensions
+        if min(source_rows, source_cols, destination_rows, destination_cols) <= 0:
+            raise ProgramValidationError(
+                f"{operation} matrix extents must be positive"
+            )
+
+        source_shape = (
+            (source_cols, source_rows) if transpose else (source_rows, source_cols)
+        )
+        destination_shape = (destination_rows, destination_cols)
+        if (
+            destination_rows > source_shape[0]
+            or destination_cols > source_shape[1]
+        ):
+            raise ProgramValidationError(
+                f"{operation} destination tile must fit its logical L1 source"
+            )
+        source_layout = "nZ" if transpose else "zN"
+        destination_layout = "zZ" if operation.endswith("l0a") else "nZ"
+
+        source_name = self._access_ptr_data_name(arguments[0])
+        destination_name = self._access_ptr_data_name(arguments[1])
+        if source_name is None or destination_name is None:
+            return {}
+        source_buffer = self.buffer_name_by_data_var.get(source_name)
+        destination_buffer = self.buffer_name_by_data_var.get(destination_name)
+        if source_buffer is None or destination_buffer is None:
+            return {}
+        source_spec = self.buffers[source_buffer]
+        destination_spec = self.buffers[destination_buffer]
+        expected_destination_scope = (
+            MemoryScope.L0A if operation.endswith("l0a") else MemoryScope.L0B
+        )
+        if (
+            source_spec.scope is not MemoryScope.L1
+            or destination_spec.scope is not expected_destination_scope
+        ):
+            raise ProgramValidationError(
+                f"{operation} requires L1 source and {expected_destination_scope.value} destination"
+            )
+        if source_spec.dtype != destination_spec.dtype:
+            raise ProgramValidationError(
+                f"{operation} requires matching source/destination dtype"
+            )
+
+        itemsize = dtype_size_bytes(source_spec.dtype)
+        source_elements = storage_elements(source_layout, source_shape, itemsize)
+        destination_elements = storage_elements(
+            destination_layout, destination_shape, itemsize
+        )
+        source = self._access_buffer_region(
+            arguments[0], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (destination_elements,), context
+        )
+        if source is None or destination is None:
+            return {}
+        for label, region, elements, spec in (
+            ("source", source, source_elements, source_spec),
+            ("destination", destination, destination_elements, destination_spec),
+        ):
+            tile_bytes = elements * itemsize
+            if (
+                not isinstance(region.byte_offset, int)
+                or region.byte_offset % tile_bytes
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional {operation} requires a tile-base-aligned {label}"
+                )
+            buffer_size = _buffer_size_bytes(spec)
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"{operation} physical {label} tile exceeds its buffer"
+                )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout_transform": True,
+                "source_layout": source_layout,
+                "destination_layout": destination_layout,
+                "source_shape": source_shape,
+                "destination_shape": destination_shape,
+                "transpose": transpose,
             },
         }
 

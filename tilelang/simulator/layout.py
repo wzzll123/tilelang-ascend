@@ -1,6 +1,6 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""Physical A2/A3 matrix-layout codecs used by Cube simulation."""
+"""Physical A2/A3 zN, zZ, and nZ matrix-layout codecs for Cube simulation."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def storage_elements(layout: str, shape: Tuple[int, int], itemsize: int) -> int:
     normalized = layout.strip().lower()
     if normalized == "row_major":
         return rows * cols
-    if normalized == "zn":
+    if normalized in {"zn", "zz"}:
         return _round_up(rows, C0_NUM_PER_FRACTAL) * _round_up(cols, elements_per_c0)
     if normalized == "nz":
         return _round_up(rows, elements_per_c0) * _round_up(cols, C0_NUM_PER_FRACTAL)
@@ -56,7 +56,8 @@ def physical_index(
 ) -> int:
     """Map one logical matrix coordinate to its physical element offset.
 
-    The zN/nZ formulas are identical to ``tilelang/intrinsics/ascend_layout.py``.
+    zN/nZ follow ``tilelang/intrinsics/ascend_layout.py``; zZ follows the
+    Catlass ``layout::zZ::MakeLayout`` shape and stride construction.
     """
     rows, cols, elements_per_c0 = _validate(shape, itemsize)
     if not (0 <= row < rows and 0 <= col < cols):
@@ -73,6 +74,15 @@ def physical_index(
             + col // elements_per_c0
             * _round_up(rows, C0_NUM_PER_FRACTAL)
             * elements_per_c0
+            + row % C0_NUM_PER_FRACTAL * elements_per_c0
+            + col % elements_per_c0
+        )
+    if normalized == "zz":
+        return (
+            row // C0_NUM_PER_FRACTAL
+            * _round_up(cols, elements_per_c0)
+            * C0_NUM_PER_FRACTAL
+            + col // elements_per_c0 * elements_per_fractal
             + row % C0_NUM_PER_FRACTAL * elements_per_c0
             + col % elements_per_c0
         )
@@ -97,7 +107,8 @@ def pack_matrix(values: np.ndarray, layout: str) -> np.ndarray:
     result = np.zeros(storage_elements(layout, shape, matrix.dtype.itemsize), dtype=matrix.dtype)
     for row in range(shape[0]):
         for col in range(shape[1]):
-            result[physical_index(layout, row, col, shape, matrix.dtype.itemsize)] = matrix[row, col]
+            index = physical_index(layout, row, col, shape, matrix.dtype.itemsize)
+            result[index] = matrix[row, col]
     return result
 
 

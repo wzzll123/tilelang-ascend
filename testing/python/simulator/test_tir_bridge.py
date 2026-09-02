@@ -20,7 +20,7 @@ from tilelang.simulator import (  # noqa: E402
     UnsupportedSimOpError,
     build_kernel_program,
 )
-from tilelang.simulator.layout import unpack_matrix  # noqa: E402
+from tilelang.simulator.layout import pack_matrix, unpack_matrix  # noqa: E402
 
 
 @T.prim_func
@@ -107,6 +107,87 @@ def _gm_to_l1_zn_primfunc(physical_rows=16):
     )
     root = tvm.tir.Block(
         [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[l1]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source},
+    )
+
+
+def _l1_to_l0_primfunc(
+    destination_scope="wmma.matrix_a",
+    transpose=False,
+    source_rows=32,
+    source_cols=32,
+    destination_rows=None,
+    destination_cols=None,
+):
+    destination_rows = destination_rows or (source_cols if transpose else source_rows)
+    destination_cols = destination_cols or (source_rows if transpose else source_cols)
+    source_elements = ((source_rows + 15) // 16 * 16) * (
+        (source_cols + 15) // 16 * 16
+    )
+    destination_elements = ((destination_rows + 15) // 16 * 16) * (
+        (destination_cols + 15) // 16 * 16
+    )
+    l1 = tvm.tir.decl_buffer(
+        (source_elements,), "float16", name="l1", scope="shared.l1"
+    )
+    l0 = tvm.tir.decl_buffer(
+        (destination_elements,), "float16", name="l0", scope=destination_scope
+    )
+    suffix = "a" if destination_scope == "wmma.matrix_a" else "b"
+    copy = tvm.tir.call_extern(
+        "handle",
+        f"tl::ascend::copy_l1_to_l0{suffix}<half, {source_rows}, "
+        f"{source_cols}, {str(transpose).lower()}>",
+        l1.access_ptr("r"),
+        l0.access_ptr("w"),
+        destination_rows,
+        destination_cols,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[l1, l0]
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
+def _gm_l1_l0_primfunc():
+    source = tvm.tir.decl_buffer((32, 32), "float16", name="source", scope="global")
+    l1 = tvm.tir.decl_buffer((1024,), "float16", name="l1", scope="shared.l1")
+    l0a = tvm.tir.decl_buffer(
+        (1024,), "float16", name="l0a", scope="wmma.matrix_a"
+    )
+    gm_to_l1 = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_gm_to_l1<half, 32, 32>",
+        source.access_ptr("r"),
+        l1.access_ptr("w"),
+        32,
+        32,
+        32,
+        32,
+        32,
+    )
+    l1_to_l0a = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_l1_to_l0a<half, 32, 32, false>",
+        l1.access_ptr("r"),
+        l0a.access_ptr("w"),
+        32,
+        32,
+    )
+    root = tvm.tir.Block(
+        [],
+        [],
+        [],
+        "root",
+        tvm.tir.SeqStmt([
+            tvm.tir.Evaluate(gm_to_l1),
+            tvm.tir.Evaluate(l1_to_l0a),
+        ]),
+        alloc_buffers=[l1, l0a],
     )
     return tvm.tir.PrimFunc(
         [source.data],
@@ -1218,6 +1299,94 @@ def test_real_tir_zn_gm_to_l1_copy_packs_and_clears_tail() -> None:
 def test_zn_gm_to_l1_rejects_non_fractal_physical_tile() -> None:
     with pytest.raises(UnsupportedSimOpError, match="fractal/C0-aligned"):
         build_kernel_program(_gm_to_l1_zn_primfunc(physical_rows=15), platform="A2")
+
+
+@pytest.mark.parametrize(
+    ("destination_scope", "destination_layout"),
+    [("wmma.matrix_a", "zZ"), ("wmma.matrix_b", "nZ")],
+)
+def test_real_tir_l1_to_l0_copy_converts_physical_layout(
+    destination_scope, destination_layout
+) -> None:
+    program = build_kernel_program(
+        _l1_to_l0_primfunc(destination_scope=destination_scope), platform="A3"
+    )
+    task = program.tasks[0]
+    expected_operation = (
+        "copy_l1_to_l0a" if destination_scope == "wmma.matrix_a"
+        else "copy_l1_to_l0b"
+    )
+    assert (task.operation, task.lane, task.pipe) == (
+        expected_operation, Lane.CUBE, Pipe.MTE1,
+    )
+    assert task.metadata["copy"]["source_layout"] == "zN"
+    assert task.metadata["copy"]["destination_layout"] == destination_layout
+
+    simulator = FunctionalSimulator(program)
+    logical = np.arange(32 * 32, dtype=np.float16).reshape(32, 32)
+    simulator.write(task.metadata["src"], pack_matrix(logical, "zN"))
+    simulator.run()
+
+    physical = simulator.read(task.metadata["dst"])
+    np.testing.assert_array_equal(
+        unpack_matrix(physical, destination_layout, (32, 32)), logical
+    )
+
+
+def test_real_tir_transposed_l1_to_l0b_reinterprets_zn_as_nz() -> None:
+    program = build_kernel_program(
+        _l1_to_l0_primfunc(
+            destination_scope="wmma.matrix_b",
+            transpose=True,
+            source_rows=16,
+            source_cols=32,
+        ),
+        platform="A2",
+    )
+    task = program.tasks[0]
+    assert task.metadata["copy"] == {
+        "layout_transform": True,
+        "source_layout": "nZ",
+        "destination_layout": "nZ",
+        "source_shape": (32, 16),
+        "destination_shape": (32, 16),
+        "transpose": True,
+    }
+
+    simulator = FunctionalSimulator(program)
+    original = np.arange(16 * 32, dtype=np.float16).reshape(16, 32)
+    source_storage = pack_matrix(original, "zN")
+    np.testing.assert_array_equal(source_storage, pack_matrix(original.T, "nZ"))
+    simulator.write(task.metadata["src"], source_storage)
+    simulator.run()
+
+    physical = simulator.read(task.metadata["dst"])
+    np.testing.assert_array_equal(
+        unpack_matrix(physical, "nZ", (32, 16)), original.T
+    )
+
+
+def test_l1_to_l0_rejects_destination_larger_than_logical_source() -> None:
+    with pytest.raises(ProgramValidationError, match="must fit"):
+        build_kernel_program(
+            _l1_to_l0_primfunc(destination_rows=48), platform="A3"
+        )
+
+
+def test_real_tir_gm_l1_l0a_pipeline_executes_with_raw_dependency() -> None:
+    program = build_kernel_program(_gm_l1_l0_primfunc(), platform="A3")
+    assert [task.operation for task in program.tasks] == [
+        "copy_gm_to_l1", "copy_l1_to_l0a",
+    ]
+    assert program.tasks[1].dependencies == (program.tasks[0].task_id,)
+
+    simulator = FunctionalSimulator(program)
+    logical = np.arange(32 * 32, dtype=np.float16).reshape(32, 32)
+    simulator.write(program.tasks[0].metadata["src"], logical)
+    simulator.run()
+
+    physical = simulator.read(program.tasks[1].metadata["dst"])
+    np.testing.assert_array_equal(unpack_matrix(physical, "zZ", (32, 32)), logical)
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,7 @@ import numpy as np
 
 from .config import SimulatorConfig
 from .errors import ProgramValidationError, UnsupportedSimOpError
-from .layout import pack_matrix
+from .layout import pack_matrix, unpack_matrix
 from .memory import MemoryRuntime, MemoryView
 from .program import (
     AffineInt,
@@ -214,7 +214,17 @@ class FunctionalSimulator:
                 task_core_id=task.core_id,
             )
         values = self.read(source, task_core_id=task.core_id)
-        if copy_details.get("layout") == "zN":
+        if copy_details.get("layout_transform") is True:
+            source_shape = tuple(copy_details["source_shape"])
+            destination_shape = tuple(copy_details["destination_shape"])
+            logical = unpack_matrix(
+                values, copy_details["source_layout"], source_shape
+            )
+            values = pack_matrix(
+                logical[:destination_shape[0], :destination_shape[1]],
+                copy_details["destination_layout"],
+            )
+        elif copy_details.get("layout") == "zN":
             physical_shape = (
                 _resolve_int(copy_details["physical_rows"], self.bindings),
                 _resolve_int(copy_details["physical_cols"], self.bindings),

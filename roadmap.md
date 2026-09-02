@@ -145,6 +145,8 @@ sum/max/min 对二维 valid rectangle 按列归约；workspace、axis 1 和 accu
 Cube copy 已有两条 GM→L1 路径：显式 RowMajor 路径按二维 stride 搬运；默认路径将有效
 矩形按仓库 `ascend_layout.py` 的 zN 公式写入真实物理存储，并复现 tail tile 清零。默认
 路径当前只接受 fractal/C0 对齐、tile-base 对齐的静态物理 tile；子 tile 拼接继续拒绝。
+L1→L0 已支持 tile-base 路径：L0A 执行 zN→zZ，L0B 执行 zN→nZ；transpose 路径利用
+zN(A) 与 nZ(Aᵀ) 的物理等价关系，并保留 L1 写入到 L0 读取的 RAW dependency。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe，以及后续 P3–P8 operation。
@@ -165,13 +167,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `173 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `180 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 173 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 180 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -271,7 +273,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   contract 和 32-byte row alignment。~~
 - [x] ~~实现默认 zN `copy_gm_to_l1` 的 aligned physical tile/base 路径、tail clear
   和真实物理 pack。~~
-- [ ] 实现非对齐/子 tile GM→L1、L1→L0A/L0B 和 L0C→GM 的合法 copy 路径。
+- [x] ~~实现 tile-base L1→L0A/L0B 的 zN→zZ/zN→nZ layout conversion、transpose
+  重解释、容量检查和跨级 RAW dependency。~~
+- [ ] 实现非对齐/子 tile GM→L1、sliced L1→L0A/L0B 和 L0C→GM 的合法 copy 路径。
 - [ ] 实现 `gemm_v0`。
 - [ ] 实现显式 `mma`，支持 init、accumulate 和多 K tile 累加。
 - [ ] 实现基础 fixpipe 和 L0C 输出。
@@ -357,7 +361,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：173 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：180 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -367,7 +371,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 实现 L1→L0A/L0B 的合法 layout 转换和真实物理存储。
-2. 实现 L0C→GM/fixpipe 基础输出路径。
-3. 接入 `gemm_v0`，再实现显式 `mma` 的 init/accumulate/K-tile。
+1. 实现 L0C→GM/fixpipe 基础输出路径。
+2. 接入 `gemm_v0`，再实现显式 `mma` 的 init/accumulate/K-tile。
+3. 扩展 sliced L1→L0 和非 tile-base 的合法路径。
 4. 并行补齐 compare/select mask variants 与 reduction dtype/whole/block variants。
