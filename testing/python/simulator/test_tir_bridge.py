@@ -295,6 +295,64 @@ def _mma_chain_primfunc():
     return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
 
 
+def _mma_fixpipe_primfunc(
+    *, n_actual=16, mma_unit_flag=3, fix_unit_flag=3, fix_valid_cols=None,
+    accumulate=False,
+):
+    rows, cols, inner = 16, 32, 13
+    valid_cols = n_actual if fix_valid_cols is None else fix_valid_cols
+    operand_count = 2 if accumulate else 1
+    operands = [
+        (
+            tvm.tir.decl_buffer(
+                (16 * 16,), "float16", name=f"l0a{index}",
+                scope="wmma.matrix_a",
+            ),
+            tvm.tir.decl_buffer(
+                (16 * 32,), "float16", name=f"l0b{index}",
+                scope="wmma.matrix_b",
+            ),
+        )
+        for index in range(operand_count)
+    ]
+    l0c = tvm.tir.decl_buffer(
+        (16 * 32,), "float32", name="l0c", scope="wmma.accumulator"
+    )
+    output = tvm.tir.decl_buffer(
+        (rows, cols), "float16", name="output", scope="global"
+    )
+    mma_calls = [
+        tvm.tir.call_extern(
+            "handle", "tl.ascend_mma", "mma<half, float, 16, 32>",
+            l0a.access_ptr("r"), l0b.access_ptr("r"),
+            l0c.access_ptr("w" if index == 0 else "rw"), index == 0, inner,
+            n_actual, 2 if index + 1 < operand_count else mma_unit_flag,
+        )
+        for index, (l0a, l0b) in enumerate(operands)
+    ]
+    fixpipe = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_l0c_to_gm<float, half, layout::RowMajor, "
+        "16, 32, false>",
+        l0c.access_ptr("r"), output.access_ptr("w"), cols, rows, valid_cols,
+        rows, cols, False, fix_unit_flag,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root",
+        tvm.tir.SeqStmt([
+            *(tvm.tir.Evaluate(mma) for mma in mma_calls),
+            tvm.tir.Evaluate(fixpipe),
+        ]),
+        alloc_buffers=[
+            *(buffer for pair in operands for buffer in pair), l0c,
+        ],
+    )
+    return tvm.tir.PrimFunc(
+        [output.data], tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
 def _gemm_v0_primfunc(
     transpose_a=False, transpose_b=False, init=True, n_actual=None,
     k_l0_size=16, inner=13, rows=16, cols=16,
@@ -1743,7 +1801,7 @@ def test_real_tir_l0c_to_gm_executes_relu_tail_and_dtype_conversion() -> None:
         "layout_transform": True,
         "source_layout": "l0c",
         "destination_layout": "row_major",
-        "source_shape": (16, 32),
+        "source_shape": (16, 17),
         "destination_shape": (13, 17),
         "relu": True,
         "unit_flag": 0,
@@ -1759,9 +1817,91 @@ def test_real_tir_l0c_to_gm_executes_relu_tail_and_dtype_conversion() -> None:
     np.testing.assert_array_equal(simulator.read(task.metadata["dst"]), expected)
 
 
-def test_l0c_to_gm_rejects_paired_unit_flag_until_mma_is_supported() -> None:
-    with pytest.raises(UnsupportedSimOpError, match="unitFlag=0 only"):
+def test_l0c_to_gm_rejects_unpaired_unit_flag() -> None:
+    with pytest.raises(ProgramValidationError, match="preceding paired MMA"):
         build_kernel_program(_l0c_to_gm_primfunc(unit_flag=3), platform="A2")
+
+
+def test_mma_fixpipe_unit_flag_pair_executes_partial_columns() -> None:
+    program = build_kernel_program(_mma_fixpipe_primfunc(), platform="A3")
+    mma, fixpipe = program.tasks
+    assert mma.metadata["unit_flag_role"] == "release"
+    assert mma.metadata["unit_flag_pair"] == fixpipe.task_id
+    assert fixpipe.metadata["unit_flag_role"] == "consume"
+    assert fixpipe.metadata["unit_flag_pair"] == mma.task_id
+    assert mma.task_id in fixpipe.dependencies
+    assert fixpipe.metadata["src"].shape == (16 * 16,)
+
+    simulator = FunctionalSimulator(program)
+    left = (np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 50) / 32
+    right = (np.arange(13 * 16, dtype=np.float16).reshape(13, 16) - 70) / 64
+    simulator.write(mma.metadata["lhs"], pack_matrix(left, "l0a"))
+    simulator.write(mma.metadata["rhs"], pack_matrix(right, "l0b"))
+    simulator.run()
+    np.testing.assert_allclose(
+        simulator.read(fixpipe.metadata["dst"]),
+        (left.astype(np.float32) @ right.astype(np.float32)).astype(np.float16),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_mma_fixpipe_unit_flag_hold_accumulates_then_releases() -> None:
+    program = build_kernel_program(
+        _mma_fixpipe_primfunc(accumulate=True), platform="A2"
+    )
+    first, second, fixpipe = program.tasks
+    assert first.metadata["unit_flag_role"] == "hold"
+    assert second.metadata["unit_flag_role"] == "release"
+    assert fixpipe.metadata["unit_flag_role"] == "consume"
+    assert first.task_id in second.dependencies
+    assert second.task_id in fixpipe.dependencies
+
+    simulator = FunctionalSimulator(program)
+    expected = np.zeros((16, 16), dtype=np.float32)
+    for index, mma in enumerate((first, second)):
+        left = (
+            np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 50 + index
+        ) / 32
+        right = (
+            np.arange(13 * 16, dtype=np.float16).reshape(13, 16) - 70 - index
+        ) / 64
+        simulator.write(mma.metadata["lhs"], pack_matrix(left, "l0a"))
+        simulator.write(mma.metadata["rhs"], pack_matrix(right, "l0b"))
+        expected += left.astype(np.float32) @ right.astype(np.float32)
+    simulator.run()
+    np.testing.assert_allclose(
+        simulator.read(fixpipe.metadata["dst"]),
+        expected.astype(np.float16),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_mma_fixpipe_unit_flag_pair_rejects_column_mismatch() -> None:
+    with pytest.raises(ProgramValidationError, match="column counts disagree"):
+        build_kernel_program(
+            _mma_fixpipe_primfunc(fix_valid_cols=32), platform="A2"
+        )
+
+
+def test_mma_rejects_unmatched_release_unit_flag() -> None:
+    with pytest.raises(ProgramValidationError, match="following paired fixpipe"):
+        build_kernel_program(
+            _mma_primfunc(cols=32, n_actual=16, unit_flag=3), platform="A3"
+        )
+
+
+def test_mma_rejects_unknown_unit_flag() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="unitFlag"):
+        build_kernel_program(
+            _mma_primfunc(cols=32, n_actual=16, unit_flag=1), platform="A2"
+        )
+
+
+def test_fixpipe_rejects_unknown_unit_flag() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="unitFlag"):
+        build_kernel_program(_l0c_to_gm_primfunc(unit_flag=2), platform="A3")
 
 
 @pytest.mark.parametrize("initialize", [True, False])

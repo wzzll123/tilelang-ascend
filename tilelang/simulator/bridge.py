@@ -197,6 +197,7 @@ class _TirBridge:
         self._collect_memory_plan(func)
         self._collect_parameter_buffers(func)
         self._visit(func.body, _Context())
+        self._validate_unit_flag_pairs()
         cores = tuple(
             CoreProgram(core_id, tuple(self.tasks[core_id])) for core_id in sorted(self.tasks)
         )
@@ -1246,9 +1247,9 @@ class _TirBridge:
                 "copy_l0c_to_gm ReLU argument disagrees with its template"
             )
         unit_flag = self._runtime_int(arguments[8], context.environment)
-        if unit_flag != 0:
+        if not isinstance(unit_flag, int) or unit_flag not in {0, 3}:
             raise UnsupportedSimOpError(
-                "functional copy_l0c_to_gm supports standalone unitFlag=0 only"
+                "functional copy_l0c_to_gm supports unitFlag 0 or 0b11"
             )
 
         source_name = self._access_ptr_data_name(arguments[0])
@@ -1258,9 +1259,14 @@ class _TirBridge:
         if source_buffer is None:
             return {}
         source_spec = self.buffers[source_buffer]
-        source_elements = storage_elements(
+        source_capacity_elements = storage_elements(
             "l0c",
             (physical_rows, physical_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source_elements = storage_elements(
+            "l0c",
+            (physical_rows, valid_cols),
             dtype_size_bytes(source_spec.dtype),
         )
         source = self._access_buffer_region(
@@ -1288,7 +1294,7 @@ class _TirBridge:
             raise ProgramValidationError(
                 "copy_l0c_to_gm buffer dtypes disagree with its template"
             )
-        source_bytes = source_elements * dtype_size_bytes(source.dtype)
+        source_bytes = source_capacity_elements * dtype_size_bytes(source.dtype)
         if (
             not isinstance(source.byte_offset, int)
             or source.byte_offset % source_bytes
@@ -1308,7 +1314,7 @@ class _TirBridge:
                 "layout_transform": True,
                 "source_layout": "l0c",
                 "destination_layout": "row_major",
-                "source_shape": (physical_rows, physical_cols),
+                "source_shape": (physical_rows, valid_cols),
                 "destination_shape": (valid_rows, valid_cols),
                 "relu": template_relu,
                 "unit_flag": unit_flag,
@@ -1366,9 +1372,9 @@ class _TirBridge:
                 raise UnsupportedSimOpError(
                     "functional mma requires n_actual to be a multiple of 16"
                 )
-            if unit_flag != 0:
+            if not isinstance(unit_flag, int) or unit_flag not in {0, 2, 3}:
                 raise UnsupportedSimOpError(
-                    "functional mma supports standalone unitFlag=0 only"
+                    "functional mma supports unitFlag 0, 0b10, or 0b11"
                 )
 
         input_dtype = _ascend_template_dtype(parameters[0])
@@ -1442,9 +1448,75 @@ class _TirBridge:
                 "unit_flag": unit_flag,
             },
         }
+        if unit_flag == 2:
+            metadata["unit_flag_role"] = "hold"
         if not initialize:
             metadata["accumulator"] = destination
         return metadata
+
+    def _validate_unit_flag_pairs(self) -> None:
+        """Validate the hardware MMA-to-fixpipe unitFlag handshake per core."""
+        for core_id, tasks in self.tasks.items():
+            releases: list[Tuple[int, Task]] = []
+            consumed: set[str] = set()
+            for index, task in enumerate(tasks):
+                mma = task.metadata.get("mma")
+                copy = task.metadata.get("copy")
+                if isinstance(mma, Mapping) and mma.get("unit_flag") == 3:
+                    releases.append((index, task))
+                    continue
+                if not (
+                    isinstance(copy, Mapping)
+                    and copy.get("unit_flag") == 3
+                    and task.operation == "copy_l0c_to_gm"
+                ):
+                    continue
+                source = task.metadata.get("src")
+                candidates = [
+                    (release_index, release)
+                    for release_index, release in releases
+                    if release.task_id not in consumed
+                    and release.task_id in task.dependencies
+                    and isinstance(source, BufferRegion)
+                    and isinstance(release.metadata.get("dst"), BufferRegion)
+                    and self._regions_overlap(
+                        source, release.metadata["dst"], core_id
+                    )
+                ]
+                if not candidates:
+                    raise ProgramValidationError(
+                        "unitFlag=0b11 fixpipe requires a preceding paired MMA "
+                        f"on the same L0C region (task {task.task_id})"
+                    )
+                release_index, release = candidates[-1]
+                mma_cols = release.metadata["mma"]["n_actual"]
+                fix_cols = copy["destination_shape"][1]
+                if mma_cols != fix_cols:
+                    raise ProgramValidationError(
+                        "paired MMA/fixpipe unitFlag column counts disagree: "
+                        f"mma n_actual={mma_cols}, fixpipe validN={fix_cols}"
+                    )
+                consumed.add(release.task_id)
+                release_metadata = dict(release.metadata)
+                release_metadata.update({
+                    "unit_flag_role": "release",
+                    "unit_flag_pair": task.task_id,
+                })
+                tasks[release_index] = replace(release, metadata=release_metadata)
+                task_metadata = dict(task.metadata)
+                task_metadata.update({
+                    "unit_flag_role": "consume",
+                    "unit_flag_pair": release.task_id,
+                })
+                tasks[index] = replace(task, metadata=task_metadata)
+            unmatched = [
+                task.task_id for _, task in releases if task.task_id not in consumed
+            ]
+            if unmatched:
+                raise ProgramValidationError(
+                    "unitFlag=0b11 MMA requires a following paired fixpipe; "
+                    "unmatched tasks: " + ", ".join(unmatched)
+                )
 
     def _gemm_v0_metadata(
         self,
