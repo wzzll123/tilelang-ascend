@@ -146,9 +146,341 @@ private:
   bool is_2d_vectorizing_ = false;
   int temp_buffer_id_ = 0;
   std::vector<Buffer> temp_buffers_;
+  // Hoisted offset-table init stmts for interleaved stores, and a dedupe cache
+  // keyed by (dtype, rows, D). The table contents are compile-time constants,
+  // so the init is loop-invariant: emit it once at the enclosing block entry
+  // instead of re-executing rows*D scalar stores on every tile iteration
+  // (the T.Parallel sits inside a serial tile loop in e.g. interleaved RoPE).
+  std::vector<Stmt> hoisted_offset_inits_;
+  std::unordered_map<std::string, Buffer> offset_table_cache_;
   int64_t vector_dim_extent_{
       0};                       // Track the extent of the vector dimension loop
   int64_t outer_dim_extent_{0}; // Track the extent of the outer dimension loop
+
+  // Interleaved store pattern detection: rf[2j]=oa[j], rf[2j+1]=ob[j]
+  // This is the core pattern from apply_rotary_pos_emb interleaved mode.
+  // A2 (2201) has no Interleave/DeInterleave primitive, so we lower this to
+  // Gather-based vectorized recombination:
+  //   Step 1: DataCopy oa/ob into a contiguous staging buffer tmp=[oa|ob]
+  //   Step 2: Dynamically generate offset buffer off[k]=(k/2+(k%2)*half)*sizeof(T)
+  //   Step 3: Gather(rf, tmp, off, 0, D) for vectorized recombination
+  struct InterleavedStoreInfo {
+    Buffer output_buffer;      // rf
+    Buffer input_a;            // oa
+    Buffer input_b;            // ob
+    const VarNode *row_var;    // i
+    const VarNode *col_var;    // j
+    int64_t half_width;        // half (inner extent of oa/ob)
+    int64_t full_width;        // D = 2 * half (inner extent of rf)
+    int64_t outer_extent;      // TILE_ROWS
+  };
+
+  // Match a single interleaved-store pair:
+  //   store_even: rf[i, 2*j]   = oa[i, j]
+  //   store_odd:  rf[i, 2*j+1] = ob[i, j]
+  // On success fills `info` and returns true. Pure matcher (no emission).
+  bool MatchInterleavedPair(const BufferStoreNode *store0,
+                            const BufferStoreNode *store1,
+                            const std::unordered_set<const VarNode *> &parallel_vars,
+                            InterleavedStoreInfo *info) {
+    if (!store0 || !store1) {
+      return false;
+    }
+
+    // Both stores must be to the same output buffer
+    if (!store0->buffer.same_as(store1->buffer)) {
+      return false;
+    }
+
+    Buffer output_buffer = store0->buffer;
+    if (output_buffer->shape.size() != 2 || store0->indices.size() != 2 ||
+        store1->indices.size() != 2) {
+      return false;
+    }
+
+    // Check if both stores have the same row index (outer var)
+    if (!store0->indices[0].same_as(store1->indices[0])) {
+      return false;
+    }
+
+    // Extract row and column variables
+    const VarNode *row_var = store0->indices[0].as<VarNode>();
+    if (!row_var || parallel_vars.count(row_var) == 0) {
+      return false;
+    }
+
+    // Check if column indices are 2*j and 2*j+1 (interleaved pattern)
+    // store0: rf[i, 2*j] = oa[i, j]
+    // store1: rf[i, 2*j+1] = ob[i, j]
+    PrimExpr col0 = store0->indices[1];
+    PrimExpr col1 = store1->indices[1];
+
+    // Try to match 2*j pattern (handle both 2*j and j*2)
+    const MulNode *mul0 = col0.as<MulNode>();
+    if (!mul0) {
+      return false;
+    }
+    const IntImmNode *two0 = nullptr;
+    const VarNode *j0 = nullptr;
+    if (mul0->a.as<IntImmNode>() && mul0->b.as<VarNode>()) {
+      two0 = mul0->a.as<IntImmNode>();
+      j0 = mul0->b.as<VarNode>();
+    } else if (mul0->a.as<VarNode>() && mul0->b.as<IntImmNode>()) {
+      j0 = mul0->a.as<VarNode>();
+      two0 = mul0->b.as<IntImmNode>();
+    }
+    if (!two0 || two0->value != 2 || !j0 || parallel_vars.count(j0) == 0) {
+      return false;
+    }
+
+    // Try to match 2*j+1 pattern (handle both 2*j+1 and j*2+1)
+    const AddNode *add1 = col1.as<AddNode>();
+    if (!add1) {
+      return false;
+    }
+    const MulNode *mul1 = add1->a.as<MulNode>();
+    const IntImmNode *one1 = add1->b.as<IntImmNode>();
+    if (!mul1 || !one1 || one1->value != 1) {
+      return false;
+    }
+    const IntImmNode *two1 = nullptr;
+    const VarNode *j1 = nullptr;
+    if (mul1->a.as<IntImmNode>() && mul1->b.as<VarNode>()) {
+      two1 = mul1->a.as<IntImmNode>();
+      j1 = mul1->b.as<VarNode>();
+    } else if (mul1->a.as<VarNode>() && mul1->b.as<IntImmNode>()) {
+      j1 = mul1->a.as<VarNode>();
+      two1 = mul1->b.as<IntImmNode>();
+    }
+    if (!two1 || two1->value != 2 || !j1 || j1 != j0) {
+      return false;
+    }
+
+    // Check if sources are oa[i, j] and ob[i, j]
+    const BufferLoadNode *load0 = store0->value.as<BufferLoadNode>();
+    const BufferLoadNode *load1 = store1->value.as<BufferLoadNode>();
+    if (!load0 || !load1) {
+      return false;
+    }
+
+    // Both loads must have the same row index as the store
+    if (load0->indices.size() != 2 || load1->indices.size() != 2) {
+      return false;
+    }
+    if (!load0->indices[0].same_as(store0->indices[0]) ||
+        !load1->indices[0].same_as(store1->indices[0])) {
+      return false;
+    }
+
+    // Both loads must have column index j (same as the mul variable)
+    const VarNode *load_j0 = load0->indices[1].as<VarNode>();
+    const VarNode *load_j1 = load1->indices[1].as<VarNode>();
+    if (!load_j0 || !load_j1 || load_j0 != j0 || load_j1 != j0) {
+      return false;
+    }
+
+    // Extract buffer information
+    info->output_buffer = output_buffer;
+    info->input_a = load0->buffer;
+    info->input_b = load1->buffer;
+    info->row_var = row_var;
+    info->col_var = j0;
+
+    // Get half width from input buffer shape
+    const IntImmNode *half_imm = info->input_a->shape[1].as<IntImmNode>();
+    if (!half_imm) {
+      return false;
+    }
+    info->half_width = half_imm->value;
+
+    // Get full width from output buffer shape
+    const IntImmNode *full_imm = output_buffer->shape[1].as<IntImmNode>();
+    if (!full_imm) {
+      return false;
+    }
+    info->full_width = full_imm->value;
+
+    // Verify full_width == 2 * half_width
+    if (info->full_width != 2 * info->half_width) {
+      return false;
+    }
+
+    // Get outer extent from vector_dim_extent_ (set by caller)
+    info->outer_extent = outer_dim_extent_;
+
+    return true;
+  }
+
+  // Detect one or more interleaved-store pairs in `stores`. Stores are grouped by
+  // output buffer; each group of exactly two stores forming an interleaved pair
+  // becomes one entry in `infos`. Returns true iff at least one pair was found AND
+  // every store was consumed by some pair (a leftover store means the loop body is
+  // not a clean set of independent interleaved recombinations, so we bail to the
+  // generic vectorizer to avoid mis-lowering).
+  bool DetectInterleavedStore(
+      const Array<Stmt> &stores,
+      const std::unordered_set<const VarNode *> &parallel_vars,
+      std::vector<InterleavedStoreInfo> *infos) {
+    if (stores.size() == 0 || (stores.size() % 2) != 0) {
+      return false;
+    }
+
+    // Group store indices by output buffer (preserve first-seen order).
+    std::vector<const BufferNode *> group_order;
+    std::unordered_map<const BufferNode *, std::vector<int>> groups;
+    for (size_t s = 0; s < stores.size(); ++s) {
+      const auto *st = stores[s].as<BufferStoreNode>();
+      if (!st) {
+        return false;
+      }
+      const BufferNode *key = st->buffer.get();
+      if (groups.find(key) == groups.end()) {
+        group_order.push_back(key);
+      }
+      groups[key].push_back(static_cast<int>(s));
+    }
+
+    std::vector<InterleavedStoreInfo> collected;
+    for (const BufferNode *key : group_order) {
+      const auto &idxs = groups[key];
+      if (idxs.size() != 2) {
+        return false;  // each output buffer must be written by exactly one pair
+      }
+      const auto *store0 = stores[idxs[0]].as<BufferStoreNode>();
+      const auto *store1 = stores[idxs[1]].as<BufferStoreNode>();
+      InterleavedStoreInfo info;
+      // Try (even, odd) and (odd, even) orderings: the store writing column 2*j
+      // must be store0, the one writing 2*j+1 must be store1.
+      if (!MatchInterleavedPair(store0, store1, parallel_vars, &info) &&
+          !MatchInterleavedPair(store1, store0, parallel_vars, &info)) {
+        return false;
+      }
+      collected.push_back(info);
+      VLOG(2) << "DetectInterleavedStore: detected interleaved store pattern, "
+              << "half=" << info.half_width << ", full=" << info.full_width
+              << ", rows=" << info.outer_extent;
+    }
+
+    *infos = std::move(collected);
+    return true;
+  }
+
+  Stmt GenerateOneInterleavedStore(const InterleavedStoreInfo &info) {
+    // Generate Gather-based vectorized recombination:
+    //   Step 1: DataCopy oa/ob into a contiguous staging buffer tmp=[oa|ob]
+    //   Step 2: Dynamically generate offset buffer off[k]=(k/2+(k%2)*half)*sizeof(T)
+    //   Step 3: Gather(rf, tmp, off, 0, D) for vectorized recombination
+
+    DataType dtype = info.output_buffer->dtype;
+    int64_t half = info.half_width;
+    int64_t D = info.full_width;
+    int64_t rows = info.outer_extent;
+
+    // Create staging buffer tmp=[oa|ob] with shape [rows, D]
+    Buffer tmp_buffer = CreateTempBufferLike(info.output_buffer, rows * D, D);
+
+    // Offset buffer off_big[i*D+k] = (i*D + (k/2 + (k%2)*half)) * sizeof(T),
+    // covering the whole [rows, D] block so a SINGLE Gather recombines all rows
+    // at once. This mirrors the verified BuildRecombine idiom in
+    // apply_rotary_pos_emb: src is the staging buffer BASE (no per-row pointer
+    // offset) and the offset table carries the row offset. Table contents are
+    // compile-time constants, so identical (dtype, rows, D) tables are shared
+    // (e.g. RoPE recombines q and k with one table) and the init stmts are
+    // hoisted to the enclosing block entry (loop-invariant, built once).
+    std::string table_key = std::to_string(static_cast<int>(dtype.code())) +
+                            "_" + std::to_string(dtype.bits()) + "_" +
+                            std::to_string(rows) + "_" + std::to_string(D);
+    Buffer offset_buffer;
+    auto cache_it = offset_table_cache_.find(table_key);
+    if (cache_it != offset_table_cache_.end()) {
+      offset_buffer = cache_it->second;
+    } else {
+      Var offset_data("interleaved_offset_" + std::to_string(temp_buffer_id_++) +
+                          "_data",
+                      PointerType(PrimType(DataType::UInt(32)), "shared.ub"));
+      Array<PrimExpr> offset_shape = {IntImm(DataType::Int(32), rows * D)};
+      offset_buffer =
+          Buffer(offset_data, DataType::UInt(32), offset_shape,
+                 /*strides=*/{},
+                 /*elem_offset=*/PrimExpr(0),
+                 /*name=*/offset_data->name_hint,
+                 /*data_alignment=*/0,
+                 /*offset_factor=*/0,
+                 /*buffer_type=*/kDefault);
+      temp_buffers_.push_back(offset_buffer);
+      offset_table_cache_[table_key] = offset_buffer;
+
+      // off_big[i*D+k] = (i*D + (k/2 + (k%2)*half)) * sizeof(T)
+      int64_t elem_size = dtype.bytes();
+      for (int64_t i = 0; i < rows; ++i) {
+        for (int64_t k = 0; k < D; ++k) {
+          int64_t idx = i * D + (k / 2) + (k % 2) * half;
+          PrimExpr offset_val =
+              IntImm(DataType::UInt(32), static_cast<int32_t>(idx * elem_size));
+          auto set_offset = BufferStore(
+              offset_buffer, offset_val,
+              {IntImm(DataType::Int(32), static_cast<int32_t>(i * D + k))});
+          hoisted_offset_inits_.push_back(set_offset);
+        }
+      }
+    }
+
+    Array<Stmt> stmts;
+
+    // Step 1: stage tmp=[oa|ob] with TWO whole-block strided copies (NOT a per-row
+    // loop). GenerateAscendCopy emits a full 2D copy whose extents come from the
+    // source buffer shape ([rows, half]); the destination row stride is implied by
+    // tmp's row width D. A per-row loop here would re-issue the whole [rows, half]
+    // copy rows times starting at tmp row i, overrunning tmp (the original bug:
+    // rows * rows rows written into a rows-row buffer -> UB out of bounds).
+    //
+    // copy oa[rows, half] -> tmp[:, 0:half]   (dst linear offset 0)
+    // copy ob[rows, half] -> tmp[:, half:D]   (dst linear offset half)
+    {
+      auto copy_a = GenerateAscendCopy(
+          info.input_a, tmp_buffer,
+          /*src_offset=*/IntImm(DataType::Int(32), 0),
+          /*dst_offset=*/IntImm(DataType::Int(32), 0), half, false);
+      stmts.push_back(copy_a);
+
+      auto copy_b = GenerateAscendCopy(
+          info.input_b, tmp_buffer,
+          /*src_offset=*/IntImm(DataType::Int(32), 0),
+          /*dst_offset=*/IntImm(DataType::Int(32), static_cast<int32_t>(half)), half,
+          false);
+      stmts.push_back(copy_b);
+    }
+
+    // Step 2 (offset table generation) is hoisted: see offset-table creation
+    // above. The table is built once at the enclosing block entry.
+
+    // Step 3: ONE Gather over the whole [rows, D] block.
+    //   dst = rf base, src = tmp base, offset = off_big (carries row offsets),
+    //   srcBaseAddr = 0, count = rows*D.
+    {
+      PrimExpr dst_ptr = CreateAccessPtr(info.output_buffer, dtype, 0, rows * D, 2);
+      PrimExpr src_ptr = CreateAccessPtr(tmp_buffer, dtype, 0, rows * D, 1);
+      PrimExpr offset_ptr =
+          CreateAccessPtr(offset_buffer, DataType::UInt(32), 0, rows * D, 1);
+      PrimExpr base_addr = IntImm(DataType::Int(32), 0);
+      PrimExpr count = IntImm(DataType::Int(32), static_cast<int32_t>(rows * D));
+
+      Array<PrimExpr> gather_args = {dst_ptr, src_ptr, offset_ptr, base_addr, count};
+      PrimExpr gather_call = Call(DataType::Handle(), tl::ascend_gather(), gather_args);
+      stmts.push_back(Evaluate(gather_call));
+    }
+
+    return SeqStmt::Flatten(stmts);
+  }
+
+  // Emit the recombination for every detected interleaved pair, concatenated.
+  Stmt GenerateInterleavedStore(const std::vector<InterleavedStoreInfo> &infos) {
+    Array<Stmt> all;
+    for (const auto &info : infos) {
+      all.push_back(GenerateOneInterleavedStore(info));
+    }
+    return SeqStmt::Flatten(all);
+  }
 
   Buffer CreateTempBufferLike(const Buffer &ref, int64_t num_elements,
                               int64_t inner_vec_len = 0) {
@@ -372,6 +704,8 @@ private:
   Stmt VisitStmt_(const BlockNode *op) override {
     // Save outer state
     auto saved_buffers = std::move(temp_buffers_);
+    auto saved_inits = std::move(hoisted_offset_inits_);
+    auto saved_cache = std::move(offset_table_cache_);
     int saved_temp_id = temp_buffer_id_;
     const VarNode *saved_vector_dim = vector_dim_var_;
     const VarNode *saved_outer_dim = outer_dim_var_;
@@ -379,6 +713,8 @@ private:
 
     // Reset block-local state
     temp_buffers_.clear();
+    hoisted_offset_inits_.clear();
+    offset_table_cache_.clear();
     temp_buffer_id_ = 0;
     vector_dim_var_ = nullptr;
     outer_dim_var_ = nullptr;
@@ -386,6 +722,16 @@ private:
 
     // Visit body (vectorization happens here)
     Stmt new_body = VisitStmt(op->body);
+
+    // Hoisted interleaved offset-table inits run once at block entry, before
+    // any loop that contains the consuming Gather. Contents are compile-time
+    // constants; block-allocated UB buffers persist across serial iterations.
+    if (!hoisted_offset_inits_.empty()) {
+      Array<Stmt> seq;
+      for (const Stmt &s : hoisted_offset_inits_) seq.push_back(s);
+      seq.push_back(new_body);
+      new_body = SeqStmt::Flatten(seq);
+    }
 
     // Attach temps to THIS block only
     Array<Buffer> allocs = op->alloc_buffers;
@@ -395,6 +741,8 @@ private:
 
     // Restore outer state
     temp_buffers_ = std::move(saved_buffers);
+    hoisted_offset_inits_ = std::move(saved_inits);
+    offset_table_cache_ = std::move(saved_cache);
     temp_buffer_id_ = saved_temp_id;
     vector_dim_var_ = saved_vector_dim;
     outer_dim_var_ = saved_outer_dim;
@@ -805,6 +1153,17 @@ private:
       stores_to_process = seq->seq;
     } else {
       return Stmt(); // Not a store or sequence
+    }
+
+    // Check for interleaved store pattern: rf[2j]=oa[j], rf[2j+1]=ob[j]
+    // This is the core pattern from apply_rotary_pos_emb interleaved mode.
+    // A2 (2201) has no Interleave/DeInterleave primitive, so we lower this to
+    // Gather-based vectorized recombination. Supports multiple independent pairs
+    // in one loop body (e.g. RoPE recombines both q and k in the same Parallel).
+    std::vector<InterleavedStoreInfo> interleaved_infos;
+    if (!getenv("TL_ASCEND_DISABLE_INTERLEAVED_STORE") &&
+        DetectInterleavedStore(stores_to_process, parallel_vars, &interleaved_infos)) {
+      return GenerateInterleavedStore(interleaved_infos);
     }
 
     // Find the first buffer store node as reference
