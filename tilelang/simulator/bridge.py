@@ -505,6 +505,24 @@ class _TirBridge:
                 (storage_elements("l0b", (max_k, details["n_tile"]), input_bytes),),
                 input_dtype,
             )
+
+        def source_window_regions(source, shape, origin, window_shape):
+            regions = []
+            cursor = origin[1]
+            limit = cursor + window_shape[1]
+            elements_per_c0 = BYTE_PER_C0 // input_bytes
+            while cursor < limit:
+                width = min(elements_per_c0 - cursor % elements_per_c0, limit - cursor)
+                offset = physical_index("zn", origin[0], cursor, shape, input_bytes)
+                regions.append(replace(
+                    source,
+                    shape=(window_shape[0], width),
+                    byte_offset=source.byte_offset + offset * input_bytes,
+                    strides_bytes=(elements_per_c0 * input_bytes, input_bytes),
+                ))
+                cursor += width
+            return tuple(regions)
+
         for step in range(step_count):
             n_index, k_index = divmod(step, k_split)
             slot = step % 2
@@ -538,28 +556,48 @@ class _TirBridge:
                 (storage_elements("l0b", (k_size, n_size), input_bytes),),
                 input_dtype, core_id=context.core_id,
             )
+            a_regions = source_window_regions(
+                metadata["lhs"], details["shape_a"], origin_a, shape_a_source
+            )
+            b_regions = source_window_regions(
+                metadata["rhs"], details["shape_b"], origin_b, shape_b_source
+            )
+            a_source_metadata = {
+                "src": a_regions[0] if len(a_regions) == 1 else metadata["lhs"]
+            }
+            b_source_metadata = {
+                "src": b_regions[0] if len(b_regions) == 1 else metadata["rhs"]
+            }
+            if len(a_regions) > 1:
+                a_source_metadata["src_regions"] = a_regions
+            if len(b_regions) > 1:
+                b_source_metadata["src_regions"] = b_regions
             load_a = self._emit_task(
                 "copy_l1_to_l0a", context,
-                metadata={**stage, "src": metadata["lhs"], "dst": l0a, "copy": {
+                metadata={**stage, **a_source_metadata, "dst": l0a, "copy": {
                     "layout_transform": True,
                     "source_layout": "zn",
                     "destination_layout": "l0a",
                     "source_shape": details["shape_a"],
                     "source_origin": origin_a,
                     "source_window_shape": shape_a_source,
+                    "source_window_direct": len(a_regions) == 1,
+                    "source_region_axis": 1,
                     "destination_shape": (details["rows"], k_size),
                     "transpose_after_slice": details["transpose_a"],
                 }},
             )
             load_b = self._emit_task(
                 "copy_l1_to_l0b", context,
-                metadata={**stage, "src": metadata["rhs"], "dst": l0b, "copy": {
+                metadata={**stage, **b_source_metadata, "dst": l0b, "copy": {
                     "layout_transform": True,
                     "source_layout": "zn",
                     "destination_layout": "l0b",
                     "source_shape": details["shape_b"],
                     "source_origin": origin_b,
                     "source_window_shape": shape_b_source,
+                    "source_window_direct": len(b_regions) == 1,
+                    "source_region_axis": 1,
                     "destination_shape": (k_size, n_size),
                     "transpose_after_slice": details["transpose_b"],
                 }},

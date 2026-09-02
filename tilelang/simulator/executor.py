@@ -252,8 +252,8 @@ class FunctionalSimulator:
                     source_row:source_row + window_shape[0],
                     source_col:source_col + window_shape[1],
                 ]
-                if copy_details.get("transpose_after_slice") is True:
-                    tile = tile.T
+            if copy_details.get("transpose_after_slice") is True:
+                tile = tile.T
             if copy_details.get("relu") is True:
                 tile = np.maximum(tile, 0)
             values = pack_matrix(

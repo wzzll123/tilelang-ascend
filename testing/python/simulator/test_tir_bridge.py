@@ -1911,13 +1911,27 @@ def test_gemm_v0_expands_multi_k_steps_with_real_l0_payloads(
     ]
     final = program.tasks[-1]
     assert program.tasks[2].task_id in program.tasks[6].dependencies
+    assert [program.tasks[index].metadata["src"].byte_offset for index in (0, 3, 6)] == [
+        0, 256 * 2, 512 * 2,
+    ]
+    assert [program.tasks[index].metadata["src"].byte_offset for index in (1, 4, 7)] == [
+        0, 256 * 2, 512 * 2,
+    ]
     simulator = FunctionalSimulator(program)
     left = np.arange(np.prod(shape_a), dtype=np.float16).reshape(shape_a) / 64
     right = (
         np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 100
     ) / 128
-    simulator.write(program.tasks[0].metadata["src"], pack_matrix(left, "zn"))
-    simulator.write(program.tasks[1].metadata["src"], pack_matrix(right, "zn"))
+    for task, values in zip(program.tasks[:2], (left, right)):
+        payload = pack_matrix(values, "zn")
+        source = task.metadata["src"]
+        simulator.write(
+            BufferRegion(
+                source.buffer, MemoryScope.L1, (payload.size,), source.dtype,
+                core_id=task.core_id,
+            ),
+            payload,
+        )
     result = simulator.run()
     records = {record.task_id: record for record in result.schedule.records}
     assert records[program.tasks[2].task_id].start_cycle == records[
@@ -1940,13 +1954,24 @@ def test_gemm_v0_expands_n_tiles_into_l0c_column_bands() -> None:
     assert [task.metadata["gemm_stage"]["n_index"] for task in program.tasks] == [
         0, 0, 0, 1, 1, 1,
     ]
+    assert len(program.tasks[1].metadata["src_regions"]) == 8
+    assert len(program.tasks[4].metadata["src_regions"]) == 8
+    assert program.tasks[4].metadata["src_regions"][0].byte_offset == 2048 * 2
     simulator = FunctionalSimulator(program)
     left = np.arange(np.prod(shape_a), dtype=np.float16).reshape(shape_a) / 64
     right = (
         np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 100
     ) / 128
-    simulator.write(program.tasks[0].metadata["src"], pack_matrix(left, "zn"))
-    simulator.write(program.tasks[1].metadata["src"], pack_matrix(right, "zn"))
+    for task, values in zip(program.tasks[:2], (left, right)):
+        payload = pack_matrix(values, "zn")
+        source = task.metadata["src"]
+        simulator.write(
+            BufferRegion(
+                source.buffer, MemoryScope.L1, (payload.size,), source.dtype,
+                core_id=task.core_id,
+            ),
+            payload,
+        )
     simulator.run()
     output = BufferRegion(
         program.tasks[2].metadata["dst"].buffer,
