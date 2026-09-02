@@ -174,6 +174,12 @@ class FunctionalSimulator:
         if operation == "tail_select":
             self._tail_select(task)
             return
+        if operation == "reduce":
+            kind = task.metadata.get("reduce_kind")
+            if kind not in _REDUCE_OPERATIONS:
+                raise UnsupportedSimOpError(f"unsupported reduce kind {kind!r}")
+            self._reduce(task, kind)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -466,7 +472,14 @@ class FunctionalSimulator:
         values = self.read(source, task_core_id=task.core_id)
         if values.shape[0] == 0 or values.shape[1] == 0:
             return
-        result = _REDUCE_OPERATIONS[operation](values)
+        axis = task.metadata.get("reduce_axis", 0)
+        numpy_axis = 0 if axis == 0 else 1
+        implementation = {
+            "reduce_sum": np.sum,
+            "reduce_max": np.max,
+            "reduce_min": np.min,
+        }[operation]
+        result = implementation(values, axis=numpy_axis)
         self.write(destination, result, task_core_id=task.core_id)
 
     def _resolve(self, region: BufferRegion, task_core_id: int) -> MemoryView:

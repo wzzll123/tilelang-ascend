@@ -518,6 +518,8 @@ class _TirBridge:
             return self._cast_metadata(arguments, context)
         if short == "fill":
             return self._fill_metadata(arguments, context)
+        if short == "reduce":
+            return self._reduce_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
             return self._tail_reduce_metadata(arguments, context)
         if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
@@ -587,6 +589,77 @@ class _TirBridge:
                 metadata["pad_dst"] = pad_destination
             else:
                 metadata["pad_disabled_reason"] = "physical tile exceeds buffer view"
+        return metadata
+
+    def _reduce_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) < 4:
+            return {}
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or "<" not in tag or not tag.endswith(">"):
+            return {}
+        kind, encoded = tag.split("<", 1)
+        kind = _short_operation(kind)
+        if kind not in _TAIL_REDUCE_OPERATIONS:
+            raise UnsupportedSimOpError(f"unsupported reduce kind {kind!r}")
+        parameters = [part.strip() for part in encoded[:-1].split(",")]
+        if len(parameters) != 4:
+            raise UnsupportedSimOpError(f"malformed reduce tag {tag!r}")
+        try:
+            rows, cols, axis = (int(parameters[index]) for index in (1, 2, 3))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                f"reduce tag requires static M/N/axis, got {tag!r}"
+            ) from error
+        if rows < 0 or cols < 0:
+            raise ProgramValidationError("reduce extents must not be negative")
+        if axis not in {0, -1}:
+            raise UnsupportedSimOpError(f"reduce supports axis 0 or -1, got {axis}")
+
+        cursor = len(arguments) - 1
+        physical_cols = cols
+        if str(getattr(arguments[cursor], "dtype", "")) != "bool":
+            candidate = self._const_int(arguments[cursor], context.environment)
+            if candidate is None:
+                return {}
+            physical_cols = candidate
+            cursor -= 1
+        clear = self._literal(arguments[cursor])
+        if clear not in {True, 1}:
+            raise UnsupportedSimOpError(
+                "functional reduce clear=false accumulation is not supported yet"
+            )
+        scratch_arguments = arguments[3:cursor]
+        if len(scratch_arguments) > 2:
+            return {}
+        source = self._access_buffer_region(arguments[2], (rows, cols), context)
+        output_count = cols if axis == 0 else rows
+        destination = self._access_buffer_region(
+            arguments[1], (output_count,), context
+        )
+        if source is None or destination is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "src": source,
+            "dst": destination,
+            "reduce_kind": kind,
+            "reduce_axis": axis,
+            "clear": True,
+            "rows": rows,
+            "cols": cols,
+            "physical_cols": physical_cols,
+        }
+        for index, argument in enumerate(scratch_arguments):
+            extent = self._access_ptr_extent(argument, context)
+            if extent is None:
+                return {}
+            scratch = self._access_buffer_region(argument, (extent,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch" if index == 0 else "output_scratch"] = scratch
         return metadata
 
     def _region_fits_buffer(self, region: BufferRegion) -> bool:
