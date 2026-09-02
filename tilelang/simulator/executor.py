@@ -62,6 +62,15 @@ _REDUCE_OPERATIONS = {
     "reduce_sum": lambda value: np.sum(value, axis=0),
 }
 
+_COMPARE_OPERATIONS = {
+    "EQ": np.equal,
+    "NE": np.not_equal,
+    "GT": np.greater,
+    "GE": np.greater_equal,
+    "LT": np.less,
+    "LE": np.less_equal,
+}
+
 
 @dataclass(frozen=True)
 class FunctionalExecutionResult:
@@ -152,6 +161,9 @@ class FunctionalSimulator:
             return
         if operation == "broadcast":
             self._broadcast(task)
+            return
+        if operation in {"compare", "compare_scalar"}:
+            self._compare(task)
             return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
@@ -312,6 +324,41 @@ class FunctionalSimulator:
                 f"cannot broadcast source shape {values.shape} to {destination_shape}"
             ) from error
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _compare(self, task: Task) -> None:
+        left = _operand(task, "lhs")
+        destination = _operand(task, "dst")
+        left_values = self.read(left, task_core_id=task.core_id)
+        right = task.metadata.get("rhs")
+        if isinstance(right, BufferRegion):
+            right_values: Any = self.read(right, task_core_id=task.core_id)
+        elif "scalar" in task.metadata:
+            right_values = task.metadata["scalar"]
+        else:
+            raise ProgramValidationError(
+                f"compare task {task.task_id!r} requires rhs or scalar metadata"
+            )
+        mode = task.metadata.get("compare_mode")
+        implementation = _COMPARE_OPERATIONS.get(mode)
+        if implementation is None:
+            raise UnsupportedSimOpError(f"unsupported compare mode {mode!r}")
+        predicate = np.asarray(implementation(left_values, right_values)).reshape(-1)
+        packed = np.packbits(predicate, bitorder="little")
+        destination_shape = tuple(
+            _resolve_int(value, self.bindings) for value in destination.shape
+        )
+        required = int(np.prod(destination_shape))
+        if packed.size > required:
+            raise ProgramValidationError(
+                f"packed compare result needs {packed.size} bytes, destination has {required}"
+            )
+        result = np.zeros(required, dtype=_numpy_dtype(destination.dtype))
+        result[:packed.size] = packed
+        self.write(
+            destination,
+            result.reshape(destination_shape),
+            task_core_id=task.core_id,
+        )
 
     def _reduce(self, task: Task, operation: str) -> None:
         source = _operand(task, "src")

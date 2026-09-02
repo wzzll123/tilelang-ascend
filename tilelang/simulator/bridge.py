@@ -504,6 +504,8 @@ class _TirBridge:
             return self._clamp_metadata(short, arguments, context)
         if short == "broadcast":
             return self._broadcast_metadata(arguments, context)
+        if short in {"compare", "compare_scalar"}:
+            return self._compare_metadata(short, arguments, context)
         if short == "cast":
             return self._cast_metadata(arguments, context)
         if short == "fill":
@@ -820,6 +822,55 @@ class _TirBridge:
             if scratch is None:
                 return {}
             metadata["scratch"] = scratch
+        return metadata
+
+    def _compare_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 5:
+            # The six-argument compare_scalar form reads its scalar through a
+            # buffer plus index.  Keep it fail-closed until scalar BufferLoad
+            # addressing is represented explicitly in SimIR.
+            return {}
+        count = self._runtime_int(arguments[4], context.environment)
+        mode = getattr(arguments[3], "value", None)
+        if count is None or not isinstance(mode, str):
+            return {}
+        mode = mode.upper()
+        if mode not in {"EQ", "NE", "GT", "GE", "LT", "LE"}:
+            raise UnsupportedSimOpError(f"unsupported compare mode {mode!r}")
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("compare count must not be negative")
+        mask_extent = self._access_ptr_extent(arguments[0], context)
+        if mask_extent is None:
+            return {}
+        destination = self._access_buffer_region(
+            arguments[0], (mask_extent,), context
+        )
+        left = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or left is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "lhs": left,
+            "compare_mode": mode,
+            "count": count,
+        }
+        if operation == "compare":
+            right = self._access_buffer_region(arguments[2], (count,), context)
+            if right is None:
+                return {}
+            metadata["rhs"] = right
+        else:
+            scalar = self._literal(self.analyzer.simplify(arguments[2]))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"functional compare_scalar requires a literal scalar, got {scalar!r}"
+                )
+            metadata["scalar"] = scalar
         return metadata
 
     def _scalar_metadata(

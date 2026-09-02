@@ -529,6 +529,51 @@ def _broadcast_primfunc(source_shape, *, with_scratch=False):
     )
 
 
+def _compare_primfunc(mode, *, scalar=False):
+    left = tvm.tir.decl_buffer((8,), "float32", name="left", scope="global")
+    right = tvm.tir.decl_buffer((8,), "float32", name="right", scope="global")
+    output = tvm.tir.decl_buffer((1,), "uint8", name="output", scope="global")
+    ub_left = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_left", scope="shared.ub"
+    )
+    ub_right = tvm.tir.decl_buffer(
+        (8,), "float32", name="ub_right", scope="shared.ub"
+    )
+    ub_mask = tvm.tir.decl_buffer(
+        (1,), "uint8", name="ub_mask", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    statements = [copy("copy_gm_to_ub", left, ub_left, 8)]
+    operation = "compare_scalar" if scalar else "compare"
+    if scalar:
+        right_argument = tvm.tir.FloatImm("float32", 0.0)
+    else:
+        statements.append(copy("copy_gm_to_ub", right, ub_right, 8))
+        right_argument = ub_right.access_ptr("r")
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_{operation}", ub_mask.access_ptr("w"),
+            ub_left.access_ptr("r"), right_argument, mode, 8,
+        )),
+        copy("copy_ub_to_gm", ub_mask, output, 1),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_left, ub_right, ub_mask],
+    )
+    return tvm.tir.PrimFunc(
+        [left.data, right.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={left.data: left, right.data: right, output.data: output},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -1140,6 +1185,45 @@ def test_real_tir_broadcast_executes_both_axes(source_shape, with_scratch) -> No
         simulator.read(store.metadata["dst"]),
         np.broadcast_to(values.reshape(source_shape), (2, 3)).reshape(-1),
     )
+
+
+@pytest.mark.parametrize("mode", ["EQ", "NE", "GT", "GE", "LT", "LE"])
+@pytest.mark.parametrize("scalar", [False, True])
+def test_real_tir_compare_packs_little_endian_predicate_bits(mode, scalar) -> None:
+    program = build_kernel_program(
+        _compare_primfunc(mode, scalar=scalar), platform="A3"
+    )
+    compare = next(
+        task for task in program.tasks
+        if task.operation in {"compare", "compare_scalar"}
+    )
+    store = program.tasks[-1]
+    assert compare.metadata["compare_mode"] == mode
+    assert store.dependencies == (compare.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    left = np.array([-2, -1, 0, 1, 2, 3, 4, 5], dtype=np.float32)
+    right = np.array([-2, 0, -1, 1, 3, 2, 5, 4], dtype=np.float32)
+    simulator.write(
+        BufferRegion("left", MemoryScope.GM, (8,), "float32"), left
+    )
+    if not scalar:
+        simulator.write(
+            BufferRegion("right", MemoryScope.GM, (8,), "float32"), right
+        )
+    simulator.run()
+
+    rhs = 0.0 if scalar else right
+    predicates = {
+        "EQ": np.equal,
+        "NE": np.not_equal,
+        "GT": np.greater,
+        "GE": np.greater_equal,
+        "LT": np.less,
+        "LE": np.less_equal,
+    }[mode](left, rhs)
+    expected = np.packbits(predicates, bitorder="little")
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:
