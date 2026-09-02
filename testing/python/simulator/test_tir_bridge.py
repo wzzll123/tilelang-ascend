@@ -229,8 +229,8 @@ def _l0c_to_gm_primfunc(enable_relu=True, unit_flag=0):
     )
 
 
-def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0):
-    rows, cols = 16, 16
+def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0, cols=16):
+    rows = 16
     a_elements = rows * ((inner + 15) // 16 * 16)
     b_elements = ((inner + 15) // 16 * 16) * cols
     c_elements = rows * cols
@@ -244,7 +244,7 @@ def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0):
         (c_elements,), "float32", name="l0c", scope="wmma.accumulator"
     )
     arguments = [
-        "mma<half, float, 16, 16>",
+        f"mma<half, float, 16, {cols}>",
         l0a.access_ptr("r"),
         l0b.access_ptr("r"),
         l0c.access_ptr("w" if init else "rw"),
@@ -1801,10 +1801,45 @@ def test_real_tir_mma_executes_k_tail_and_accumulation(initialize) -> None:
     )
 
 
-def test_mma_rejects_partial_n_actual_until_partial_l0c_is_modeled() -> None:
-    with pytest.raises(UnsupportedSimOpError, match="n_actual"):
+@pytest.mark.parametrize("initialize", [True, False])
+def test_real_tir_mma_executes_partial_n_actual(initialize) -> None:
+    program = build_kernel_program(
+        _mma_primfunc(init=initialize, cols=32, n_actual=16), platform="A3"
+    )
+    task = program.tasks[0]
+    assert task.metadata["mma"]["cols"] == 32
+    assert task.metadata["mma"]["n_actual"] == 16
+    assert task.metadata["rhs"].shape == (16 * 16,)
+    assert task.metadata["dst"].shape == (16 * 16,)
+
+    simulator = FunctionalSimulator(program)
+    left = (np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 50) / 32
+    right = (np.arange(13 * 16, dtype=np.float16).reshape(13, 16) - 70) / 64
+    simulator.write(task.metadata["lhs"], pack_matrix(left, "l0a"))
+    simulator.write(task.metadata["rhs"], pack_matrix(right, "l0b"))
+    expected = left.astype(np.float32) @ right.astype(np.float32)
+    if not initialize:
+        previous = np.arange(16 * 16, dtype=np.float32).reshape(16, 16) / 17
+        simulator.write(
+            task.metadata["accumulator"], pack_matrix(previous, "l0c")
+        )
+        expected += previous
+    simulator.run()
+
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(task.metadata["dst"]), "l0c", (16, 16)),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("n_actual", [0, 8, 48])
+def test_mma_rejects_illegal_partial_n_actual(n_actual) -> None:
+    error = ProgramValidationError if n_actual in {0, 48} else UnsupportedSimOpError
+    with pytest.raises(error, match="n_actual"):
         build_kernel_program(
-            _mma_primfunc(n_actual=8), platform="A3"
+            _mma_primfunc(cols=32, n_actual=n_actual), platform="A3"
         )
 
 
@@ -1879,9 +1914,74 @@ def test_real_tir_gemm_v0_executes_transpose_and_accumulation(
     )
 
 
-def test_gemm_v0_rejects_partial_n_actual_until_partial_l0c_is_modeled() -> None:
-    prim_func, _, _ = _gemm_v0_primfunc(transpose_b=True, n_actual=8)
-    with pytest.raises(UnsupportedSimOpError, match="partial n_actual"):
+@pytest.mark.parametrize("initialize", [True, False])
+def test_gemm_v0_executes_partial_n_actual_prefix(initialize) -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(
+        transpose_b=True, init=initialize, cols=32, inner=48,
+        k_l0_size=16, n_actual=16,
+    )
+    program = build_kernel_program(prim_func, platform="A2")
+    assert [task.operation for task in program.tasks] == [
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+    ]
+    assert program.tasks[1].metadata["copy"]["source_window_shape"] == (16, 16)
+    assert program.tasks[2].metadata["mma"]["cols"] == 16
+    assert program.tasks[2].metadata["mma"]["n_actual"] == 16
+    assert program.tasks[2].metadata["dst"].shape == (16 * 16,)
+    assert [
+        program.tasks[index].metadata["src"].byte_offset
+        for index in (1, 4, 7)
+    ] == [0, 512 * 2, 1024 * 2]
+
+    simulator = FunctionalSimulator(program)
+    left = (np.arange(np.prod(shape_a), dtype=np.float16).reshape(shape_a) - 50) / 32
+    right = (
+        np.arange(np.prod(shape_b), dtype=np.float16).reshape(shape_b) - 70
+    ) / 64
+    for task, values in zip(program.tasks[:2], (left, right)):
+        payload = pack_matrix(values, "zn")
+        source = task.metadata["src"]
+        simulator.write(
+            BufferRegion(
+                source.buffer, MemoryScope.L1, (payload.size,), source.dtype,
+                core_id=task.core_id,
+            ),
+            payload,
+        )
+    expected = left.astype(np.float32) @ right[:16].T.astype(np.float32)
+    final = program.tasks[-1]
+    if not initialize:
+        previous = np.arange(16 * 16, dtype=np.float32).reshape(16, 16) / 17
+        simulator.write(
+            program.tasks[2].metadata["accumulator"], pack_matrix(previous, "l0c")
+        )
+        expected += previous
+    simulator.run()
+    np.testing.assert_allclose(
+        unpack_matrix(
+            simulator.read(final.metadata["dst"]), "l0c", (16, 16)
+        ),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_gemm_v0_rejects_partial_n_actual_without_transpose_b() -> None:
+    prim_func, _, _ = _gemm_v0_primfunc(cols=32, n_actual=16)
+    with pytest.raises(UnsupportedSimOpError, match="transpose_B"):
+        build_kernel_program(prim_func, platform="A2")
+
+
+@pytest.mark.parametrize("n_actual", [0, 8, 48])
+def test_gemm_v0_rejects_illegal_partial_n_actual(n_actual) -> None:
+    prim_func, _, _ = _gemm_v0_primfunc(
+        transpose_b=True, cols=32, n_actual=n_actual,
+    )
+    error = ProgramValidationError if n_actual in {0, 48} else UnsupportedSimOpError
+    with pytest.raises(error, match="n_actual"):
         build_kernel_program(prim_func, platform="A3")
 
 

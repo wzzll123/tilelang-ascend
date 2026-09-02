@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 40%**。checkbox 裸计数约 54%，但未完成的完整
+- **完整 roadmap：约 41%**。checkbox 裸计数约 54%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 70%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 72%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -185,8 +185,9 @@ standalone L0C→GM 已支持固定 16×16 accumulator fractal 到 RowMajor GM �
 rectangle、float32→float16 转换和 ReLU；与 MMA 配对的非零 `unitFlag` 仍严格拒绝。
 显式 half→float32 MMA 已支持 L0A/L0B 物理 payload 解码、K-tail、`init=true` 覆盖和
 `init=false` 累加；已有 GM→L1→L0A/L0B→MMA→L0C→GM 的真实 final-TIR NumPy golden，
-整条功能模拟路径不调用 BiSheng。partial `n_actual`、bias、非零 `unitFlag` 和其它 dtype
-仍 fail-closed。
+整条功能模拟路径不调用 BiSheng。显式 MMA 已支持静态、16 列粒度的 partial `n_actual`，
+并将 L0B/L0C footprint 收窄到有效列；bias、非零 `unitFlag`、runtime BufferLoad 和其它
+dtype 仍 fail-closed。
 高层 half→float32 `gemm_v0` 也可直接执行，支持 A/B transpose、K-tail、init/accumulate，
 并已打通 GM→L1→gemm_v0→L0C→GM，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot
 capacity legality check。当 `gemm_v0` 有多个 K/N step 时，bridge 会展开每步 L0A/L0B
@@ -196,6 +197,9 @@ L0A/L0B payload，逐 K tile 累加并按 N tile 写入对应 L0C column band。
 窗口已拆为精确 zN C0 source regions。各 stage 已有独立的 `gemm_v0.load_a/load_b/mma`
 timing key、transfer bytes/math ops 和 MTE1↔M event annotation；周期仍使用可替换的
 `uncalibrated-unit-cost` profile，annotation 尚不是显式硬件 flag task。
+`gemm_v0` 还支持仓库 AscendC contract 中 `transpose_B=true` 的静态 partial `n_actual`：
+只加载/计算 16 列对齐的输出前缀，并在多 K tile 下保持正确 zN stride 和 L0C 累加；
+非 transpose-B partial-N、runtime BufferLoad 和尾部 fixpipe 配对仍拒绝。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
@@ -216,13 +220,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `209 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `218 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 209 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 218 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -349,7 +353,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   升级为显式硬件 flag/wait task。
 - [x] ~~实现显式 half→float32 `mma`，支持 K-tail、init 和 accumulate。~~
 - [x] ~~实现多 MMA task 对同一 L0C 的 K 分块累加与 RAW dependency golden。~~
-- [ ] 实现 partial `n_actual` 和其它 MMA dtype。
+- [x] ~~实现显式 MMA 及 transpose-B `gemm_v0` 的静态、16 列粒度 partial `n_actual`，
+  收窄 L0B/L0C footprint，并覆盖 init/accumulate 与多 K tile。~~
+- [ ] 实现 runtime BufferLoad `n_actual` 和其它 MMA dtype。
 - [ ] 实现 MMA/fixpipe 配对 unitFlag、quant、非 RowMajor 输出和其它 fixpipe variants。
 - [ ] 支持 A/B transpose，以及 NZ、ZN、fractal 等核心 layout。
 - [ ] 使用 NumPy/PyTorch golden 覆盖 M/N/K tail、多 core 分块和 pipeline overlap。
@@ -433,7 +439,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：209 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：218 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -443,7 +449,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 实现 partial `n_actual` 与 unitFlag/fixpipe 配对协议。
+1. 实现 unitFlag/fixpipe 配对协议和 runtime BufferLoad `n_actual`。
 2. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

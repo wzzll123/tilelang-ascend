@@ -473,7 +473,11 @@ class _TirBridge:
             metadata["span"] = str(span)
         if (
             _short_operation(operation) == "gemm_v0"
-            and metadata.get("gemm", {}).get("step_count", 1) > 1
+            and (
+                metadata.get("gemm", {}).get("step_count", 1) > 1
+                or metadata.get("gemm", {}).get("n_actual")
+                != metadata.get("gemm", {}).get("cols")
+            )
         ):
             self._emit_gemm_v0_trace_tasks(operation, context, metadata)
             return
@@ -529,7 +533,11 @@ class _TirBridge:
             k_start = k_index * details["k_l0_size"]
             n_start = n_index * details["n_tile"]
             k_size = min(details["k_l0_size"], details["inner"] - k_start)
-            n_size = details["n_tile"]
+            n_size = (
+                details["n_actual"]
+                if details["transpose_b"]
+                else details["n_tile"]
+            )
             stage = {"gemm_stage": {
                 "step": step,
                 "n_index": n_index,
@@ -1346,9 +1354,17 @@ class _TirBridge:
         if len(arguments) == 8:
             actual_cols = self._runtime_int(arguments[6], context.environment)
             unit_flag = self._runtime_int(arguments[7], context.environment)
-            if actual_cols != cols:
+            if not isinstance(actual_cols, int):
                 raise UnsupportedSimOpError(
-                    "functional mma does not yet support n_actual smaller than N"
+                    "functional mma requires a static n_actual"
+                )
+            if actual_cols <= 0 or actual_cols > cols:
+                raise ProgramValidationError(
+                    f"mma n_actual must be in [1, {cols}], got {actual_cols}"
+                )
+            if actual_cols % 16:
+                raise UnsupportedSimOpError(
+                    "functional mma requires n_actual to be a multiple of 16"
                 )
             if unit_flag != 0:
                 raise UnsupportedSimOpError(
@@ -1364,11 +1380,17 @@ class _TirBridge:
         a_elements = storage_elements(
             "l0a", (rows, inner), dtype_size_bytes(input_dtype)
         )
-        b_elements = storage_elements(
+        b_capacity_elements = storage_elements(
             "l0b", (inner, cols), dtype_size_bytes(input_dtype)
         )
-        c_elements = storage_elements(
+        c_capacity_elements = storage_elements(
             "l0c", (rows, cols), dtype_size_bytes(accumulator_dtype)
+        )
+        b_elements = storage_elements(
+            "l0b", (inner, actual_cols), dtype_size_bytes(input_dtype)
+        )
+        c_elements = storage_elements(
+            "l0c", (rows, actual_cols), dtype_size_bytes(accumulator_dtype)
         )
         left = self._access_buffer_region(arguments[1], (a_elements,), context)
         right = self._access_buffer_region(arguments[2], (b_elements,), context)
@@ -1389,12 +1411,12 @@ class _TirBridge:
             or destination.dtype != accumulator_dtype
         ):
             raise ProgramValidationError("mma buffer dtypes disagree with its template")
-        for label, region, elements in (
+        for label, region, capacity_elements in (
             ("L0A", left, a_elements),
-            ("L0B", right, b_elements),
-            ("L0C", destination, c_elements),
+            ("L0B", right, b_capacity_elements),
+            ("L0C", destination, c_capacity_elements),
         ):
-            tile_bytes = elements * dtype_size_bytes(region.dtype)
+            tile_bytes = capacity_elements * dtype_size_bytes(region.dtype)
             if (
                 not isinstance(region.byte_offset, int)
                 or region.byte_offset % tile_bytes
@@ -1473,9 +1495,21 @@ class _TirBridge:
         actual_cols = cols
         if len(arguments) == 6:
             actual_cols = self._runtime_int(arguments[5], context.environment)
-            if actual_cols != cols:
+            if not isinstance(actual_cols, int):
                 raise UnsupportedSimOpError(
-                    "functional gemm_v0 does not yet support partial n_actual"
+                    "functional gemm_v0 requires a static n_actual"
+                )
+            if actual_cols <= 0 or actual_cols > cols:
+                raise ProgramValidationError(
+                    f"gemm_v0 n_actual must be in [1, {cols}], got {actual_cols}"
+                )
+            if actual_cols % 16:
+                raise UnsupportedSimOpError(
+                    "functional gemm_v0 requires n_actual to be a multiple of 16"
+                )
+            if actual_cols != cols and not transpose_b:
+                raise UnsupportedSimOpError(
+                    "functional gemm_v0 supports partial n_actual only with transpose_B"
                 )
 
         input_dtype = _ascend_template_dtype(parameters[0])

@@ -324,9 +324,10 @@ class FunctionalSimulator:
         right = _operand(task, "rhs")
         destination = _operand(task, "dst")
         details = task.metadata.get("mma", {})
+        actual_cols = details["n_actual"]
         shape_a = (details["rows"], details["inner"])
-        shape_b = (details["inner"], details["cols"])
-        shape_c = (details["rows"], details["cols"])
+        shape_b = (details["inner"], actual_cols)
+        shape_c = (details["rows"], actual_cols)
         a_values = unpack_matrix(
             self.read(left, task_core_id=task.core_id), "l0a", shape_a
         )
