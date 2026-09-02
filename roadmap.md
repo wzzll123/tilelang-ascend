@@ -162,7 +162,7 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `145 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `148 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -243,8 +243,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 compare/compare_scalar 的六种 mode、literal scalar 和 packed mask。~~
 - [x] ~~实现 select tensor-tensor/tensor-scalar 的普通与 scratch forms，并将 packed
   mask 纳入显式 read dependency。~~
-- [ ] 实现 compare_scalar BufferLoad、select BufferLoad/CMPMASK mode 和 tail/mask
-  variants。
+- [x] ~~实现 tail_compare/tail_compare_scalar 的二维有效矩形、逐行 packed mask、
+  物理 stride 和 literal scalar。~~
+- [ ] 实现 compare_scalar BufferLoad、select BufferLoad/CMPMASK mode、tail_select
+  和其它 tail/mask variants。
 - [x] ~~实现真实 `tail_reduce` 的 float32 axis-0 clear=true sum/max/min，并覆盖
   valid rectangle、dependency 和非法 dim/clear contract。~~
 - [ ] 实现普通 reduce、axis 1、accumulate/workspace，以及 whole/block reduction。
@@ -339,7 +341,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：145 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：148 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

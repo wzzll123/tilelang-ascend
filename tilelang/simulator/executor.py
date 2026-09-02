@@ -165,6 +165,9 @@ class FunctionalSimulator:
         if operation in {"compare", "compare_scalar"}:
             self._compare(task)
             return
+        if operation in {"tail_compare", "tail_compare_scalar"}:
+            self._tail_compare(task)
+            return
         if operation == "select":
             self._select(task)
             return
@@ -389,6 +392,34 @@ class FunctionalSimulator:
         self.write(
             destination,
             np.where(predicate, left_values, right_values),
+            task_core_id=task.core_id,
+        )
+
+    def _tail_compare(self, task: Task) -> None:
+        left = _operand(task, "lhs")
+        destination = _operand(task, "dst")
+        left_values = self.read(left, task_core_id=task.core_id)
+        right = task.metadata.get("rhs")
+        if isinstance(right, BufferRegion):
+            right_values: Any = self.read(right, task_core_id=task.core_id)
+        elif "scalar" in task.metadata:
+            right_values = task.metadata["scalar"]
+        else:
+            raise ProgramValidationError(
+                f"tail compare task {task.task_id!r} requires rhs or scalar metadata"
+            )
+        mode = task.metadata.get("compare_mode")
+        implementation = _COMPARE_OPERATIONS.get(mode)
+        if implementation is None:
+            raise UnsupportedSimOpError(f"unsupported tail compare mode {mode!r}")
+        predicate = np.asarray(implementation(left_values, right_values))
+        if predicate.ndim != 2:
+            raise ProgramValidationError(
+                f"tail compare requires a 2D valid rectangle, got {predicate.shape}"
+            )
+        self.write(
+            destination,
+            np.packbits(predicate, axis=1, bitorder="little"),
             task_core_id=task.core_id,
         )
 

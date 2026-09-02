@@ -506,6 +506,8 @@ class _TirBridge:
             return self._broadcast_metadata(arguments, context)
         if short in {"compare", "compare_scalar"}:
             return self._compare_metadata(short, arguments, context)
+        if short in {"tail_compare", "tail_compare_scalar"}:
+            return self._tail_compare_metadata(short, arguments, context)
         if short == "select":
             return self._select_metadata(arguments, context)
         if short == "cast":
@@ -955,6 +957,79 @@ class _TirBridge:
             if scratch is None:
                 return {}
             metadata["scratch"] = scratch
+        return metadata
+
+    def _tail_compare_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Internal contract emitted by AscendTailMaskPropagation:
+        # dst, src0, src1/scalar, mode, validRow, validCol, physRow,
+        # physCol, storageCol.
+        if len(arguments) != 9:
+            return {}
+        mode = getattr(arguments[3], "value", None)
+        if mode not in {"EQ", "NE", "GT", "GE", "LT", "LE"}:
+            raise UnsupportedSimOpError(f"unsupported tail compare mode {mode!r}")
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[4:9]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        valid_rows, valid_cols, physical_rows, physical_cols, storage_cols = dimensions
+        if any(isinstance(value, int) and value < 0 for value in dimensions):
+            raise ProgramValidationError("tail compare dimensions must not be negative")
+        if all(isinstance(value, int) for value in dimensions):
+            if valid_rows > physical_rows or valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "tail compare valid rectangle must fit its physical tile"
+                )
+            if storage_cols < (physical_cols + 7) // 8:
+                raise ProgramValidationError(
+                    "tail compare packed storage width is too small"
+                )
+        packed_valid_cols: Any
+        if isinstance(valid_cols, int):
+            packed_valid_cols = (valid_cols + 7) // 8
+        else:
+            packed_valid_cols = SymbolicInt(
+                "floordiv", (SymbolicInt("add", (valid_cols, 7)), 8)
+            )
+        destination = self._access_buffer_region(
+            arguments[0], (valid_rows, packed_valid_cols), context
+        )
+        source = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "lhs": source,
+            "compare_mode": mode,
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "physical_rows": physical_rows,
+            "physical_cols": physical_cols,
+            "storage_cols": storage_cols,
+        }
+        if operation == "tail_compare_scalar":
+            scalar = self._literal(self.analyzer.simplify(arguments[2]))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"tail compare scalar requires a literal, got {scalar!r}"
+                )
+            metadata["scalar"] = scalar
+        else:
+            right = self._access_buffer_region(
+                arguments[2], (valid_rows, valid_cols), context
+            )
+            if right is None:
+                return {}
+            metadata["rhs"] = right
         return metadata
 
     def _scalar_metadata(

@@ -641,6 +641,48 @@ def _compare_select_primfunc(*, scalar_select=False, with_scratch=False):
     )
 
 
+def _tail_compare_primfunc(*, scalar=False, storage_cols=2):
+    left = tvm.tir.decl_buffer((2, 10), "float32", name="left", scope="global")
+    right = tvm.tir.decl_buffer((2, 10), "float32", name="right", scope="global")
+    ub_left = tvm.tir.decl_buffer(
+        (2, 10), "float32", name="ub_left", scope="shared.ub"
+    )
+    ub_right = tvm.tir.decl_buffer(
+        (2, 10), "float32", name="ub_right", scope="shared.ub"
+    )
+    ub_mask = tvm.tir.decl_buffer(
+        (2, 32), "uint8", name="ub_mask", scope="shared.ub"
+    )
+
+    def load(source_buffer, destination_buffer):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_gm_to_ub", source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), 10, 2, 9, 0, 2, 10,
+        ))
+
+    statements = [load(left, ub_left)]
+    if scalar:
+        right_argument = tvm.tir.FloatImm("float32", 0.0)
+        operation = "tl.ascend_tail_compare_scalar"
+    else:
+        statements.append(load(right, ub_right))
+        right_argument = ub_right.access_ptr("r")
+        operation = "tl.ascend_tail_compare"
+    statements.append(tvm.tir.Evaluate(tvm.tir.call_extern(
+        "handle", operation, ub_mask.access_ptr("w"), ub_left.access_ptr("r"),
+        right_argument, "GE", 2, 9, 2, 10, storage_cols,
+    )))
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_left, ub_right, ub_mask],
+    )
+    return tvm.tir.PrimFunc(
+        [left.data, right.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={left.data: left, right.data: right},
+    )
+
+
 def _padded_copy_primfunc(pad_value=-3.5):
     source = tvm.tir.decl_buffer((2, 5), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((3, 8), "float32", name="output", scope="global")
@@ -1327,6 +1369,49 @@ def test_real_tir_select_reads_packed_compare_mask(
         simulator.read(store.metadata["dst"]),
         np.where(left < right, left, fallback),
     )
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+def test_real_tail_compare_packs_each_valid_row_independently(scalar) -> None:
+    program = build_kernel_program(_tail_compare_primfunc(scalar=scalar), platform="A2")
+    compare = program.tasks[-1]
+    assert compare.operation == (
+        "tail_compare_scalar" if scalar else "tail_compare"
+    )
+    assert compare.metadata["valid_rows"] == 2
+    assert compare.metadata["valid_cols"] == 9
+    assert compare.metadata["physical_cols"] == 10
+    assert compare.metadata["storage_cols"] == 2
+    assert set(compare.dependencies) == {
+        task.task_id for task in program.tasks[:-1]
+    }
+
+    simulator = FunctionalSimulator(program)
+    left = np.array([
+        [-2, -1, 0, 1, 2, 3, 4, 5, 6, 99],
+        [6, 5, 4, 3, 2, 1, 0, -1, -2, 99],
+    ], dtype=np.float32)
+    right = np.array([
+        [-1, -1, 1, 0, 3, 2, 5, 4, 7, 99],
+        [7, 4, 5, 2, 3, 0, 1, -2, -1, 99],
+    ], dtype=np.float32)
+    simulator.write(program.tasks[0].metadata["src"], left[:, :9])
+    if not scalar:
+        simulator.write(program.tasks[1].metadata["src"], right[:, :9])
+    simulator.run()
+
+    rhs = 0.0 if scalar else right[:, :9]
+    expected = np.packbits(left[:, :9] >= rhs, axis=1, bitorder="little")
+    np.testing.assert_array_equal(simulator.read(compare.metadata["dst"]), expected)
+
+
+def test_tail_compare_rejects_narrow_packed_storage() -> None:
+    with pytest.raises(
+        ProgramValidationError, match="packed storage width is too small"
+    ):
+        build_kernel_program(
+            _tail_compare_primfunc(storage_cols=1), platform="A3"
+        )
 
 
 def test_unconfirmed_cast_round_mode_fails_closed_during_execution() -> None:
