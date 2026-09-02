@@ -239,6 +239,14 @@ class FunctionalSimulator:
             result = values
         elif round_mode == "CAST_RINT":
             result = np.rint(values)
+        elif round_mode == "CAST_FLOOR":
+            result = np.floor(values)
+        elif round_mode == "CAST_CEIL":
+            result = np.ceil(values)
+        elif round_mode == "CAST_ROUND":
+            result = np.copysign(np.floor(np.abs(values) + 0.5), values)
+        elif round_mode == "CAST_TRUNC":
+            result = np.trunc(values)
         else:
             raise UnsupportedSimOpError(
                 f"functional cast does not support round mode {round_mode!r}"

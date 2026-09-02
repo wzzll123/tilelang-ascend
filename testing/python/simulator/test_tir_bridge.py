@@ -904,6 +904,33 @@ def test_real_tir_cast_rint_executes_and_converts_destination_dtype() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("round_mode", "expected"),
+    [
+        ("CAST_FLOOR", [-3, -3, -2, -1, 0]),
+        ("CAST_CEIL", [-2, -2, -1, 0, 1]),
+        ("CAST_ROUND", [-3, -2, -2, -1, 1]),
+        ("CAST_TRUNC", [-2, -2, -1, 0, 0]),
+    ],
+)
+def test_real_tir_cast_round_modes_execute(round_mode, expected) -> None:
+    program = build_kernel_program(_cast_primfunc(round_mode), platform="A3")
+    load, _, store = program.tasks
+    simulator = FunctionalSimulator(program)
+    values = np.array(
+        [-2.5, -2.1, -1.5, -0.5, 0.5, 1.5, 2.1, 2.5], dtype=np.float32
+    )
+    simulator.write(
+        BufferRegion("source", MemoryScope.GM, (8,), "float32"), values
+    )
+
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), np.asarray(expected, dtype=np.int32)
+    )
+
+
 def test_real_tir_fill_initializes_offset_region_and_builds_dependency() -> None:
     count = tvm.tir.Var("count", "int32")
     program = build_kernel_program(_fill_primfunc(count=count), platform="A3")

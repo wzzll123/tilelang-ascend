@@ -126,8 +126,8 @@ vector binary 的普通形式当前支持一维显式 count；tail unary/scalar/
 valid rectangle，并保留原始 tail intrinsic 类型供 trace/debug。bridge 会读取最终
 PrimFunc 的 `address_map/size_map`；dependency 与 FunctionalSimulator backing 均按
 scope、core 和绝对 byte range 处理跨 buffer 的部分或完全 alias。
-cast 已贯通 `dst/src/round_mode/count` contract；当前仅执行 `CAST_NONE` 和
-`CAST_RINT`，其它 round mode 明确拒绝。
+cast 已贯通 `dst/src/round_mode/count` contract；当前执行 `CAST_NONE/RINT/FLOOR/CEIL/
+ROUND/TRUNC`，其中 ROUND 遵循 ties-away-from-zero；语义未充分确认的 CAST_ODD 明确拒绝。
 fill 已贯通原生 intrinsic 和等价 call_extern contract，支持 literal scalar、runtime
 count、pointer offset、poison 初始化和后续访问 dependency。
 leaky_relu 已复用 scalar vector contract；axpy 将 destination 同时建模为 accumulator read
@@ -158,7 +158,7 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `124 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `128 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -233,8 +233,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 leaky_relu 和 in-place accumulator 语义的 axpy。~~
 - [x] ~~实现 sigmoid、silu、sin、cos 的普通与 scratch forms。~~
 - [x] ~~实现 pow 和 clamp/max/min 的普通与 scratch forms。~~
-- [ ] 实现 duplicate；补齐其它 cast round
-  mode，并为已有 unary/cast 补齐 dtype/异常值语义。
+- [x] ~~实现 CAST_FLOOR、CAST_CEIL、CAST_ROUND ties-away-from-zero 和 CAST_TRUNC。~~
+- [ ] 实现 duplicate；确认 CAST_ODD，并为已有 unary/cast 补齐 dtype/异常值语义。
 - [ ] 实现 broadcast、compare、compare_scalar、select 和 tail/mask 语义。
 - [x] ~~实现真实 `tail_reduce` 的 float32 axis-0 clear=true sum/max/min，并覆盖
   valid rectangle、dependency 和非法 dim/clear contract。~~
@@ -330,7 +330,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：124 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：128 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
