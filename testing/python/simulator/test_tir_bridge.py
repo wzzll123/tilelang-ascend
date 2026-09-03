@@ -1080,6 +1080,43 @@ def _gather_primfunc(
     )
 
 
+def _transpose_primfunc(*, shape=(16, 32), dtype="float32", dst_shape=None):
+    dst_shape = dst_shape or tuple(reversed(shape))
+    source = tvm.tir.decl_buffer(shape, dtype, name="source", scope="global")
+    output = tvm.tir.decl_buffer(dst_shape, dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        shape, dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        dst_shape, dtype, name="ub_output", scope="shared.ub"
+    )
+    source_count = int(np.prod(shape))
+    destination_count = int(np.prod(dst_shape))
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, source_count),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_transpose",
+            ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+        )),
+        copy("copy_ub_to_gm", ub_output, output, destination_count),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_source, ub_output]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -3318,6 +3355,50 @@ def test_gather_rejects_non_32_bit_offsets() -> None:
     with pytest.raises(ProgramValidationError, match="int32 or uint32"):
         build_kernel_program(
             _gather_primfunc(offset_dtype="int16"), platform="A3"
+        )
+
+
+@pytest.mark.parametrize(
+    ("platform", "dtype", "shape"),
+    [
+        ("A2", "float16", (16, 32)),
+        ("A2", "int8", (32, 64)),
+        ("A3", "float32", (16, 32)),
+        ("A3", "uint16", (32, 16)),
+    ],
+)
+def test_transpose_executes_rank_two_tile(platform, dtype, shape) -> None:
+    program = build_kernel_program(
+        _transpose_primfunc(shape=shape, dtype=dtype), platform=platform
+    )
+    load, transpose, store = program.tasks
+    assert transpose.operation == "transpose"
+    assert transpose.metadata["src"].shape == shape
+    assert transpose.metadata["dst"].shape == tuple(reversed(shape))
+    assert transpose.dependencies == (load.task_id,)
+    assert store.dependencies == (transpose.task_id,)
+
+    values = np.arange(int(np.prod(shape)), dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    expected = values.reshape(shape).T.reshape(-1)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_transpose_validates_shape_alignment_and_dtype() -> None:
+    with pytest.raises(ProgramValidationError, match="reverse the source shape"):
+        build_kernel_program(
+            _transpose_primfunc(shape=(16, 32), dst_shape=(16, 32)),
+            platform="A2",
+        )
+    with pytest.raises(ProgramValidationError, match="32-byte aligned"):
+        build_kernel_program(
+            _transpose_primfunc(shape=(16, 20), dtype="float32"), platform="A3"
+        )
+    with pytest.raises(UnsupportedSimOpError, match="does not support dtype"):
+        build_kernel_program(
+            _transpose_primfunc(shape=(16, 16), dtype="bfloat16"), platform="A2"
         )
 
 

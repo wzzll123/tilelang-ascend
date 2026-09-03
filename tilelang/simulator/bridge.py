@@ -797,6 +797,8 @@ class _TirBridge:
             return self._sequence_metadata(short, arguments, context)
         if short == "gather":
             return self._gather_metadata(arguments, context)
+        if short == "transpose":
+            return self._transpose_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2084,6 +2086,60 @@ class _TirBridge:
                 return {}
             metadata["scratch"] = scratch
         return metadata
+
+    def _transpose_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 2:
+            return {}
+        specs = []
+        for pointer in arguments:
+            data_name = self._access_ptr_data_name(pointer)
+            buffer_name = self.buffer_name_by_data_var.get(data_name or "")
+            if buffer_name is None:
+                return {}
+            specs.append(self.buffers[buffer_name])
+        destination_spec, source_spec = specs
+        if source_spec.scope is not MemoryScope.UB or destination_spec.scope is not MemoryScope.UB:
+            raise ProgramValidationError("transpose requires UB source and destination")
+        if len(source_spec.shape) != 2 or len(destination_spec.shape) != 2:
+            raise UnsupportedSimOpError("functional transpose requires rank-2 buffers")
+        if not all(
+            isinstance(extent, int)
+            for extent in source_spec.shape + destination_spec.shape
+        ):
+            raise UnsupportedSimOpError("functional transpose requires static shapes")
+        if destination_spec.shape != tuple(reversed(source_spec.shape)):
+            raise ProgramValidationError(
+                "transpose destination shape must reverse the source shape"
+            )
+        if destination_spec.dtype != source_spec.dtype:
+            raise ProgramValidationError("transpose source/destination dtypes must match")
+        if source_spec.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional transpose does not support dtype {source_spec.dtype!r}"
+            )
+        itemsize = dtype_size_bytes(source_spec.dtype)
+        if any(extent * itemsize % 32 for extent in source_spec.shape):
+            raise ProgramValidationError(
+                "transpose source dimensions must each be 32-byte aligned"
+            )
+        destination = self._access_buffer_region(
+            arguments[0], destination_spec.shape, context
+        )
+        source = self._access_buffer_region(arguments[1], source_spec.shape, context)
+        if destination is None or source is None:
+            return {}
+        if destination.byte_offset != 0 or source.byte_offset != 0:
+            raise UnsupportedSimOpError(
+                "functional transpose currently requires whole-buffer operands"
+            )
+        return {"dst": destination, "src": source}
 
     def _pow_metadata(
         self,

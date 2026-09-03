@@ -208,6 +208,9 @@ class FunctionalSimulator:
         if operation == "gather":
             self._gather(task)
             return
+        if operation == "transpose":
+            self._transpose(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -552,6 +555,16 @@ class FunctionalSimulator:
         self.write(
             destination,
             source_values[indices].astype(source_values.dtype, copy=False),
+            task_core_id=task.core_id,
+        )
+
+    def _transpose(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        values = self.read(source, task_core_id=task.core_id)
+        self.write(
+            destination,
+            np.ascontiguousarray(values.T),
             task_core_id=task.core_id,
         )
 
