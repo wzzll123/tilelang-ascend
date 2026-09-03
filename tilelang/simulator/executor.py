@@ -138,6 +138,21 @@ class FunctionalSimulator:
                         f"topk actual_num must be in [{k}, {max_actual_num}], "
                         f"got {actual_num}"
                     )
+            sort = task.metadata.get("sort")
+            if isinstance(sort, Mapping):
+                actual_num = _resolve_int(sort["actual_num"], self.bindings)
+                repeat_times = _resolve_int(sort["repeat_times"], self.bindings)
+                capacity = _resolve_int(sort["source_capacity"], self.bindings)
+                if actual_num <= 0 or actual_num > capacity:
+                    raise ProgramValidationError(
+                        f"sort actual_num must be in [1, {capacity}], got {actual_num}"
+                    )
+                expected_repeats = (actual_num + 31) // 32
+                if repeat_times != expected_repeats:
+                    raise ProgramValidationError(
+                        "sort repeatTimes must equal ceil(actual_num / 32), "
+                        f"got {repeat_times}"
+                    )
 
     def write(self, region: BufferRegion, values: Any, *, task_core_id: int = 0) -> None:
         """Initialize a concrete region from an array-like CPU value."""
@@ -236,6 +251,9 @@ class FunctionalSimulator:
             return
         if operation == "sort32":
             self._sort32(task)
+            return
+        if operation == "sort":
+            self._sort(task)
             return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
@@ -746,6 +764,16 @@ class FunctionalSimulator:
             result.reshape(-1),
             task_core_id=task.core_id,
         )
+
+    def _sort(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        order = np.argsort(-values.astype(np.float64), kind="stable")
+        result = np.empty(values.size * 2, dtype=_numpy_dtype(destination.dtype))
+        result[0::2] = values[order]
+        result[1::2] = order
+        self.write(destination, result, task_core_id=task.core_id)
 
     def _block_reduce(self, task: Task) -> None:
         source = _operand(task, "src")

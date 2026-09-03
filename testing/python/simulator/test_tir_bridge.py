@@ -1411,6 +1411,63 @@ def _sort32_primfunc(*, dtype="float32", repeat_times=2, output_elements=None):
     )
 
 
+def _sort_primfunc(
+    *, dtype="float32", actual_num=37, capacity=64, repeat_times=None,
+    destination_extent=None, template_dtype=None,
+):
+    repeat_times = (
+        (actual_num + 31) // 32 if repeat_times is None else repeat_times
+    )
+    destination_extent = destination_extent or 2 * capacity
+    source = tvm.tir.decl_buffer(
+        (capacity,), dtype, name="source", scope="global"
+    )
+    output = tvm.tir.decl_buffer(
+        (2 * capacity,), dtype, name="output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (capacity,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (destination_extent,), dtype, name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (capacity * 8,), dtype, name="scratch", scope="shared.ub"
+    )
+    dtype_name = template_dtype or {"float16": "half", "float32": "float"}[dtype]
+
+    def copy(name, source_buffer, destination_buffer, extent):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), extent,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, capacity),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_sort", f"Sort<{dtype_name}>",
+            ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+            scratch.access_ptr("w"), repeat_times, actual_num,
+        )),
+        copy(
+            "copy_ub_to_gm", ub_output, output,
+            actual_num * 2,
+        ),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body,
+        alloc_buffers=[ub_source, ub_output, scratch],
+    )
+    parameters = [source.data, output.data]
+    if isinstance(actual_num, tvm.tir.Var):
+        parameters.append(actual_num)
+    return tvm.tir.PrimFunc(
+        parameters,
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -4015,6 +4072,63 @@ def test_sort32_validates_repeat_and_destination_extent() -> None:
     with pytest.raises(ProgramValidationError, match="destination extent"):
         build_kernel_program(
             _sort32_primfunc(output_elements=127), platform="A3"
+        )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_sort_executes_valid_prefix_with_numeric_indices(platform, dtype) -> None:
+    program = build_kernel_program(_sort_primfunc(dtype=dtype), platform=platform)
+    load, sort, store = program.tasks
+    assert sort.operation == "sort"
+    assert sort.dependencies == (load.task_id,)
+    assert store.dependencies == (sort.task_id,)
+    assert sort.metadata["scratch"].scope is MemoryScope.UB
+
+    valid = np.array(
+        [3, 8, 8, -2, 11, 1, 7] + list(range(30)), dtype=np.dtype(dtype)
+    )
+    values = np.concatenate(
+        (valid, np.full(64 - valid.size, 1000, dtype=np.dtype(dtype)))
+    )
+    order = np.argsort(-valid.astype(np.float64), kind="stable")
+    expected = np.empty(valid.size * 2, dtype=np.dtype(dtype))
+    expected[0::2] = valid[order]
+    expected[1::2] = order
+
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_sort_resolves_runtime_actual_num_and_repeat() -> None:
+    actual_num = tvm.tir.Var("actual_num", "int32")
+    program = build_kernel_program(
+        _sort_primfunc(actual_num=actual_num), platform="A3"
+    )
+    load, sort, store = program.tasks
+    assert isinstance(sort.metadata["sort"]["actual_num"], AffineInt)
+    assert isinstance(sort.metadata["sort"]["repeat_times"], SymbolicInt)
+    values = np.arange(64, dtype=np.float32)
+    simulator = FunctionalSimulator(program, bindings={"actual_num": 33})
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    result = simulator.read(store.metadata["dst"])
+    np.testing.assert_array_equal(result[0::2], np.arange(32, -1, -1))
+    np.testing.assert_array_equal(result[1::2], np.arange(32, -1, -1))
+
+
+def test_sort_validates_repeat_extent_and_template() -> None:
+    with pytest.raises(ProgramValidationError, match="does not match actual_num"):
+        build_kernel_program(_sort_primfunc(repeat_times=1), platform="A2")
+    with pytest.raises(ProgramValidationError, match="twice the source extent"):
+        build_kernel_program(
+            _sort_primfunc(destination_extent=127), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype"):
+        build_kernel_program(
+            _sort_primfunc(template_dtype="half"), platform="A3"
         )
 
 

@@ -817,6 +817,8 @@ class _TirBridge:
             return self._topk_metadata(arguments, context)
         if short == "sort32":
             return self._sort32_metadata(arguments, context)
+        if short == "sort":
+            return self._sort_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2550,6 +2552,88 @@ class _TirBridge:
             "offsets": replace(index_base, shape=(count,)),
             "repeat_times": repeat_times,
             "output_multiplier": output_multiplier,
+        }
+
+    def _sort_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final post-workspace-injection ABI:
+        # template, dst, src, tmp, repeatTimes, actual_num.
+        if len(arguments) != 6:
+            raise UnsupportedSimOpError(
+                "functional sort requires the final six-argument ABI"
+            )
+        template = self._literal(arguments[0])
+        repeat_times = self._runtime_int(arguments[4], context.environment)
+        actual_num = self._runtime_int(arguments[5], context.environment)
+        if repeat_times is None or actual_num is None:
+            raise UnsupportedSimOpError(
+                "sort repeatTimes and actual_num must be executable"
+            )
+        if isinstance(actual_num, int) and actual_num <= 0:
+            raise ProgramValidationError("sort actual_num must be positive")
+        if isinstance(repeat_times, int):
+            expected = (actual_num + 31) // 32 if isinstance(actual_num, int) else None
+            if repeat_times <= 0 or (expected is not None and repeat_times != expected):
+                raise ProgramValidationError(
+                    f"sort repeatTimes does not match actual_num: {repeat_times}"
+                )
+        destination_extent = self._access_ptr_extent(arguments[1], context)
+        source_extent = self._access_ptr_extent(arguments[2], context)
+        scratch_extent = self._access_ptr_extent(arguments[3], context)
+        extents = (destination_extent, source_extent, scratch_extent)
+        if not all(isinstance(extent, int) for extent in extents):
+            raise UnsupportedSimOpError(
+                "functional sort requires static pointer extents"
+            )
+        if source_extent <= 0 or destination_extent < 2 * source_extent:
+            raise ProgramValidationError(
+                "sort destination extent must be at least twice the source extent"
+            )
+        if scratch_extent <= 0:
+            raise ProgramValidationError("sort scratch extent must be positive")
+        if isinstance(actual_num, int) and actual_num > source_extent:
+            raise ProgramValidationError("sort actual_num exceeds source extent")
+        destination = self._access_buffer_region(
+            arguments[1], (_scale_runtime_int(actual_num, 2),), context
+        )
+        source = self._access_buffer_region(arguments[2], (actual_num,), context)
+        scratch = self._access_buffer_region(
+            arguments[3], (scratch_extent,), context
+        )
+        if destination is None or source is None or scratch is None:
+            return {}
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination, source, scratch)
+        ):
+            raise ProgramValidationError("sort requires UB operands")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("sort source/destination dtypes must match")
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional sort does not support dtype {source.dtype!r}"
+            )
+        if not isinstance(template, str) or not (
+            template.startswith("Sort<") and template.endswith(">")
+        ):
+            raise ProgramValidationError("sort template must be Sort<dtype>")
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError("sort template dtype must match operands")
+        return {
+            "dst": destination,
+            "src": source,
+            "scratch": scratch,
+            "sort": {
+                "actual_num": actual_num,
+                "repeat_times": repeat_times,
+                "source_capacity": source_extent,
+            },
         }
 
     def _pow_metadata(
