@@ -718,6 +718,12 @@ class _TirBridge:
         short = _short_operation(normalized)
         if short in {"add", "sub", "mul", "div", "min", "max"}:
             return self._binary_metadata(arguments, context, tail=tail_kind is not None)
+        if short in {"bitwise_and", "bitwise_or"}:
+            return self._bitwise_metadata(
+                self._binary_metadata(arguments, context, tail=False)
+            )
+        if short == "bitwise_xor":
+            return self._bitwise_metadata(self._pow_metadata(arguments, context))
         if short in {
             "adds", "subs", "muls", "divs", "mins", "maxs", "leaky_relu",
         }:
@@ -729,6 +735,12 @@ class _TirBridge:
             return metadata
         if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
+        if short == "bitwise_not":
+            return self._bitwise_metadata(
+                self._unary_metadata(arguments, context, tail=False)
+            )
+        if short in {"bitwise_lshift", "bitwise_rshift"}:
+            return self._shift_metadata(arguments, context)
         if short in {"sigmoid", "silu", "sin", "cos"}:
             return self._scratch_unary_metadata(arguments, context)
         if short == "pow":
@@ -1924,6 +1936,59 @@ class _TirBridge:
             if scratch is None:
                 return {}
             metadata["scratch"] = scratch
+        return metadata
+
+    def _bitwise_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        if not metadata:
+            return metadata
+        if any(
+            name in metadata and not isinstance(metadata[name], BufferRegion)
+            for name in ("dst", "src", "lhs", "rhs")
+        ):
+            return {}
+        operands = [
+            value for name in ("dst", "src", "lhs", "rhs")
+            if isinstance((value := metadata.get(name)), BufferRegion)
+        ]
+        dtypes = {operand.dtype for operand in operands}
+        if len(dtypes) != 1:
+            raise ProgramValidationError("bitwise operand dtypes must match")
+        dtype = next(iter(dtypes))
+        if dtype not in {"int16", "int32", "uint16", "uint32"}:
+            raise UnsupportedSimOpError(
+                f"functional bitwise operation does not support dtype {dtype!r}"
+            )
+        return metadata
+
+    def _shift_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            return {}
+        count = self._runtime_int(arguments[3], context.environment)
+        shift = self._runtime_int(arguments[2], context.environment)
+        if count is None or shift is None:
+            raise UnsupportedSimOpError(
+                "functional bitwise shift requires executable shift/count arguments"
+            )
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("bitwise shift count must not be negative")
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or source is None:
+            return {}
+        metadata = self._bitwise_metadata({"dst": destination, "src": source})
+        if not metadata:
+            return {}
+        if isinstance(shift, int):
+            bits = dtype_size_bytes(source.dtype) * 8
+            if shift < 0 or shift > bits:
+                raise ProgramValidationError(
+                    f"bitwise shift must be in [0, {bits}], got {shift}"
+                )
+        metadata.update({"shift": shift, "count": count})
         return metadata
 
     def _pow_metadata(

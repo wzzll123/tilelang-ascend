@@ -906,6 +906,59 @@ def _scalar_vector_primfunc(operation):
     )
 
 
+def _bitwise_primfunc(operation, *, dtype="int16", shift=1, with_scratch=False):
+    left = tvm.tir.decl_buffer((8,), dtype, name="left", scope="global")
+    right = tvm.tir.decl_buffer((8,), dtype, name="right", scope="global")
+    output = tvm.tir.decl_buffer((8,), dtype, name="output", scope="global")
+    ub_left = tvm.tir.decl_buffer((8,), dtype, name="ub_left", scope="shared.ub")
+    ub_right = tvm.tir.decl_buffer((8,), dtype, name="ub_right", scope="shared.ub")
+    ub_output = tvm.tir.decl_buffer((8,), dtype, name="ub_output", scope="shared.ub")
+    scratch = tvm.tir.decl_buffer((6,), dtype, name="scratch", scope="shared.ub")
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    destination = ub_output.access_ptr("w", offset=1, extent=6)
+    source = ub_left.access_ptr("r", offset=1, extent=6)
+    arguments = [destination, source]
+    if operation in {"bitwise_and", "bitwise_or"}:
+        arguments.extend([ub_right.access_ptr("r", offset=1, extent=6), 6])
+    elif operation == "bitwise_xor":
+        arguments.append(ub_right.access_ptr("r", offset=1, extent=6))
+        if with_scratch:
+            arguments.append(scratch.access_ptr("w"))
+    elif operation == "bitwise_not":
+        arguments.append(6)
+    else:
+        arguments.extend([shift, 6])
+    statements = [copy("copy_gm_to_ub", left, ub_left, 8)]
+    if operation in {"bitwise_and", "bitwise_or", "bitwise_xor"}:
+        statements.append(copy("copy_gm_to_ub", right, ub_right, 8))
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_{operation}", *arguments,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_ub_to_gm", ub_output.access_ptr("r", offset=1),
+            output.access_ptr("w", offset=1), 6,
+        )),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_left, ub_right, ub_output, scratch],
+    )
+    parameters = [left.data, right.data, output.data]
+    if isinstance(shift, tvm.tir.Var):
+        parameters.append(shift)
+    return tvm.tir.PrimFunc(
+        parameters, tvm.tir.BlockRealize([], True, root),
+        buffer_map={left.data: left, right.data: right, output.data: output},
+    )
+
+
 def _scratch_unary_primfunc(operation, *, with_scratch=False, in_place=False):
     source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((5,), "float32", name="output", scope="global")
@@ -2948,6 +3001,93 @@ def test_sequence_intrinsics_reject_negative_count_and_dtype_mismatch() -> None:
                 "arith_progression", dtype="float32", template_dtype="half"
             ),
             platform="A3",
+        )
+
+
+@pytest.mark.parametrize("dtype", ["int16", "uint16"])
+@pytest.mark.parametrize(
+    ("operation", "implementation", "with_scratch"),
+    [
+        ("bitwise_and", np.bitwise_and, False),
+        ("bitwise_or", np.bitwise_or, False),
+        ("bitwise_xor", np.bitwise_xor, True),
+    ],
+)
+def test_bitwise_binary_executes_offset_region(
+    dtype, operation, implementation, with_scratch
+) -> None:
+    program = build_kernel_program(
+        _bitwise_primfunc(operation, dtype=dtype, with_scratch=with_scratch),
+        platform="A2",
+    )
+    left_load, right_load, bitwise, store = program.tasks
+    assert bitwise.metadata["dst"].byte_offset == np.dtype(dtype).itemsize
+    assert set(bitwise.dependencies) == {left_load.task_id, right_load.task_id}
+    assert ("scratch" in bitwise.metadata) is with_scratch
+    assert store.dependencies == (bitwise.task_id,)
+
+    left = np.array([0, 1, 3, 7, 15, 31, 0x5555, 0x7FFF], dtype=dtype)
+    right = np.array([0, 2, 5, 8, 17, 0x1234, 0x3333, 0x7F00], dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(left_load.metadata["src"], left)
+    simulator.write(right_load.metadata["src"], right)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        implementation(left[1:7], right[1:7]),
+    )
+
+
+@pytest.mark.parametrize("dtype", ["int16", "uint16", "int32", "uint32"])
+def test_bitwise_not_preserves_fixed_width_dtype(dtype) -> None:
+    program = build_kernel_program(
+        _bitwise_primfunc("bitwise_not", dtype=dtype), platform="A3"
+    )
+    left_load, bitwise, store = program.tasks
+    assert bitwise.dependencies == (left_load.task_id,)
+    values = np.arange(8, dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(left_load.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), np.bitwise_not(values[1:7])
+    )
+
+
+@pytest.mark.parametrize("operation", ["bitwise_lshift", "bitwise_rshift"])
+@pytest.mark.parametrize("dtype", ["int16", "uint16", "int32", "uint32"])
+def test_bitwise_shift_matches_signed_or_unsigned_numpy(operation, dtype) -> None:
+    program = build_kernel_program(
+        _bitwise_primfunc(operation, dtype=dtype, shift=3), platform="A2"
+    )
+    left_load, shift_task, store = program.tasks
+    signed = dtype.startswith("int")
+    values = np.array(
+        [0, -9 if signed else 9, -1 if signed else 0xFFFF, 1, 7, 0x1234, 31, 2],
+        dtype=dtype,
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(left_load.metadata["src"], values)
+    simulator.run()
+    implementation = np.left_shift if operation == "bitwise_lshift" else np.right_shift
+    expected = implementation(values[1:7], 3).astype(dtype)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+    assert shift_task.dependencies == (left_load.task_id,)
+
+
+def test_runtime_bitwise_shift_validates_width() -> None:
+    shift = tvm.tir.Var("shift", "int32")
+    program = build_kernel_program(
+        _bitwise_primfunc("bitwise_lshift", dtype="int16", shift=shift),
+        platform="A3",
+    )
+    simulator = FunctionalSimulator(program, bindings={"shift": 17})
+    simulator.write(program.tasks[0].metadata["src"], np.arange(8, dtype=np.int16))
+    with pytest.raises(ProgramValidationError, match=r"\[0, 16\]"):
+        simulator.run()
+    with pytest.raises(UnsupportedSimOpError, match="does not support dtype"):
+        build_kernel_program(
+            _bitwise_primfunc("bitwise_not", dtype="float32"), platform="A2"
         )
 
 

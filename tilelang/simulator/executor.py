@@ -72,6 +72,12 @@ _COMPARE_OPERATIONS = {
     "LE": np.less_equal,
 }
 
+_BITWISE_BINARY_OPERATIONS = {
+    "bitwise_and": np.bitwise_and,
+    "bitwise_or": np.bitwise_or,
+    "bitwise_xor": np.bitwise_xor,
+}
+
 
 @dataclass(frozen=True)
 class FunctionalExecutionResult:
@@ -162,6 +168,9 @@ class FunctionalSimulator:
         if operation in _BINARY_OPERATIONS:
             self._binary(task, operation)
             return
+        if operation in _BITWISE_BINARY_OPERATIONS:
+            self._bitwise_binary(task, operation)
+            return
         if operation in _SCALAR_OPERATIONS:
             self._binary(task, operation)
             return
@@ -176,6 +185,12 @@ class FunctionalSimulator:
             return
         if operation in _UNARY_OPERATIONS:
             self._unary(task, operation)
+            return
+        if operation == "bitwise_not":
+            self._bitwise_not(task)
+            return
+        if operation in {"bitwise_lshift", "bitwise_rshift"}:
+            self._bitwise_shift(task, operation)
             return
         if operation == "cast":
             self._cast(task)
@@ -440,6 +455,41 @@ class FunctionalSimulator:
             )
         shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _bitwise_binary(self, task: Task, operation: str) -> None:
+        destination = _operand(task, "dst")
+        left = _operand(task, "lhs")
+        right = _operand(task, "rhs")
+        result = _BITWISE_BINARY_OPERATIONS[operation](
+            self.read(left, task_core_id=task.core_id),
+            self.read(right, task_core_id=task.core_id),
+        )
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _bitwise_not(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        self.write(
+            destination,
+            np.bitwise_not(self.read(source, task_core_id=task.core_id)),
+            task_core_id=task.core_id,
+        )
+
+    def _bitwise_shift(self, task: Task, operation: str) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        values = self.read(source, task_core_id=task.core_id)
+        shift = _resolve_int(task.metadata.get("shift"), self.bindings)
+        bits = values.dtype.itemsize * 8
+        if shift < 0 or shift > bits:
+            raise ProgramValidationError(
+                f"bitwise shift must be in [0, {bits}], got {shift}"
+            )
+        implementation = (
+            np.left_shift if operation == "bitwise_lshift" else np.right_shift
+        )
+        result = implementation(values, shift).astype(values.dtype, copy=False)
         self.write(destination, result, task_core_id=task.core_id)
 
     def _sequence(self, task: Task) -> None:
