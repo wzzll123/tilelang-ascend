@@ -795,6 +795,8 @@ class _TirBridge:
             return self._fill_metadata(arguments, context)
         if short in {"arith_progression", "createvecindex"}:
             return self._sequence_metadata(short, arguments, context)
+        if short == "gather":
+            return self._gather_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2021,6 +2023,68 @@ class _TirBridge:
         metadata.update({"shift": shift, "count": count})
         return metadata
 
+    def _gather_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {5, 6}:
+            return {}
+        count = self._runtime_int(arguments[4], context.environment)
+        base = self._runtime_int(arguments[3], context.environment)
+        source_extent = self._access_ptr_extent(arguments[1], context)
+        if count is None or base is None or source_extent is None:
+            raise UnsupportedSimOpError(
+                "functional gather requires executable base/count and source extent"
+            )
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("gather count must not be negative")
+        if isinstance(base, int) and base < 0:
+            raise ProgramValidationError("gather base byte address must not be negative")
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        source = self._access_buffer_region(arguments[1], (source_extent,), context)
+        offsets = self._access_buffer_region(arguments[2], (count,), context)
+        if destination is None or source is None or offsets is None:
+            return {}
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("gather source/destination dtypes must match")
+        if source.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional gather does not support dtype {source.dtype!r}"
+            )
+        if offsets.dtype not in {"int32", "uint32"}:
+            raise ProgramValidationError(
+                f"gather offsets must use int32 or uint32, got {offsets.dtype!r}"
+            )
+        for label, region in (
+            ("destination", destination), ("source", source), ("offset", offsets)
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"gather {label} pointer must be 32-byte aligned"
+                )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "offsets": offsets,
+            "base": base,
+            "count": count,
+        }
+        if len(arguments) == 6:
+            scratch_extent = self._access_ptr_extent(arguments[5], context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                arguments[5], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
     def _pow_metadata(
         self,
         arguments: Tuple[Any, ...],
@@ -3152,7 +3216,7 @@ class _TirBridge:
             metadata,
             (
                 "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
-                "scalar_src",
+                "scalar_src", "offsets",
             ),
         )
         writes = self._operand_regions(
@@ -3177,7 +3241,7 @@ class _TirBridge:
             task.metadata,
             (
                 "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
-                "scalar_src",
+                "scalar_src", "offsets",
             ),
         )
         writes = self._operand_regions(

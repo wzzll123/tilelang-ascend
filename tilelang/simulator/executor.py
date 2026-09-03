@@ -205,6 +205,9 @@ class FunctionalSimulator:
         if operation in {"arith_progression", "createvecindex"}:
             self._sequence(task)
             return
+        if operation == "gather":
+            self._gather(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -517,6 +520,38 @@ class FunctionalSimulator:
         self.write(
             destination,
             np.asarray(values, dtype=_numpy_dtype(destination.dtype)),
+            task_core_id=task.core_id,
+        )
+
+    def _gather(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        offsets = _operand(task, "offsets")
+        source_values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        offset_values = self.read(offsets, task_core_id=task.core_id).reshape(-1)
+        base = _resolve_int(task.metadata.get("base"), self.bindings)
+        if base < 0:
+            raise ProgramValidationError(
+                f"gather base byte address must not be negative, got {base}"
+            )
+        itemsize = source_values.dtype.itemsize
+        byte_addresses = offset_values.astype(np.int64) + base
+        misaligned = byte_addresses % itemsize != 0
+        if np.any(misaligned):
+            bad = int(byte_addresses[np.flatnonzero(misaligned)[0]])
+            raise ProgramValidationError(
+                f"gather byte address must align with element size {itemsize}, got {bad}"
+            )
+        indices = byte_addresses // itemsize
+        invalid = (indices < 0) | (indices >= source_values.size)
+        if np.any(invalid):
+            bad = int(indices[np.flatnonzero(invalid)[0]])
+            raise ProgramValidationError(
+                f"gather source index out of range: {bad} for {source_values.size} elements"
+            )
+        self.write(
+            destination,
+            source_values[indices].astype(source_values.dtype, copy=False),
             task_core_id=task.core_id,
         )
 

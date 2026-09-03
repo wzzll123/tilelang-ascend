@@ -1010,6 +1010,76 @@ def _mul_add_dst_primfunc(*, dtype="float32", right_dtype=None):
     )
 
 
+def _gather_primfunc(
+    *, dtype="float32", offset_dtype="uint32", base=0, with_scratch=False
+):
+    itemsize = np.dtype(dtype).itemsize
+    aligned_elements = 32 // itemsize
+    source_size = aligned_elements + 16
+    destination_size = aligned_elements + 5
+    offset_start = 8
+    source = tvm.tir.decl_buffer(
+        (source_size,), dtype, name="source", scope="global"
+    )
+    offsets = tvm.tir.decl_buffer(
+        (offset_start + 5,), offset_dtype, name="offsets", scope="global"
+    )
+    output = tvm.tir.decl_buffer((5,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (source_size,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_offsets = tvm.tir.decl_buffer(
+        (offset_start + 5,), offset_dtype, name="ub_offsets", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (destination_size,), dtype, name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer((64,), "uint8", name="scratch", scope="shared.ub")
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    gather_arguments = [
+        ub_output.access_ptr("w", offset=aligned_elements, extent=5),
+        ub_source.access_ptr("r", offset=aligned_elements, extent=16),
+        ub_offsets.access_ptr("r", offset=offset_start, extent=5),
+        base,
+        5,
+    ]
+    if with_scratch:
+        gather_arguments.append(scratch.access_ptr("w", offset=32, extent=32))
+    statements = [
+        copy("copy_gm_to_ub", source, ub_source, source_size),
+        copy("copy_gm_to_ub", offsets, ub_offsets, offset_start + 5),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_gather", *gather_arguments,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_ub_to_gm",
+            ub_output.access_ptr("r", offset=aligned_elements),
+            output.access_ptr("w"), 5,
+        )),
+    ]
+    alloc_buffers = [ub_source, ub_offsets, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=alloc_buffers,
+    )
+    parameters = [source.data, offsets.data, output.data]
+    if isinstance(base, tvm.tir.Var):
+        parameters.append(base)
+    return tvm.tir.PrimFunc(
+        parameters,
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, offsets.data: offsets, output.data: output},
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -3180,6 +3250,75 @@ def test_mul_add_dst_validates_operand_dtypes() -> None:
         )
     with pytest.raises(UnsupportedSimOpError, match="does not support dtype"):
         build_kernel_program(_mul_add_dst_primfunc(dtype="int16"), platform="A3")
+
+
+@pytest.mark.parametrize(
+    ("platform", "dtype", "with_scratch"),
+    [
+        ("A2", "float16", False),
+        ("A2", "int32", True),
+        ("A3", "float32", True),
+        ("A3", "uint16", False),
+    ],
+)
+def test_gather_executes_flat_byte_offsets(platform, dtype, with_scratch) -> None:
+    itemsize = np.dtype(dtype).itemsize
+    program = build_kernel_program(
+        _gather_primfunc(
+            dtype=dtype, base=itemsize, with_scratch=with_scratch
+        ),
+        platform=platform,
+    )
+    source_load, offset_load, gather, store = program.tasks
+    assert gather.operation == "gather"
+    assert set(gather.dependencies) == {
+        source_load.task_id, offset_load.task_id,
+    }
+    assert ("scratch" in gather.metadata) is with_scratch
+    assert store.dependencies == (gather.task_id,)
+
+    source_values = np.arange(source_load.metadata["src"].shape[0], dtype=dtype)
+    offset_values = np.zeros(offset_load.metadata["src"].shape, dtype=np.uint32)
+    relative_indices = np.array([0, 2, 5, 7, 9], dtype=np.uint32)
+    offset_values[8:13] = relative_indices * itemsize
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], source_values)
+    simulator.write(offset_load.metadata["src"], offset_values)
+    simulator.run()
+
+    source_start = 32 // itemsize
+    expected_indices = source_start + relative_indices.astype(np.int64) + 1
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), source_values[expected_indices]
+    )
+
+
+@pytest.mark.parametrize(
+    ("base", "offset", "message"),
+    [(1, 0, "align with element size"), (0, 4096, "index out of range")],
+)
+def test_gather_rejects_invalid_byte_address(base, offset, message) -> None:
+    program = build_kernel_program(
+        _gather_primfunc(dtype="float32", base=base), platform="A2"
+    )
+    source_load, offset_load, _, _ = program.tasks
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        source_load.metadata["src"],
+        np.arange(source_load.metadata["src"].shape[0], dtype=np.float32),
+    )
+    offset_values = np.zeros(offset_load.metadata["src"].shape, dtype=np.uint32)
+    offset_values[8] = offset
+    simulator.write(offset_load.metadata["src"], offset_values)
+    with pytest.raises(ProgramValidationError, match=message):
+        simulator.run()
+
+
+def test_gather_rejects_non_32_bit_offsets() -> None:
+    with pytest.raises(ProgramValidationError, match="int32 or uint32"):
+        build_kernel_program(
+            _gather_primfunc(offset_dtype="int16"), platform="A3"
+        )
 
 
 @pytest.mark.parametrize("operation", ["leaky_relu", "axpy"])

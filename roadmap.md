@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 52%**。checkbox 裸计数约 62%，但未完成的完整
+- **完整 roadmap：约 53%**。checkbox 裸计数约 63%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 88%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 89%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -175,6 +175,8 @@ sigmoid、silu、sin 和 cos 已支持普通及显式/隐藏 scratch 签名；sc
 参与 alias 和 dependency，in-place silu 保留 source read 与 destination write。
 round 已支持 A2/A3 float16/float32、显式/隐藏 scratch 和 ties-away-from-zero，并拒绝
 后端 workspace policy 未允许的非浮点 dtype。
+gather 已支持 flat UB source、int32/uint32 字节 offset、base address、pointer slice 和
+显式/隐藏 scratch；执行前验证 32B pointer alignment、元素对齐、dtype 和源索引范围。
 pow 和 clamp/max/min 已支持普通与 scratch forms；pow 的 count 来自真实 access_ptr extent，
 clamp 会验证 literal bounds 和 min/max 顺序。
 broadcast 已支持 rank-1/2、两条二维广播轴、普通/scratch forms、shape legality 和动态
@@ -246,13 +248,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `304 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `311 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 304 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 311 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -328,6 +330,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 sigmoid、silu、sin、cos 的普通与 scratch forms。~~
 - [x] ~~实现 A2/A3 float16/float32 round 的普通/scratch forms、dtype validation 和
   ties-away-from-zero 语义。~~
+- [x] ~~实现 gather 的 flat-source 字节 offset、base address、scratch、alignment、dtype、
+  source-bounds、poison 和 dependency 语义。~~
 - [x] ~~实现 pow 和 clamp/max/min 的普通与 scratch forms。~~
 - [x] ~~实现 CAST_FLOOR、CAST_CEIL、CAST_ROUND ties-away-from-zero 和 CAST_TRUNC。~~
 - [ ] 为 duplicate 补齐 TileLang builtin/language/codegen contract 后实现模拟；当前树只有
@@ -487,7 +491,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：304 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：311 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
