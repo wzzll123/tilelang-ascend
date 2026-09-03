@@ -1080,6 +1080,73 @@ def _gather_primfunc(
     )
 
 
+def _gatherb_primfunc(
+    *, dtype="uint16", offset_dtype="uint32", repeat=2,
+    dst_block_stride=1, dst_repeat_stride=8, template_dtype=None,
+):
+    itemsize = np.dtype(dtype).itemsize
+    elements_per_block = 32 // itemsize
+    source_count = 24 * elements_per_block
+    storage_repeat = repeat if isinstance(repeat, int) else 2
+    offset_count = max(0, storage_repeat) * 8
+    destination_blocks = max(0, storage_repeat - 1) * dst_repeat_stride + 8
+    destination_count = max(1, destination_blocks * elements_per_block)
+    source = tvm.tir.decl_buffer(
+        (source_count,), dtype, name="source", scope="global"
+    )
+    offsets = tvm.tir.decl_buffer(
+        (max(1, offset_count),), offset_dtype, name="offsets", scope="global"
+    )
+    output = tvm.tir.decl_buffer(
+        (destination_count,), dtype, name="output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (source_count,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_offsets = tvm.tir.decl_buffer(
+        (max(1, offset_count),), offset_dtype,
+        name="ub_offsets", scope="shared.ub",
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (destination_count,), dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    template_dtype = template_dtype or {
+        "float16": "half", "float32": "float", "int8": "int8_t",
+        "uint8": "uint8_t", "int16": "int16_t", "uint16": "uint16_t",
+        "int32": "int", "uint32": "uint32_t",
+    }[dtype]
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, source_count),
+        copy("copy_gm_to_ub", offsets, ub_offsets, max(1, offset_count)),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_gatherb", f"Gatherb<{template_dtype}>",
+            ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+            ub_offsets.access_ptr("r"), repeat,
+            dst_block_stride, dst_repeat_stride,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, destination_count),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body,
+        alloc_buffers=[ub_source, ub_offsets, ub_output],
+    )
+    parameters = [source.data, offsets.data, output.data]
+    if isinstance(repeat, tvm.tir.Var):
+        parameters.append(repeat)
+    return tvm.tir.PrimFunc(
+        parameters,
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, offsets.data: offsets, output.data: output},
+    )
+
+
 def _transpose_primfunc(*, shape=(16, 32), dtype="float32", dst_shape=None):
     dst_shape = dst_shape or tuple(reversed(shape))
     source = tvm.tir.decl_buffer(shape, dtype, name="source", scope="global")
@@ -3356,6 +3423,101 @@ def test_gather_rejects_non_32_bit_offsets() -> None:
         build_kernel_program(
             _gather_primfunc(offset_dtype="int16"), platform="A3"
         )
+
+
+@pytest.mark.parametrize(
+    ("platform", "dtype"),
+    [
+        ("A2", "uint16"),
+        ("A2", "float16"),
+        ("A3", "uint32"),
+        ("A3", "int32"),
+    ],
+)
+def test_gatherb_executes_eight_blocks_per_repeat(platform, dtype) -> None:
+    program = build_kernel_program(
+        _gatherb_primfunc(dtype=dtype, repeat=2), platform=platform
+    )
+    source_load, offset_load, gatherb, store = program.tasks
+    assert gatherb.operation == "gatherb"
+    assert gatherb.metadata["dst"].shape == (
+        2, 8, 32 // np.dtype(dtype).itemsize
+    )
+    assert set(gatherb.dependencies) == {
+        source_load.task_id, offset_load.task_id,
+    }
+    assert store.dependencies == (gatherb.task_id,)
+
+    source_values = np.arange(source_load.metadata["src"].shape[0], dtype=dtype)
+    offset_values = (
+        np.arange(offset_load.metadata["src"].shape[0], dtype=np.uint32)[::-1]
+        * 32
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], source_values)
+    simulator.write(offset_load.metadata["src"], offset_values)
+    simulator.run()
+    block_elements = 32 // np.dtype(dtype).itemsize
+    expected = np.concatenate([
+        source_values[int(offset) // np.dtype(dtype).itemsize:
+                      int(offset) // np.dtype(dtype).itemsize + block_elements]
+        for offset in offset_values
+    ])
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize(
+    ("offset", "message"),
+    [(2, "32-byte aligned"), (24 * 32, "block out of range")],
+)
+def test_gatherb_rejects_invalid_block_offset(offset, message) -> None:
+    program = build_kernel_program(_gatherb_primfunc(repeat=1), platform="A2")
+    source_load, offset_load, _, _ = program.tasks
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        source_load.metadata["src"],
+        np.arange(source_load.metadata["src"].shape[0], dtype=np.uint16),
+    )
+    offsets = np.zeros(offset_load.metadata["src"].shape, dtype=np.uint32)
+    offsets[0] = offset
+    simulator.write(offset_load.metadata["src"], offsets)
+    with pytest.raises(ProgramValidationError, match=message):
+        simulator.run()
+
+
+def test_gatherb_validates_control_and_offset_dtype() -> None:
+    with pytest.raises(ProgramValidationError, match="must not exceed 255"):
+        build_kernel_program(_gatherb_primfunc(repeat=256), platform="A3")
+    with pytest.raises(ProgramValidationError, match="must not be negative"):
+        build_kernel_program(
+            _gatherb_primfunc(dst_block_stride=-1), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="int32 or uint32"):
+        build_kernel_program(
+            _gatherb_primfunc(offset_dtype="int16"), platform="A3"
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype must match"):
+        build_kernel_program(
+            _gatherb_primfunc(dtype="uint16", template_dtype="uint32_t"),
+            platform="A2",
+        )
+
+    repeat = tvm.tir.Var("repeat", "int32")
+    program = build_kernel_program(
+        _gatherb_primfunc(repeat=repeat), platform="A3"
+    )
+    source_load, offset_load, _, _ = program.tasks
+    simulator = FunctionalSimulator(program, bindings={"repeat": 256})
+    simulator.write(
+        source_load.metadata["src"],
+        np.arange(source_load.metadata["src"].shape[0], dtype=np.uint16),
+    )
+    simulator.write(
+        offset_load.metadata["src"],
+        np.zeros(offset_load.metadata["src"].shape, dtype=np.uint32),
+    )
+    with pytest.raises(ProgramValidationError, match="must not exceed 255"):
+        simulator.run()
 
 
 @pytest.mark.parametrize(

@@ -208,6 +208,9 @@ class FunctionalSimulator:
         if operation == "gather":
             self._gather(task)
             return
+        if operation == "gatherb":
+            self._gatherb(task)
+            return
         if operation == "transpose":
             self._transpose(task)
             return
@@ -557,6 +560,45 @@ class FunctionalSimulator:
             source_values[indices].astype(source_values.dtype, copy=False),
             task_core_id=task.core_id,
         )
+
+    def _gatherb(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        offsets = _operand(task, "offsets")
+        repeat = _resolve_int(task.metadata.get("repeat"), self.bindings)
+        dst_block_stride = _resolve_int(
+            task.metadata.get("dst_block_stride"), self.bindings
+        )
+        dst_repeat_stride = _resolve_int(
+            task.metadata.get("dst_repeat_stride"), self.bindings
+        )
+        if min(repeat, dst_block_stride, dst_repeat_stride) < 0:
+            raise ProgramValidationError("gatherb repeat/strides must not be negative")
+        if repeat > 255:
+            raise ProgramValidationError(
+                f"gatherb repeat must not exceed 255, got {repeat}"
+            )
+        source_values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        offset_values = self.read(offsets, task_core_id=task.core_id)
+        block_elements = _resolve_int(
+            task.metadata.get("elements_per_block"), self.bindings
+        )
+        blocks = np.empty(
+            offset_values.shape + (block_elements,), dtype=source_values.dtype
+        )
+        for index in np.ndindex(offset_values.shape):
+            byte_offset = int(offset_values[index])
+            if byte_offset < 0 or byte_offset % 32:
+                raise ProgramValidationError(
+                    f"gatherb byte offset must be non-negative and 32-byte aligned, got {byte_offset}"
+                )
+            source_index = byte_offset // source_values.dtype.itemsize
+            if source_index + block_elements > source_values.size:
+                raise ProgramValidationError(
+                    f"gatherb source block out of range at byte offset {byte_offset}"
+                )
+            blocks[index] = source_values[source_index:source_index + block_elements]
+        self.write(destination, blocks, task_core_id=task.core_id)
 
     def _transpose(self, task: Task) -> None:
         destination = _operand(task, "dst")

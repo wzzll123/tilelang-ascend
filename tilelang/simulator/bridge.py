@@ -797,6 +797,8 @@ class _TirBridge:
             return self._sequence_metadata(short, arguments, context)
         if short == "gather":
             return self._gather_metadata(arguments, context)
+        if short == "gatherb":
+            return self._gatherb_metadata(arguments, context)
         if short == "transpose":
             return self._transpose_metadata(arguments, context)
         if short == "reduce":
@@ -2086,6 +2088,98 @@ class _TirBridge:
                 return {}
             metadata["scratch"] = scratch
         return metadata
+
+    def _gatherb_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        argument_offset = 0
+        if arguments and isinstance(self._literal(arguments[0]), str):
+            argument_offset = 1
+        operands = arguments[argument_offset:]
+        if len(operands) != 6:
+            return {}
+        repeat = self._runtime_int(operands[3], context.environment)
+        dst_block_stride = self._runtime_int(operands[4], context.environment)
+        dst_repeat_stride = self._runtime_int(operands[5], context.environment)
+        source_extent = self._access_ptr_extent(operands[1], context)
+        if any(value is None for value in (
+            repeat, dst_block_stride, dst_repeat_stride, source_extent
+        )):
+            raise UnsupportedSimOpError(
+                "functional gatherb requires executable repeat/strides and source extent"
+            )
+        if all(isinstance(value, int) for value in (
+            repeat, dst_block_stride, dst_repeat_stride
+        )):
+            if min(repeat, dst_block_stride, dst_repeat_stride) < 0:
+                raise ProgramValidationError("gatherb repeat/strides must not be negative")
+            if repeat > 255:
+                raise ProgramValidationError("gatherb repeat must not exceed 255")
+        source_base = self._access_buffer_region(operands[1], (source_extent,), context)
+        destination_base = self._access_buffer_region(operands[0], (1,), context)
+        offsets = self._access_buffer_region(operands[2], (repeat, 8), context)
+        if source_base is None or destination_base is None or offsets is None:
+            return {}
+        offsets = replace(offsets, strides_bytes=(8 * 4, 4))
+        if source_base.dtype != destination_base.dtype:
+            raise ProgramValidationError("gatherb source/destination dtypes must match")
+        if argument_offset:
+            template = self._literal(arguments[0])
+            if not (
+                isinstance(template, str)
+                and template.startswith("Gatherb<")
+                and template.endswith(">")
+            ):
+                raise ProgramValidationError("gatherb template must be Gatherb<dtype>")
+            template_dtype = _ascend_template_dtype(
+                template[len("Gatherb<"):-1]
+            )
+            if template_dtype != destination_base.dtype:
+                raise ProgramValidationError(
+                    "gatherb template dtype must match destination dtype"
+                )
+        if source_base.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional gatherb does not support dtype {source_base.dtype!r}"
+            )
+        if offsets.dtype not in {"int32", "uint32"}:
+            raise ProgramValidationError(
+                f"gatherb offsets must use int32 or uint32, got {offsets.dtype!r}"
+            )
+        for label, region in (
+            ("destination", destination_base),
+            ("source", source_base),
+            ("offset", offsets),
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"gatherb {label} pointer must be 32-byte aligned"
+                )
+        itemsize = dtype_size_bytes(source_base.dtype)
+        elements_per_block = 32 // itemsize
+        destination = replace(
+            destination_base,
+            shape=(repeat, 8, elements_per_block),
+            strides_bytes=(
+                _scale_runtime_int(dst_repeat_stride, 32),
+                _scale_runtime_int(dst_block_stride, 32),
+                itemsize,
+            ),
+        )
+        return {
+            "dst": destination,
+            "src": source_base,
+            "offsets": offsets,
+            "repeat": repeat,
+            "dst_block_stride": dst_block_stride,
+            "dst_repeat_stride": dst_repeat_stride,
+            "elements_per_block": elements_per_block,
+        }
 
     def _transpose_metadata(
         self,
