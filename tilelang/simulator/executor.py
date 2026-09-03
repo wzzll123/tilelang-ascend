@@ -55,6 +55,7 @@ _UNARY_OPERATIONS = {
     "silu": lambda value: value * np.exp(-np.logaddexp(0, -value)),
     "sin": np.sin,
     "cos": np.cos,
+    "round": lambda value: np.copysign(np.floor(np.abs(value) + 0.5), value),
 }
 
 _REDUCE_OPERATIONS = {

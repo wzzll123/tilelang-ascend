@@ -758,6 +758,21 @@ class _TirBridge:
             return self._shift_metadata(arguments, context)
         if short in {"sigmoid", "silu", "sin", "cos"}:
             return self._scratch_unary_metadata(arguments, context)
+        if short == "round":
+            metadata = self._scratch_unary_metadata(arguments, context)
+            source = metadata.get("src")
+            destination = metadata.get("dst")
+            if not isinstance(source, BufferRegion) or not isinstance(
+                destination, BufferRegion
+            ):
+                return {}
+            if source.dtype != destination.dtype:
+                raise ProgramValidationError("round operand dtypes must match")
+            if source.dtype not in {"float16", "float32"}:
+                raise UnsupportedSimOpError(
+                    f"functional round does not support dtype {source.dtype!r}"
+                )
+            return metadata
         if short == "pow":
             return self._pow_metadata(arguments, context)
         if short in {"clamp", "clamp_max", "clamp_min"}:

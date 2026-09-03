@@ -1010,14 +1010,16 @@ def _mul_add_dst_primfunc(*, dtype="float32", right_dtype=None):
     )
 
 
-def _scratch_unary_primfunc(operation, *, with_scratch=False, in_place=False):
-    source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
-    output = tvm.tir.decl_buffer((5,), "float32", name="output", scope="global")
+def _scratch_unary_primfunc(
+    operation, *, with_scratch=False, in_place=False, dtype="float32"
+):
+    source = tvm.tir.decl_buffer((5,), dtype, name="source", scope="global")
+    output = tvm.tir.decl_buffer((5,), dtype, name="output", scope="global")
     ub_source = tvm.tir.decl_buffer(
-        (5,), "float32", name="ub_source", scope="shared.ub"
+        (5,), dtype, name="ub_source", scope="shared.ub"
     )
     ub_output = tvm.tir.decl_buffer(
-        (5,), "float32", name="ub_output", scope="shared.ub"
+        (5,), dtype, name="ub_output", scope="shared.ub"
     )
     scratch = tvm.tir.decl_buffer(
         (5,), "float32", name="scratch", scope="shared.ub"
@@ -3248,6 +3250,41 @@ def test_real_tir_scratch_unary_forms_execute(
     np.testing.assert_allclose(
         simulator.read(store.metadata["dst"]), expected(values), rtol=1e-6
     )
+
+
+@pytest.mark.parametrize(
+    ("platform", "dtype", "with_scratch"),
+    [
+        ("A2", "float16", True),
+        ("A2", "float32", False),
+        ("A3", "float16", False),
+        ("A3", "float32", True),
+    ],
+)
+def test_round_executes_ties_away_from_zero(platform, dtype, with_scratch) -> None:
+    program = build_kernel_program(
+        _scratch_unary_primfunc(
+            "round", dtype=dtype, with_scratch=with_scratch
+        ),
+        platform=platform,
+    )
+    load, operation, store = program.tasks
+    assert ("scratch" in operation.metadata) is with_scratch
+    values = np.array([-2.5, -1.5, -0.5, 0.5, 2.5], dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.array([-3, -2, -1, 1, 3], dtype=dtype),
+    )
+
+
+def test_round_rejects_non_floating_dtype() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="does not support dtype"):
+        build_kernel_program(
+            _scratch_unary_primfunc("round", dtype="int16"), platform="A2"
+        )
 
 
 @pytest.mark.parametrize(
