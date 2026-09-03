@@ -1121,7 +1121,10 @@ def _compare_scalar_buffer_primfunc(mode, scalar_index=1):
     )
 
 
-def _compare_select_primfunc(*, scalar_select=False, with_scratch=False):
+def _compare_select_primfunc(
+    *, scalar_select=False, buffer_select=False, with_scratch=False,
+    select_mode=None,
+):
     left = tvm.tir.decl_buffer((8,), "float32", name="left", scope="global")
     right = tvm.tir.decl_buffer((8,), "float32", name="right", scope="global")
     output = tvm.tir.decl_buffer((8,), "float32", name="output", scope="global")
@@ -1153,14 +1156,20 @@ def _compare_select_primfunc(*, scalar_select=False, with_scratch=False):
     ]
     if with_scratch:
         select_arguments.append(scratch.access_ptr("w"))
-    if scalar_select:
+    if buffer_select:
+        select_arguments.extend([
+            0, ub_right.access_ptr("r"), 1,
+            select_mode or "VSEL_CMPMASK_SPR", 8,
+        ])
+    elif scalar_select:
         select_arguments.extend([
             1, tvm.tir.FloatImm("float32", 10.0),
             "VSEL_TENSOR_SCALAR_MODE", 8, "float32", "uint8",
         ])
     else:
         select_arguments.extend([
-            2, ub_right.access_ptr("r"), "VSEL_TENSOR_TENSOR_MODE", 8,
+            2, ub_right.access_ptr("r"),
+            select_mode or "VSEL_TENSOR_TENSOR_MODE", 8,
         ])
     statements = [
         copy("copy_gm_to_ub", left, ub_left, 8),
@@ -2904,20 +2913,28 @@ def test_compare_scalar_reads_indexed_buffer_value(mode) -> None:
 
 
 @pytest.mark.parametrize(
-    ("scalar_select", "with_scratch"), [(False, False), (True, True)]
+    ("scalar_select", "with_scratch", "select_mode"),
+    [
+        (False, False, None),
+        (False, True, "VSEL_CMPMASK_SPR"),
+        (True, True, None),
+    ],
 )
 def test_real_tir_select_reads_packed_compare_mask(
-    scalar_select, with_scratch
+    scalar_select, with_scratch, select_mode
 ) -> None:
     program = build_kernel_program(
         _compare_select_primfunc(
-            scalar_select=scalar_select, with_scratch=with_scratch
+            scalar_select=scalar_select, with_scratch=with_scratch,
+            select_mode=select_mode,
         ),
         platform="A3",
     )
     left_load, right_load, compare, select, store = program.tasks
     assert select.operation == "select"
     assert select.metadata["source_type"] == (1 if scalar_select else 2)
+    if select_mode is not None:
+        assert select.metadata["select_mode"] == select_mode
     assert compare.task_id in select.dependencies
     assert left_load.task_id in select.dependencies
     if not scalar_select:
@@ -2936,6 +2953,40 @@ def test_real_tir_select_reads_packed_compare_mask(
     np.testing.assert_array_equal(
         simulator.read(store.metadata["dst"]),
         np.where(left < right, left, fallback),
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ["VSEL_CMPMASK_SPR", "VSEL_TENSOR_TENSOR_MODE"]
+)
+@pytest.mark.parametrize("with_scratch", [False, True])
+def test_select_reads_indexed_buffer_scalar(mode, with_scratch) -> None:
+    program = build_kernel_program(
+        _compare_select_primfunc(
+            buffer_select=True, with_scratch=with_scratch, select_mode=mode,
+        ),
+        platform="A2",
+    )
+    left_load, scalar_load, compare, select, store = program.tasks
+    assert select.metadata["source_type"] == 0
+    assert select.metadata["select_mode"] == mode
+    assert select.metadata["scalar_src"].shape == (1,)
+    assert select.metadata["scalar_src"].byte_offset == 4
+    assert set(select.dependencies) == {
+        left_load.task_id, scalar_load.task_id, compare.task_id,
+    }
+    assert ("scratch" in select.metadata) is with_scratch
+    assert store.dependencies == (select.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    left = np.array([-2, 4, 0, 7, 2, 3, 9, 5], dtype=np.float32)
+    right = np.array([-1, 3, 1, 6, 3, 2, 8, 6], dtype=np.float32)
+    simulator.write(left_load.metadata["src"], left)
+    simulator.write(scalar_load.metadata["src"], right)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.where(left < right, left, right[1]),
     )
 
 

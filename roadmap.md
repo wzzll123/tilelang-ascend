@@ -1,6 +1,6 @@
 # TileLang Ascend A2/A3 Simulator Roadmap
 
-更新时间：2026-09-02
+更新时间：2026-09-03
 
 本路线图只覆盖 Ascend A2/A3（C220）。`shmem` 永久不支持，也不列为待办项；任何
 shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 44%**。checkbox 裸计数约 54%，但未完成的完整
+- **完整 roadmap：约 45%**。checkbox 裸计数约 55%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 77%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 79%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -172,6 +172,10 @@ region；执行器严格按结构化 source/destination shape 广播。
 compare/compare_scalar 已支持 EQ/NE/GT/GE/LT/LE、literal scalar 和 AscendC 六参数
 indexed scalar-buffer form，输出按仓库 golden 使用 little-endian bit packing；scalar
 buffer 的单元素 region 会参与 bounds、poison 和 RAW dependency。
+select 已支持 tensor-tensor、literal tensor-scalar 和 indexed BufferLoad scalar，覆盖普通/
+显式 scratch forms、`VSEL_TENSOR_*` 与 `VSEL_CMPMASK_SPR`；mask、tensor source 和
+scalar source region 都参与 bounds、poison 与 dependency，执行器按同一 packed predicate
+选择结果。
 tail reduction 已贯通仓库当前验证的 float32、axis 0、clear=true contract，支持
 sum/max/min 对二维 valid rectangle 按列归约；workspace、axis 1 和 accumulate 仍待实现。
 Cube copy 已有两条 GM→L1 路径：显式 RowMajor 路径按二维 stride 搬运；默认路径将有效
@@ -225,13 +229,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `239 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `244 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 239 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 244 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -313,7 +317,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   AscendC 32-byte source row stride。~~
 - [x] ~~实现 compare_scalar indexed BufferLoad，保留单元素 scalar region、RAW dependency
   和六种 mode 的 packed-mask golden。~~
-- [ ] 实现 select BufferLoad/CMPMASK mode 和其它 tail/mask variants。
+- [x] ~~实现 select indexed BufferLoad 和 `VSEL_CMPMASK_SPR`，覆盖 source type 0/2、
+  optional scratch、scalar region/dependency 和 packed-mask golden。~~
+- [ ] 实现其它 tail/mask variants。
 - [x] ~~实现真实 `tail_reduce` 的 float32 axis-0 clear=true sum/max/min，并覆盖
   valid rectangle、dependency 和非法 dim/clear contract。~~
 - [x] ~~实现普通 float32 reduce 的 sum/max/min、axis 0/-1、clear=true row tmp 和
@@ -449,7 +455,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：239 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：244 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -459,7 +465,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 对照 EasyASC `pipe_vec.py` 补齐 mask/select/reduction/dtype variants。
+1. 对照 EasyASC `pipe_vec.py` 补齐剩余 mask/reduction/dtype variants。
 2. 实现其它 MMA dtype 与 quant/fixpipe variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

@@ -2252,7 +2252,20 @@ class _TirBridge:
             cursor += 1
         source_type = self._const_int(arguments[cursor], context.environment)
         cursor += 1
-        if source_type == 1:
+        scalar_source_arg = None
+        scalar_index_arg = None
+        if source_type == 0:
+            if len(arguments) != cursor + 4:
+                return {}
+            scalar_source_arg, scalar_index_arg, mode_arg, count_arg = arguments[
+                cursor:cursor + 4
+            ]
+            source1_arg = scalar_source_arg
+            scalar = None
+            expected_modes = {
+                "VSEL_CMPMASK_SPR", "VSEL_TENSOR_TENSOR_MODE",
+            }
+        elif source_type == 1:
             if len(arguments) != cursor + 5:
                 return {}
             source1_arg, mode_arg, count_arg = arguments[cursor:cursor + 3]
@@ -2261,21 +2274,24 @@ class _TirBridge:
                 raise UnsupportedSimOpError(
                     f"functional scalar select requires a literal, got {scalar!r}"
                 )
-            expected_mode = "VSEL_TENSOR_SCALAR_MODE"
+            expected_modes = {"VSEL_TENSOR_SCALAR_MODE"}
         elif source_type == 2:
             if len(arguments) != cursor + 3:
                 return {}
             source1_arg, mode_arg, count_arg = arguments[cursor:cursor + 3]
             scalar = None
-            expected_mode = "VSEL_TENSOR_TENSOR_MODE"
+            expected_modes = {
+                "VSEL_CMPMASK_SPR", "VSEL_TENSOR_TENSOR_MODE",
+            }
         else:
             raise UnsupportedSimOpError(
-                f"functional select supports source type 1 or 2, got {source_type!r}"
+                f"functional select supports source type 0, 1, or 2, got {source_type!r}"
             )
         mode = getattr(mode_arg, "value", None)
-        if mode != expected_mode:
+        if mode not in expected_modes:
             raise UnsupportedSimOpError(
-                f"select source type {source_type} requires {expected_mode}, got {mode!r}"
+                f"select source type {source_type} requires one of "
+                f"{sorted(expected_modes)}, got {mode!r}"
             )
         count = self._runtime_int(count_arg, context.environment)
         if count is None:
@@ -2297,7 +2313,33 @@ class _TirBridge:
             "select_mode": mode,
             "source_type": source_type,
         }
-        if source_type == 1:
+        if source_type == 0:
+            scalar_index = self._runtime_int(
+                scalar_index_arg, context.environment
+            )
+            if not isinstance(scalar_index, (int, AffineInt, SymbolicInt)):
+                raise UnsupportedSimOpError(
+                    "functional select BufferLoad requires an executable index"
+                )
+            scalar_source = self._access_buffer_region(
+                scalar_source_arg, (1,), context
+            )
+            if scalar_source is None:
+                return {}
+            if scalar_source.dtype != source.dtype:
+                raise ProgramValidationError(
+                    "select BufferLoad dtype must match its tensor source dtype"
+                )
+            scalar_offset = _scale_runtime_int(
+                scalar_index, dtype_size_bytes(scalar_source.dtype)
+            )
+            metadata["scalar_src"] = replace(
+                scalar_source,
+                byte_offset=_add_runtime_int(
+                    scalar_source.byte_offset, scalar_offset
+                ),
+            )
+        elif source_type == 1:
             metadata["scalar"] = scalar
         else:
             source1 = self._access_buffer_region(source1_arg, (count,), context)

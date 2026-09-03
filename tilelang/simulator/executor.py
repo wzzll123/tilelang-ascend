@@ -536,11 +536,17 @@ class FunctionalSimulator:
         right = task.metadata.get("rhs")
         if isinstance(right, BufferRegion):
             right_values: Any = self.read(right, task_core_id=task.core_id)
+        elif isinstance(task.metadata.get("scalar_src"), BufferRegion):
+            scalar_source = _operand(task, "scalar_src")
+            right_values = self.read(
+                scalar_source, task_core_id=task.core_id
+            ).reshape(-1)[0]
         elif "scalar" in task.metadata:
             right_values = task.metadata["scalar"]
         else:
             raise ProgramValidationError(
-                f"select task {task.task_id!r} requires rhs or scalar metadata"
+                f"select task {task.task_id!r} requires rhs, scalar_src, "
+                "or scalar metadata"
             )
         self.write(
             destination,
