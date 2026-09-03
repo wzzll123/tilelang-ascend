@@ -755,6 +755,8 @@ class _TirBridge:
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
             return self._block_reduce_metadata(short, arguments, context)
+        if short in {"wholereducemax", "wholereducemin", "wholereducesum"}:
+            return self._whole_reduce_metadata(short, arguments, context)
         if short == "copy_gm_to_l1_linear":
             return self._gm_to_l1_linear_metadata(arguments, context)
         if short == "copy_gm_to_l1":
@@ -2677,6 +2679,86 @@ class _TirBridge:
             "dst": destination,
             "src": source,
             "reduce_kind": operation.removeprefix("block_"),
+            "elements_per_block": elements_per_block,
+            **controls,
+        }
+
+    def _whole_reduce_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        is_sum = operation == "wholereducesum"
+        expected_arguments = 7 if is_sum else 8
+        if len(arguments) != expected_arguments:
+            return {}
+        mask, repeat, dst_rep_stride, src_blk_stride, src_rep_stride = (
+            self._const_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        controls = {
+            "repeat": repeat,
+            "mask": mask,
+            "dst_rep_stride": dst_rep_stride,
+            "src_blk_stride": src_blk_stride,
+            "src_rep_stride": src_rep_stride,
+        }
+        if any(value is None for value in controls.values()):
+            raise UnsupportedSimOpError(
+                "functional whole reduction requires static repeat/mask/strides"
+            )
+        if repeat < 0 or mask < 0:
+            raise ProgramValidationError("whole reduction repeat/mask must not be negative")
+        if any(value < 0 for value in (
+            dst_rep_stride, src_blk_stride, src_rep_stride
+        )):
+            raise ProgramValidationError("whole reduction strides must not be negative")
+
+        order = "ORDER_ONLY_VALUE" if is_sum else self._literal(arguments[7])
+        if order not in {"ORDER_ONLY_VALUE", "ORDER_VALUE_INDEX"}:
+            raise UnsupportedSimOpError(
+                f"functional whole reduction does not support order {order!r}"
+            )
+        destination_base = self._access_buffer_region(arguments[0], (1,), context)
+        source_base = self._access_buffer_region(arguments[1], (1,), context)
+        if destination_base is None or source_base is None:
+            return {}
+        if destination_base.dtype != source_base.dtype:
+            raise ProgramValidationError("whole reduction source/destination dtype must match")
+        if source_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional whole reduction supports only float16/float32"
+            )
+        itemsize = dtype_size_bytes(source_base.dtype)
+        elements_per_block = 32 // itemsize
+        vector_elements = 8 * elements_per_block
+        if mask > vector_elements:
+            raise ProgramValidationError(
+                f"whole reduction mask must be in [0, {vector_elements}], got {mask}"
+            )
+        active_blocks = (mask + elements_per_block - 1) // elements_per_block
+        output_width = 2 if order == "ORDER_VALUE_INDEX" else 1
+        source = replace(
+            source_base,
+            shape=(repeat, active_blocks, elements_per_block),
+            strides_bytes=(src_rep_stride * 32, src_blk_stride * 32, itemsize),
+        )
+        destination = replace(
+            destination_base,
+            shape=(repeat, output_width),
+            strides_bytes=(dst_rep_stride * output_width * itemsize, itemsize),
+        )
+        kind = {
+            "wholereducesum": "reduce_sum",
+            "wholereducemax": "reduce_max",
+            "wholereducemin": "reduce_min",
+        }[operation]
+        return {
+            "dst": destination,
+            "src": source,
+            "reduce_kind": kind,
+            "reduce_order": order,
             "elements_per_block": elements_per_block,
             **controls,
         }

@@ -1671,6 +1671,51 @@ def _block_reduce_primfunc(kind, *, dtype="float16", mask=37):
     )
 
 
+def _whole_reduce_primfunc(
+    kind, *, dtype="float16", mask=37, order="ORDER_VALUE_INDEX"
+):
+    source = tvm.tir.decl_buffer((256,), dtype, name="source", scope="global")
+    initial = tvm.tir.decl_buffer((16,), dtype, name="initial", scope="global")
+    output = tvm.tir.decl_buffer((16,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (256,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (16,), dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    arguments = [
+        ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+        mask, 2, 2, 1, 8,
+    ]
+    if kind != "sum":
+        arguments.append(order)
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, 256),
+        copy("copy_gm_to_ub", initial, ub_output, 16),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_wholereduce{kind}", *arguments,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, 16),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_source, ub_output]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, initial.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            source.data: source, initial.data: initial, output.data: output,
+        },
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -3352,6 +3397,73 @@ def test_block_reduce_rejects_invalid_mask_and_dtype() -> None:
     with pytest.raises(UnsupportedSimOpError, match="only float16/float32"):
         build_kernel_program(
             _block_reduce_primfunc("max", dtype="int32", mask=32), platform="A2"
+        )
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize(
+    ("kind", "order"),
+    [
+        ("sum", "ORDER_ONLY_VALUE"),
+        ("max", "ORDER_ONLY_VALUE"),
+        ("min", "ORDER_ONLY_VALUE"),
+        ("max", "ORDER_VALUE_INDEX"),
+        ("min", "ORDER_VALUE_INDEX"),
+    ],
+)
+def test_whole_reduce_executes_masked_strided_repeats(dtype, kind, order) -> None:
+    mask = 37
+    program = build_kernel_program(
+        _whole_reduce_primfunc(kind, dtype=dtype, mask=mask, order=order),
+        platform="A3",
+    )
+    source_load, initial_load, reduction, store = program.tasks
+    itemsize = np.dtype(dtype).itemsize
+    elements_per_block = 32 // itemsize
+    active_blocks = (mask + elements_per_block - 1) // elements_per_block
+    output_width = 2 if order == "ORDER_VALUE_INDEX" else 1
+    assert reduction.operation == f"wholereduce{kind}"
+    assert reduction.metadata["src"].shape == (2, active_blocks, elements_per_block)
+    assert reduction.metadata["src"].strides_bytes == (256, 32, itemsize)
+    assert reduction.metadata["dst"].shape == (2, output_width)
+    assert reduction.metadata["dst"].strides_bytes == (
+        2 * output_width * itemsize, itemsize,
+    )
+    assert set(reduction.dependencies) == {
+        source_load.task_id, initial_load.task_id,
+    }
+    assert store.dependencies == (reduction.task_id,)
+
+    values = np.linspace(-8, 8, 256, dtype=np.float32).astype(dtype)
+    initial = np.full(16, -99, dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], values)
+    simulator.write(initial_load.metadata["src"], initial)
+    simulator.run()
+
+    expected = initial.copy()
+    for repeat in range(2):
+        start = repeat * 8 * elements_per_block
+        lanes = values[start:start + mask].astype(np.float32)
+        destination_start = repeat * 2 * output_width
+        if kind == "sum":
+            expected[destination_start] = np.sum(lanes)
+        else:
+            index = int(np.argmax(lanes) if kind == "max" else np.argmin(lanes))
+            expected[destination_start] = lanes[index]
+            if order == "ORDER_VALUE_INDEX":
+                index_dtype = np.uint16 if itemsize == 2 else np.uint32
+                expected[destination_start + 1] = np.asarray(
+                    [index], dtype=index_dtype
+                ).view(np.dtype(dtype))[0]
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_whole_reduce_rejects_invalid_order() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="does not support order"):
+        build_kernel_program(
+            _whole_reduce_primfunc("max", order="ORDER_INDEX_VALUE"),
+            platform="A2",
         )
 
 

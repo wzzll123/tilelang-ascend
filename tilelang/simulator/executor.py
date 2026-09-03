@@ -210,6 +210,9 @@ class FunctionalSimulator:
         if operation in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
             self._block_reduce(task)
             return
+        if operation in {"wholereducemax", "wholereducemin", "wholereducesum"}:
+            self._whole_reduce(task)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -461,6 +464,46 @@ class FunctionalSimulator:
             else:
                 raise UnsupportedSimOpError(
                     f"functional block reduction does not support kind {kind!r}"
+                )
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _whole_reduce(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        result = self.read(destination, task_core_id=task.core_id)
+        mask = _resolve_int(task.metadata.get("mask"), self.bindings)
+        if mask == 0:
+            self.write(destination, result, task_core_id=task.core_id)
+            return
+        elements_per_block = _resolve_int(
+            task.metadata.get("elements_per_block"), self.bindings
+        )
+        kind = task.metadata.get("reduce_kind")
+        order = task.metadata.get("reduce_order")
+        for repeat_index in range(values.shape[0]):
+            remaining = mask
+            pieces = []
+            for block_index in range(values.shape[1]):
+                active = min(elements_per_block, remaining)
+                pieces.append(values[repeat_index, block_index, :active])
+                remaining -= active
+            lanes = np.concatenate(pieces)
+            compute = lanes.astype(np.float32) if lanes.dtype == np.float16 else lanes
+            if kind == "reduce_sum":
+                result[repeat_index, 0] = np.sum(compute)
+            elif kind in {"reduce_max", "reduce_min"}:
+                reducer = np.argmax if kind == "reduce_max" else np.argmin
+                index = int(reducer(compute))
+                result[repeat_index, 0] = compute[index]
+                if order == "ORDER_VALUE_INDEX":
+                    index_dtype = np.uint16 if result.dtype.itemsize == 2 else np.uint32
+                    result[repeat_index, 1] = np.asarray(
+                        [index], dtype=index_dtype
+                    ).view(result.dtype)[0]
+            else:
+                raise UnsupportedSimOpError(
+                    f"functional whole reduction does not support kind {kind!r}"
                 )
         self.write(destination, result, task_core_id=task.core_id)
 
