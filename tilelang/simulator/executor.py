@@ -177,6 +177,9 @@ class FunctionalSimulator:
         if operation == "axpy":
             self._axpy(task)
             return
+        if operation == "mul_add_dst":
+            self._mul_add_dst(task)
+            return
         if operation == "mma":
             self._mma(task)
             return
@@ -360,6 +363,18 @@ class FunctionalSimulator:
             scalar * source_values + accumulator_values,
             task_core_id=task.core_id,
         )
+
+    def _mul_add_dst(self, task: Task) -> None:
+        left = _operand(task, "lhs")
+        right = _operand(task, "rhs")
+        destination = _operand(task, "dst")
+        accumulator = _operand(task, "accumulator")
+        result = (
+            self.read(left, task_core_id=task.core_id)
+            * self.read(right, task_core_id=task.core_id)
+            + self.read(accumulator, task_core_id=task.core_id)
+        )
+        self.write(destination, result, task_core_id=task.core_id)
 
     def _mma(self, task: Task) -> None:
         left = _operand(task, "lhs")

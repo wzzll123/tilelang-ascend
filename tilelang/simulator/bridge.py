@@ -34,7 +34,7 @@ _VECTOR_OPS = frozenset({
     "compare", "compare_scalar", "cos", "createvecindex", "div", "divs", "duplicate",
     "exp", "fill", "gather", "gather_mask", "gather_mask_experiment", "gatherb",
     "init_sort_buf", "leaky_relu", "ln", "max", "maxs", "merge_sort", "min", "mins",
-    "mul", "muls", "pow", "reciprocal", "reduce", "reduce_max", "reduce_min",
+    "mul", "mul_add_dst", "muls", "pow", "reciprocal", "reduce", "reduce_max", "reduce_min",
     "reduce_sum", "relu", "round", "rsqrt", "select",
     "sigmoid", "silu", "sin", "sort", "sort32", "sqrt", "sub", "subs", "tail_binary",
     "tail_broadcast", "tail_compare", "tail_compare_scalar", "tail_reduce", "tail_scalar",
@@ -732,6 +732,21 @@ class _TirBridge:
             metadata = self._scalar_metadata(arguments, context, tail=False)
             if isinstance(metadata.get("dst"), BufferRegion):
                 metadata["accumulator"] = metadata["dst"]
+            return metadata
+        if short == "mul_add_dst":
+            metadata = self._binary_metadata(arguments, context, tail=False)
+            operands = [metadata.get(name) for name in ("dst", "lhs", "rhs")]
+            if not all(isinstance(operand, BufferRegion) for operand in operands):
+                return {}
+            dtypes = {operand.dtype for operand in operands}
+            if len(dtypes) != 1:
+                raise ProgramValidationError("mul_add_dst operand dtypes must match")
+            dtype = next(iter(dtypes))
+            if dtype not in {"float16", "float32"}:
+                raise UnsupportedSimOpError(
+                    f"functional mul_add_dst does not support dtype {dtype!r}"
+                )
+            metadata["accumulator"] = metadata["dst"]
             return metadata
         if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)

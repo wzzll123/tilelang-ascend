@@ -959,6 +959,57 @@ def _bitwise_primfunc(operation, *, dtype="int16", shift=1, with_scratch=False):
     )
 
 
+def _mul_add_dst_primfunc(*, dtype="float32", right_dtype=None):
+    right_dtype = right_dtype or dtype
+    left = tvm.tir.decl_buffer((8,), dtype, name="left", scope="global")
+    right = tvm.tir.decl_buffer((8,), right_dtype, name="right", scope="global")
+    initial = tvm.tir.decl_buffer((8,), dtype, name="initial", scope="global")
+    output = tvm.tir.decl_buffer((8,), dtype, name="output", scope="global")
+    ub_left = tvm.tir.decl_buffer((8,), dtype, name="ub_left", scope="shared.ub")
+    ub_right = tvm.tir.decl_buffer(
+        (8,), right_dtype, name="ub_right", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    statements = [
+        copy("copy_gm_to_ub", left, ub_left, 8),
+        copy("copy_gm_to_ub", right, ub_right, 8),
+        copy("copy_gm_to_ub", initial, ub_output, 8),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_mul_add_dst",
+            ub_output.access_ptr("rw", offset=1, extent=6),
+            ub_left.access_ptr("r", offset=1, extent=6),
+            ub_right.access_ptr("r", offset=1, extent=6), 6,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_ub_to_gm", ub_output.access_ptr("r", offset=1),
+            output.access_ptr("w", offset=1), 6,
+        )),
+    ]
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_left, ub_right, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [left.data, right.data, initial.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            left.data: left,
+            right.data: right,
+            initial.data: initial,
+            output.data: output,
+        },
+    )
+
+
 def _scratch_unary_primfunc(operation, *, with_scratch=False, in_place=False):
     source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
     output = tvm.tir.decl_buffer((5,), "float32", name="output", scope="global")
@@ -3089,6 +3140,44 @@ def test_runtime_bitwise_shift_validates_width() -> None:
         build_kernel_program(
             _bitwise_primfunc("bitwise_not", dtype="float32"), platform="A2"
         )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_mul_add_dst_executes_accumulator_region(dtype, platform) -> None:
+    program = build_kernel_program(_mul_add_dst_primfunc(dtype=dtype), platform=platform)
+    left_load, right_load, initial_load, multiply_add, store = program.tasks
+    assert multiply_add.operation == "mul_add_dst"
+    assert set(multiply_add.dependencies) == {
+        left_load.task_id,
+        right_load.task_id,
+        initial_load.task_id,
+    }
+    assert multiply_add.metadata["accumulator"] == multiply_add.metadata["dst"]
+    assert store.dependencies == (multiply_add.task_id,)
+
+    left = np.linspace(-2, 2, 8, dtype=dtype)
+    right = np.linspace(3, -1, 8, dtype=dtype)
+    initial = np.linspace(1, 4, 8, dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(left_load.metadata["src"], left)
+    simulator.write(right_load.metadata["src"], right)
+    simulator.write(initial_load.metadata["src"], initial)
+    simulator.run()
+    expected = left[1:7] * right[1:7] + initial[1:7]
+    np.testing.assert_allclose(
+        simulator.read(store.metadata["dst"]), expected, rtol=1e-3, atol=1e-3
+    )
+
+
+def test_mul_add_dst_validates_operand_dtypes() -> None:
+    with pytest.raises(ProgramValidationError, match="operand dtypes must match"):
+        build_kernel_program(
+            _mul_add_dst_primfunc(dtype="float32", right_dtype="float16"),
+            platform="A2",
+        )
+    with pytest.raises(UnsupportedSimOpError, match="does not support dtype"):
+        build_kernel_program(_mul_add_dst_primfunc(dtype="int16"), platform="A3")
 
 
 @pytest.mark.parametrize("operation", ["leaky_relu", "axpy"])
