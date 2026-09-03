@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 47%**。checkbox 裸计数约 57%，但未完成的完整
+- **完整 roadmap：约 48%**。checkbox 裸计数约 58%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 82%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 83%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -182,6 +182,9 @@ deprecated AscendC `block_reduce_{sum,max,min}` 已支持 float16/float32、静�
 repeat 及显式 source/destination stride；每个 32B block 独立归约，partial block mask、
 跨 repeat footprint 和依赖均按真实访问建模。`wholereduce{sum,max,min}` 也已支持同一
 mask/repeat/stride contract；max/min 覆盖 `ORDER_ONLY_VALUE` 和 value/index bitcast 输出。
+普通 row reduce 已支持 trailing `physical_cols` narrow-row contract：二维 slice offset 会
+保留物理 row stride，并严格检查 axis=-1、logical≤physical、32B row alignment、单个
+256B repeat 和 clear=true。
 Cube copy 已有两条 GM→L1 路径：显式 RowMajor 路径按二维 stride 搬运；默认路径将有效
 矩形按仓库 `ascend_layout.py` 的 zN 公式写入真实物理存储，并复现 tail tile 清零。默认
 路径当前只接受 fractal/C0 对齐、tile-base 对齐的静态物理 tile；子 tile 拼接继续拒绝。
@@ -233,13 +236,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `262 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `270 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 262 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 270 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -309,7 +312,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 sigmoid、silu、sin、cos 的普通与 scratch forms。~~
 - [x] ~~实现 pow 和 clamp/max/min 的普通与 scratch forms。~~
 - [x] ~~实现 CAST_FLOOR、CAST_CEIL、CAST_ROUND ties-away-from-zero 和 CAST_TRUNC。~~
-- [ ] 实现 duplicate；确认 CAST_ODD，并为已有 unary/cast 补齐 dtype/异常值语义。
+- [ ] 为 duplicate 补齐 TileLang builtin/language/codegen contract 后实现模拟；当前树只有
+  sync 配置和 simulator 白名单，不能猜测 ABI。确认 CAST_ODD，并为已有 unary/cast
+  补齐 dtype/异常值语义。
 - [x] ~~实现 rank-1/2 broadcast、两条二维广播轴和普通/scratch forms。~~
 - [x] ~~实现 compare/compare_scalar 的六种 mode、literal scalar 和 packed mask。~~
 - [x] ~~实现 select tensor-tensor/tensor-scalar 的普通与 scratch forms，并将 packed
@@ -334,7 +339,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   mask/repeat/stride contract，覆盖 partial block、跨 repeat footprint 和错误路径。~~
 - [x] ~~实现 whole reduce sum/max/min 的 float16/float32 静态 mask/repeat/stride，
   覆盖 only-value、value/index bitcast、partial mask、跨 repeat footprint 和错误 order。~~
-- [ ] 实现 narrow physical row reduction。
+- [x] ~~实现 narrow physical row reduction 的 slice offset/stride 和 axis、宽度、对齐、
+  单 repeat 宽度、clear contract 验证。~~
 - [ ] 覆盖 float16、bfloat16、float32、int/uint 常用 dtype 的舍入、溢出和饱和语义。
 - [ ] 增加动态 shape、动态 tail、misalignment、partial write 和非法 copy path 测试。
 
@@ -463,7 +469,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：262 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：270 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -473,7 +479,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 对照 EasyASC `pipe_vec.py` 补齐 duplicate 和剩余 mask/dtype variants。
+1. 对照 EasyASC `pipe_vec.py` 补齐剩余 mask/dtype variants；duplicate 等 TileLang ABI
+   落地后再接入，禁止按名称猜参数。
 2. 实现其它 MMA dtype 与 quant/fixpipe variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

@@ -1793,6 +1793,32 @@ class _TirBridge:
         )
         if source is None or destination is None:
             return {}
+        if physical_cols != cols:
+            itemsize = dtype_size_bytes(source.dtype)
+            if physical_cols < cols:
+                raise ProgramValidationError(
+                    "narrow reduce logical width must fit its physical row"
+                )
+            if axis != -1:
+                raise UnsupportedSimOpError(
+                    "narrow reduce supports only row reduction (axis=-1)"
+                )
+            if cols * itemsize > 256:
+                raise UnsupportedSimOpError(
+                    "narrow reduce logical row must fit one 256-byte vector repeat"
+                )
+            if physical_cols * itemsize % 32:
+                raise ProgramValidationError(
+                    "narrow reduce physical row must be 32-byte aligned"
+                )
+            if not clear:
+                raise UnsupportedSimOpError(
+                    "narrow reduce does not support clear=false"
+                )
+            source = replace(
+                source,
+                strides_bytes=(physical_cols * itemsize, itemsize),
+            )
         metadata: Dict[str, Any] = {
             "src": source,
             "dst": destination,

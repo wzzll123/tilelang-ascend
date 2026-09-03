@@ -1632,6 +1632,52 @@ def _reduce_primfunc(kind, axis, *, clear=True):
     )
 
 
+def _narrow_reduce_primfunc(
+    kind, *, rows=3, logical_cols=5, physical_cols=8, offset=2, clear=True,
+    axis=-1,
+):
+    source = tvm.tir.decl_buffer(
+        (rows, physical_cols), "float32", name="source", scope="global"
+    )
+    output = tvm.tir.decl_buffer((rows,), "float32", name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (rows, physical_cols), "float32", name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (rows,), "float32", name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (rows * logical_cols,), "float32", name="scratch", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, rows * physical_cols),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_reduce",
+            f"reduce_{kind}<float, {rows}, {logical_cols}, {axis}>",
+            ub_output.access_ptr("w"),
+            ub_source.access_ptr("r", offset=offset),
+            scratch.access_ptr("w"), tvm.tir.const(clear, "bool"), physical_cols,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, rows),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body,
+        alloc_buffers=[ub_source, ub_output, scratch],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _block_reduce_primfunc(kind, *, dtype="float16", mask=37):
     source = tvm.tir.decl_buffer((256,), dtype, name="source", scope="global")
     initial = tvm.tir.decl_buffer((16,), dtype, name="initial", scope="global")
@@ -3344,6 +3390,48 @@ def test_real_tir_reduce_executes_both_axes(kind, reducer, axis) -> None:
         simulator.read(store.metadata["dst"]),
         reducer(values, axis=0 if axis == 0 else 1),
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "reducer"),
+    [("sum", np.sum), ("max", np.max), ("min", np.min)],
+)
+def test_narrow_row_reduce_uses_physical_stride(kind, reducer) -> None:
+    program = build_kernel_program(_narrow_reduce_primfunc(kind), platform="A2")
+    load, reduction, store = program.tasks
+    assert reduction.operation == "reduce"
+    assert reduction.metadata["physical_cols"] == 8
+    assert reduction.metadata["src"].shape == (3, 5)
+    assert reduction.metadata["src"].byte_offset == 8
+    assert reduction.metadata["src"].strides_bytes == (32, 4)
+    assert reduction.dependencies == (load.task_id,)
+    assert store.dependencies == (reduction.task_id,)
+
+    values = np.arange(24, dtype=np.float32).reshape(3, 8)
+    poison = {"sum": 100, "max": 1000, "min": -1000}[kind]
+    values[:, :2] = poison
+    values[:, 7:] = poison
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values.reshape(-1))
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), reducer(values[:, 2:7], axis=1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"logical_cols": 9}, "logical width must fit"),
+        ({"physical_cols": 7}, "32-byte aligned"),
+        ({"logical_cols": 65, "physical_cols": 72}, "256-byte vector repeat"),
+        ({"axis": 0}, "only row reduction"),
+        ({"clear": False}, "clear=false"),
+    ],
+)
+def test_narrow_row_reduce_rejects_unsupported_contract(kwargs, message) -> None:
+    with pytest.raises((ProgramValidationError, UnsupportedSimOpError), match=message):
+        build_kernel_program(_narrow_reduce_primfunc("sum", **kwargs), platform="A3")
 
 
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
