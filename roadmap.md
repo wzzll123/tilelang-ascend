@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 62%**。checkbox 裸计数约 72%，但未完成的完整
+- **完整 roadmap：约 63%**。checkbox 裸计数约 72%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 97%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 98%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -201,6 +201,10 @@ UB→GM atomic_add 已支持 lowered DMA 五参数 ABI、float16/float32、二�
 row stride；destination 同时作为 accumulator read 和 atomic write 建模，因此同一 GM
 region 的跨 core 更新会在 DAG/trace 中确定性串行化。目标必须预先初始化，未初始化读取、
 非 32B 行宽、scope/dtype/template 错误均明确失败。
+L0C→GM atomic_add 已支持 lowered DMA 五参数 ABI、L0C fractal layout 解码、有效尾块和
+GM row stride，并覆盖 fp32→fp32/fp16 与 int32→int32。转换发生在加法之前，destination
+同样作为 accumulator 和 atomic write 参与依赖分析；bfloat16 因当前 NumPy host 表示/codec
+尚未落地而继续 fail closed。
 transpose 已支持静态 rank-2 UB tile 的非方形转置和常用 B8/B16/B32 dtype，并验证
 source/destination shape 互换、dtype、scope、whole-buffer 和双维度 32B 对齐契约。
 reinterpretcast 已按零拷贝元数据操作实现：执行时将目标 UB allocation 重绑到源
@@ -278,13 +282,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `367 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `374 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 367 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 374 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -496,7 +500,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 - [x] ~~实现 UB→GM atomic_add 的 float16/float32、二维有效矩形、GM stride、目标 seeding
   要求和 read-modify-write 功能语义。~~
-- [ ] 实现 L0C→GM atomic_add 的 layout 解码与 fp32→fp16/bfloat16、int32→int32 转换。
+- [x] ~~实现 L0C→GM atomic_add 的 layout 解码、有效尾块、GM stride，以及
+  fp32→fp32/fp16、int32→int32 转换。~~
+- [ ] 在 host bfloat16 表示与 layout codec 落地后补齐 L0C→GM atomic_add 的
+  fp32→bfloat16 路径。
 - [x] ~~对同一 GM region 的跨 core atomic 冲突提供确定性的 DAG 序列化，并在 trace 中
   验证前一原子写结束后下一写启动。~~
 - [ ] 实现 Persistent kernel 的 work distribution、residency 和 liveness 模型。
@@ -541,7 +548,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：367 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：374 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

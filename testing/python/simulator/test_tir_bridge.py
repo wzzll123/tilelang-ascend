@@ -230,6 +230,38 @@ def _l0c_to_gm_primfunc(enable_relu=True, unit_flag=0):
     )
 
 
+def _atomic_add_l0c_primfunc(
+    *, source_dtype="float32", destination_dtype="float16",
+    valid_rows=13, valid_cols=17,
+):
+    rows, cols = 16, 32
+    l0c = tvm.tir.decl_buffer(
+        (rows * cols,), source_dtype, name="l0c", scope="wmma.accumulator"
+    )
+    output = tvm.tir.decl_buffer(
+        (rows, cols), destination_dtype, name="output", scope="global"
+    )
+    dtype_names = {
+        "float16": "half", "float32": "float", "int32": "int",
+    }
+    atomic = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::atomic_add_l0c_to_gm<"
+        f"{dtype_names[source_dtype]}, {dtype_names[destination_dtype]}, "
+        f"layout::RowMajor, {rows}, {cols}>",
+        l0c.access_ptr("r"), output.access_ptr("w"), cols,
+        valid_rows, valid_cols,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(atomic), alloc_buffers=[l0c]
+    )
+    return tvm.tir.PrimFunc(
+        [output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
 def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0, cols=16):
     rows = 16
     a_elements = rows * ((inner + 15) // 16 * 16)
@@ -2805,6 +2837,49 @@ def test_real_tir_l0c_to_gm_executes_relu_tail_and_dtype_conversion() -> None:
 
     expected = np.maximum(logical[:13, :17], 0).astype(np.float16)
     np.testing.assert_array_equal(simulator.read(task.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize(
+    ("source_dtype", "destination_dtype"),
+    [("float32", "float32"), ("float32", "float16"), ("int32", "int32")],
+)
+def test_l0c_atomic_add_decodes_tail_converts_then_accumulates(
+    platform, source_dtype, destination_dtype
+) -> None:
+    program = build_kernel_program(
+        _atomic_add_l0c_primfunc(
+            source_dtype=source_dtype,
+            destination_dtype=destination_dtype,
+        ),
+        platform=platform,
+    )
+    task = program.tasks[0]
+    assert (task.operation, task.lane, task.pipe) == (
+        "atomic_add_l0c_to_gm", Lane.CUBE, Pipe.FIX,
+    )
+    assert task.metadata["accumulator"] == task.metadata["dst"]
+    logical = np.arange(16 * 32, dtype=np.dtype(source_dtype)).reshape(16, 32)
+    output = BufferRegion(
+        "output", MemoryScope.GM, (16, 32), destination_dtype
+    )
+    initial = np.full((16, 32), 2, dtype=np.dtype(destination_dtype))
+    simulator = FunctionalSimulator(program)
+    simulator.write(task.metadata["src"], pack_matrix(logical, "l0c"))
+    simulator.write(output, initial)
+    simulator.run()
+
+    expected = initial.copy()
+    expected[:13, :17] += logical[:13, :17].astype(destination_dtype)
+    np.testing.assert_array_equal(simulator.read(output), expected)
+
+
+def test_l0c_atomic_add_rejects_unsupported_dtype_pair() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="does not support"):
+        build_kernel_program(
+            _atomic_add_l0c_primfunc(destination_dtype="int32"),
+            platform="A3",
+        )
 
 
 def test_l0c_to_gm_rejects_unpaired_unit_flag() -> None:

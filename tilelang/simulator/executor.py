@@ -261,6 +261,9 @@ class FunctionalSimulator:
         if operation == "atomic_add_ub_to_gm":
             self._atomic_add(task)
             return
+        if operation == "atomic_add_l0c_to_gm":
+            self._atomic_add_l0c(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -818,6 +821,31 @@ class FunctionalSimulator:
         self.write(
             destination,
             destination_values + source_values,
+            task_core_id=task.core_id,
+        )
+
+    def _atomic_add_l0c(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        details = task.metadata.get("atomic")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"atomic task {task.task_id!r} requires atomic metadata"
+            )
+        logical = unpack_matrix(
+            self.read(source, task_core_id=task.core_id),
+            "l0c",
+            tuple(details["source_shape"]),
+        )
+        rows = _resolve_int(details["rows"], self.bindings)
+        cols = _resolve_int(details["cols"], self.bindings)
+        converted = logical[:rows, :cols].astype(
+            _numpy_dtype(destination.dtype)
+        )
+        previous = self.read(destination, task_core_id=task.core_id)
+        self.write(
+            destination,
+            previous + converted,
             task_core_id=task.core_id,
         )
 

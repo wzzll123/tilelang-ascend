@@ -823,6 +823,8 @@ class _TirBridge:
             return self._merge_sort_metadata(arguments, context)
         if short == "atomic_add_ub_to_gm":
             return self._atomic_add_ub_metadata(operation, arguments, context)
+        if short == "atomic_add_l0c_to_gm":
+            return self._atomic_add_l0c_metadata(operation, arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -1307,7 +1309,7 @@ class _TirBridge:
             raise UnsupportedSimOpError(
                 f"malformed copy_l0c_to_gm template {operation_tag!r}"
             )
-        if parameters[2] not in {"layout::rowmajor", "layout::row_major"}:
+        if parameters[2].lower() not in {"layout::rowmajor", "layout::row_major"}:
             raise UnsupportedSimOpError(
                 f"functional copy_l0c_to_gm requires RowMajor GM, got {parameters[2]!r}"
             )
@@ -2820,6 +2822,137 @@ class _TirBridge:
                 "cols": cols,
                 "stride": stride,
                 "source_scope": source.scope.value,
+            },
+        }
+
+    def _atomic_add_l0c_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Lowered DMA ABI: src, dst, GM row stride, valid rows, valid columns.
+        if len(arguments) != 5:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires five operands"
+            )
+        marker = "atomic_add_l0c_to_gm<"
+        marker_start = operation.find(marker)
+        if marker_start < 0 or not operation.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"malformed atomic_add_l0c_to_gm template {operation!r}"
+            )
+        parameters = [
+            part.strip()
+            for part in operation[marker_start + len(marker):-1].split(",")
+        ]
+        if len(parameters) != 5:
+            raise UnsupportedSimOpError(
+                f"malformed atomic_add_l0c_to_gm template {operation!r}"
+            )
+        if parameters[2].lower() not in {"layout::rowmajor", "layout::row_major"}:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires RowMajor GM"
+            )
+        try:
+            physical_rows, physical_cols = map(int, parameters[3:5])
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "atomic_add_l0c_to_gm requires static template extents"
+            ) from error
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:5]
+        )
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires static dimensions"
+            )
+        destination_cols, valid_rows, valid_cols = dimensions
+        if min(physical_rows, physical_cols, destination_cols) <= 0:
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm physical extents and GM stride must be positive"
+            )
+        if not (0 <= valid_rows <= physical_rows):
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm valid rows exceed the physical tile"
+            )
+        if not (0 <= valid_cols <= min(physical_cols, destination_cols)):
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm valid columns exceed the physical tile or GM stride"
+            )
+        source_name = self._access_ptr_data_name(arguments[0])
+        if source_name is None:
+            return {}
+        source_buffer = self.buffer_name_by_data_var.get(source_name)
+        if source_buffer is None:
+            return {}
+        source_spec = self.buffers[source_buffer]
+        source_capacity = storage_elements(
+            "l0c", (physical_rows, physical_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source_elements = storage_elements(
+            "l0c", (physical_rows, valid_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source = self._access_buffer_region(
+            arguments[0], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        destination = replace(
+            destination,
+            strides_bytes=(
+                destination_cols * dtype_size_bytes(destination.dtype),
+                dtype_size_bytes(destination.dtype),
+            ),
+        )
+        if source.scope is not MemoryScope.L0C or destination.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm requires L0C source and GM destination"
+            )
+        source_template_dtype = _ascend_template_dtype(parameters[0])
+        destination_template_dtype = _ascend_template_dtype(parameters[1])
+        if (
+            source_template_dtype != source.dtype
+            or destination_template_dtype != destination.dtype
+        ):
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm buffer dtypes disagree with its template"
+            )
+        dtype_pair = (source.dtype, destination.dtype)
+        if dtype_pair not in {
+            ("float32", "float32"), ("float32", "float16"),
+            ("int32", "int32"),
+        }:
+            raise UnsupportedSimOpError(
+                f"functional atomic_add_l0c_to_gm does not support {dtype_pair!r}"
+            )
+        source_bytes = source_capacity * dtype_size_bytes(source.dtype)
+        if not isinstance(source.byte_offset, int) or source.byte_offset % source_bytes:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires a tile-base-aligned source"
+            )
+        source_size = _buffer_size_bytes(source_spec)
+        if source_size is not None and source.byte_offset + source_bytes > source_size:
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm physical source tile exceeds its buffer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "accumulator": destination,
+            "atomic": {
+                "kind": "add",
+                "rows": valid_rows,
+                "cols": valid_cols,
+                "stride": destination_cols,
+                "source_scope": source.scope.value,
+                "source_shape": (physical_rows, valid_cols),
             },
         }
 
