@@ -1632,6 +1632,45 @@ def _reduce_primfunc(kind, axis, *, clear=True):
     )
 
 
+def _block_reduce_primfunc(kind, *, dtype="float16", mask=37):
+    source = tvm.tir.decl_buffer((256,), dtype, name="source", scope="global")
+    initial = tvm.tir.decl_buffer((16,), dtype, name="initial", scope="global")
+    output = tvm.tir.decl_buffer((16,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (256,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (16,), dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, 256),
+        copy("copy_gm_to_ub", initial, ub_output, 16),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_block_reduce_{kind}",
+            ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+            2, mask, 1, 1, 8,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, 16),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_source, ub_output]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, initial.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            source.data: source, initial.data: initial, output.data: output,
+        },
+    )
+
+
 def test_real_tir_primfunc_builds_program_and_local_buffer() -> None:
     program = build_kernel_program(copy_to_ub, platform="A2")
 
@@ -3260,6 +3299,60 @@ def test_real_tir_reduce_executes_both_axes(kind, reducer, axis) -> None:
         simulator.read(store.metadata["dst"]),
         reducer(values, axis=0 if axis == 0 else 1),
     )
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize(
+    ("kind", "reducer"),
+    [("sum", np.sum), ("max", np.max), ("min", np.min)],
+)
+def test_block_reduce_executes_masked_strided_repeats(dtype, kind, reducer) -> None:
+    mask = 37
+    program = build_kernel_program(
+        _block_reduce_primfunc(kind, dtype=dtype, mask=mask), platform="A2"
+    )
+    source_load, initial_load, reduction, store = program.tasks
+    itemsize = np.dtype(dtype).itemsize
+    elements_per_block = 32 // itemsize
+    active_blocks = (mask + elements_per_block - 1) // elements_per_block
+    assert reduction.operation == f"block_reduce_{kind}"
+    assert reduction.metadata["src"].shape == (2, active_blocks, elements_per_block)
+    assert reduction.metadata["src"].strides_bytes == (256, 32, itemsize)
+    assert reduction.metadata["dst"].shape == (2, active_blocks)
+    assert reduction.metadata["dst"].strides_bytes == (8 * itemsize, itemsize)
+    assert set(reduction.dependencies) == {
+        source_load.task_id, initial_load.task_id,
+    }
+    assert store.dependencies == (reduction.task_id,)
+
+    values = np.linspace(-8, 8, 256, dtype=np.float32).astype(dtype)
+    initial = np.full(16, -99, dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], values)
+    simulator.write(initial_load.metadata["src"], initial)
+    simulator.run()
+
+    expected = initial.copy()
+    for repeat in range(2):
+        for block_index in range(active_blocks):
+            active = min(
+                elements_per_block, mask - block_index * elements_per_block
+            )
+            start = repeat * 8 * elements_per_block + block_index * elements_per_block
+            block = values[start:start + active].astype(np.float32)
+            expected[repeat * 8 + block_index] = reducer(block)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_block_reduce_rejects_invalid_mask_and_dtype() -> None:
+    with pytest.raises(ProgramValidationError, match="mask must be in"):
+        build_kernel_program(
+            _block_reduce_primfunc("sum", mask=129), platform="A3"
+        )
+    with pytest.raises(UnsupportedSimOpError, match="only float16/float32"):
+        build_kernel_program(
+            _block_reduce_primfunc("max", dtype="int32", mask=32), platform="A2"
+        )
 
 
 @pytest.mark.parametrize("axis", [0, -1])

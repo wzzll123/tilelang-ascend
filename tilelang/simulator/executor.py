@@ -207,6 +207,9 @@ class FunctionalSimulator:
                 raise UnsupportedSimOpError(f"unsupported reduce kind {kind!r}")
             self._reduce(task, kind)
             return
+        if operation in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
+            self._block_reduce(task)
+            return
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
@@ -431,6 +434,34 @@ class FunctionalSimulator:
             )
         shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _block_reduce(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        values = self.read(source, task_core_id=task.core_id)
+        result = self.read(destination, task_core_id=task.core_id)
+        mask = _resolve_int(task.metadata.get("mask"), self.bindings)
+        elements_per_block = _resolve_int(
+            task.metadata.get("elements_per_block"), self.bindings
+        )
+        kind = task.metadata.get("reduce_kind")
+        for block_index in range(values.shape[1]):
+            active = min(elements_per_block, mask - block_index * elements_per_block)
+            if active <= 0:
+                continue
+            block = values[:, block_index, :active]
+            compute = block.astype(np.float32) if block.dtype == np.float16 else block
+            if kind == "reduce_sum":
+                result[:, block_index] = np.sum(compute, axis=1)
+            elif kind == "reduce_max":
+                result[:, block_index] = np.max(compute, axis=1)
+            elif kind == "reduce_min":
+                result[:, block_index] = np.min(compute, axis=1)
+            else:
+                raise UnsupportedSimOpError(
+                    f"functional block reduction does not support kind {kind!r}"
+                )
         self.write(destination, result, task_core_id=task.core_id)
 
     def _clamp(self, task: Task, operation: str) -> None:

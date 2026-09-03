@@ -753,6 +753,8 @@ class _TirBridge:
             return self._fill_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
+        if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
+            return self._block_reduce_metadata(short, arguments, context)
         if short == "copy_gm_to_l1_linear":
             return self._gm_to_l1_linear_metadata(arguments, context)
         if short == "copy_gm_to_l1":
@@ -2612,6 +2614,72 @@ class _TirBridge:
         if destination is None:
             return {}
         return {"dst": destination, "scalar": scalar}
+
+    def _block_reduce_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 7:
+            return {}
+        repeat, mask, dst_rep_stride, src_blk_stride, src_rep_stride = (
+            self._const_int(argument, context.environment)
+            for argument in arguments[2:]
+        )
+        controls = {
+            "repeat": repeat,
+            "mask": mask,
+            "dst_rep_stride": dst_rep_stride,
+            "src_blk_stride": src_blk_stride,
+            "src_rep_stride": src_rep_stride,
+        }
+        if any(value is None for value in controls.values()):
+            raise UnsupportedSimOpError(
+                "functional block reduction requires static repeat/mask/strides"
+            )
+        if repeat < 0 or mask < 0:
+            raise ProgramValidationError("block reduction repeat/mask must not be negative")
+        if any(value < 0 for value in (
+            dst_rep_stride, src_blk_stride, src_rep_stride
+        )):
+            raise ProgramValidationError("block reduction strides must not be negative")
+
+        destination_base = self._access_buffer_region(arguments[0], (1,), context)
+        source_base = self._access_buffer_region(arguments[1], (1,), context)
+        if destination_base is None or source_base is None:
+            return {}
+        if destination_base.dtype != source_base.dtype:
+            raise ProgramValidationError("block reduction source/destination dtype must match")
+        if source_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional block reduction supports only float16/float32"
+            )
+        itemsize = dtype_size_bytes(source_base.dtype)
+        elements_per_block = 32 // itemsize
+        vector_elements = 8 * elements_per_block
+        if mask > vector_elements:
+            raise ProgramValidationError(
+                f"block reduction mask must be in [0, {vector_elements}], got {mask}"
+            )
+        active_blocks = (mask + elements_per_block - 1) // elements_per_block
+        source = replace(
+            source_base,
+            shape=(repeat, active_blocks, elements_per_block),
+            strides_bytes=(src_rep_stride * 32, src_blk_stride * 32, itemsize),
+        )
+        destination = replace(
+            destination_base,
+            shape=(repeat, active_blocks),
+            strides_bytes=(dst_rep_stride * 8 * itemsize, itemsize),
+        )
+        return {
+            "dst": destination,
+            "src": source,
+            "reduce_kind": operation.removeprefix("block_"),
+            "elements_per_block": elements_per_block,
+            **controls,
+        }
 
     def _tail_reduce_metadata(
         self,
