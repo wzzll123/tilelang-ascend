@@ -234,6 +234,9 @@ class FunctionalSimulator:
         if operation == "topk":
             self._topk(task)
             return
+        if operation == "sort32":
+            self._sort32(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -699,6 +702,50 @@ class FunctionalSimulator:
         result[0::2] = values[order]
         result[1::2] = order
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _sort32(self, task: Task) -> None:
+        source = _operand(task, "src")
+        indices = _operand(task, "offsets")
+        destination = _operand(task, "dst")
+        repeat_times = _resolve_int(
+            task.metadata.get("repeat_times"), self.bindings
+        )
+        if not (1 <= repeat_times <= 255):
+            raise ProgramValidationError(
+                f"sort32 repeatTimes must be in [1, 255], got {repeat_times}"
+            )
+        source_values = self.read(
+            source, task_core_id=task.core_id
+        ).reshape(repeat_times, 32)
+        index_values = self.read(
+            indices, task_core_id=task.core_id
+        ).reshape(repeat_times, 32)
+        multiplier = _resolve_int(
+            task.metadata.get("output_multiplier"), self.bindings
+        )
+        result = np.zeros(
+            repeat_times * 32 * multiplier,
+            dtype=_numpy_dtype(destination.dtype),
+        ).reshape(repeat_times, 32, multiplier)
+        for repeat in range(repeat_times):
+            order = np.argsort(
+                -source_values[repeat].astype(np.float64), kind="stable"
+            )
+            result[repeat, :, 0] = source_values[repeat, order]
+            encoded_indices = np.ascontiguousarray(
+                index_values[repeat, order]
+            )
+            if destination.dtype == "float32":
+                result[repeat, :, 1] = encoded_indices.view(np.float32)
+            else:
+                result[repeat, :, 2:4] = encoded_indices.view(np.float16).reshape(
+                    32, 2
+                )
+        self.write(
+            destination,
+            result.reshape(-1),
+            task_core_id=task.core_id,
+        )
 
     def _block_reduce(self, task: Task) -> None:
         source = _operand(task, "src")

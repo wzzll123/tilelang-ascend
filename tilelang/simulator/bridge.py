@@ -815,6 +815,8 @@ class _TirBridge:
             return self._reinterpretcast_metadata(arguments, context)
         if short == "topk":
             return self._topk_metadata(arguments, context)
+        if short == "sort32":
+            return self._sort32_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2468,6 +2470,86 @@ class _TirBridge:
                 "max_actual_num": max_actual_num,
                 "repeat_times": repeat_times,
             },
+        }
+
+    def _sort32_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            raise UnsupportedSimOpError(
+                "functional sort32 requires dst, src, indices, and repeatTimes"
+            )
+        repeat_times = self._runtime_int(arguments[3], context.environment)
+        if repeat_times is None:
+            raise UnsupportedSimOpError("sort32 repeatTimes is not executable")
+        if isinstance(repeat_times, int) and not (1 <= repeat_times <= 255):
+            raise ProgramValidationError(
+                f"sort32 repeatTimes must be in [1, 255], got {repeat_times}"
+            )
+        count = _scale_runtime_int(repeat_times, 32)
+        source_extent = self._access_ptr_extent(arguments[1], context)
+        index_extent = self._access_ptr_extent(arguments[2], context)
+        destination_extent = self._access_ptr_extent(arguments[0], context)
+        if not all(
+            isinstance(extent, int)
+            for extent in (source_extent, index_extent, destination_extent)
+        ):
+            raise UnsupportedSimOpError(
+                "functional sort32 requires static pointer extents"
+            )
+        source_base = self._access_buffer_region(
+            arguments[1], (source_extent,), context
+        )
+        index_base = self._access_buffer_region(
+            arguments[2], (index_extent,), context
+        )
+        destination_base = self._access_buffer_region(
+            arguments[0], (destination_extent,), context
+        )
+        if source_base is None or index_base is None or destination_base is None:
+            return {}
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination_base, source_base, index_base)
+        ):
+            raise ProgramValidationError("sort32 requires UB operands")
+        if source_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional sort32 does not support dtype {source_base.dtype!r}"
+            )
+        if destination_base.dtype != source_base.dtype:
+            raise ProgramValidationError("sort32 source/destination dtypes must match")
+        if index_base.dtype not in {"int32", "uint32"}:
+            raise ProgramValidationError("sort32 indices must use int32 or uint32")
+        output_multiplier = 4 if source_base.dtype == "float16" else 2
+        if isinstance(count, int):
+            if source_extent < count or index_extent < count:
+                raise ProgramValidationError(
+                    "sort32 source/index extents must cover repeatTimes * 32"
+                )
+            if destination_extent < output_multiplier * count:
+                raise ProgramValidationError(
+                    "sort32 destination extent is too small for encoded output"
+                )
+        for label, region in (
+            ("destination", destination_base),
+            ("source", source_base),
+            ("index", index_base),
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"sort32 {label} pointer must be 32-byte aligned"
+                )
+        return {
+            "dst": replace(
+                destination_base, shape=(_scale_runtime_int(count, output_multiplier),)
+            ),
+            "src": replace(source_base, shape=(count,)),
+            "offsets": replace(index_base, shape=(count,)),
+            "repeat_times": repeat_times,
+            "output_multiplier": output_multiplier,
         }
 
     def _pow_metadata(

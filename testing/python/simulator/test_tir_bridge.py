@@ -1356,6 +1356,61 @@ def _topk_primfunc(
     )
 
 
+def _sort32_primfunc(*, dtype="float32", repeat_times=2, output_elements=None):
+    count = 64
+    multiplier = 4 if dtype == "float16" else 2
+    output_elements = output_elements or multiplier * count
+    source = tvm.tir.decl_buffer((count,), dtype, name="source", scope="global")
+    indices = tvm.tir.decl_buffer(
+        (count,), "uint32", name="indices", scope="global"
+    )
+    output = tvm.tir.decl_buffer(
+        (output_elements,), dtype, name="output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (count,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_indices = tvm.tir.decl_buffer(
+        (count,), "uint32", name="ub_indices", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (output_elements,), dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, extent):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), extent,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, count),
+        copy("copy_gm_to_ub", indices, ub_indices, count),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_sort32", ub_output.access_ptr("w"),
+            ub_source.access_ptr("r"), ub_indices.access_ptr("r"),
+            repeat_times,
+        )),
+        copy(
+            "copy_ub_to_gm", ub_output, output,
+            multiplier * 32 * repeat_times,
+        ),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body,
+        alloc_buffers=[ub_source, ub_indices, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, indices.data, output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            source.data: source,
+            indices.data: indices,
+            output.data: output,
+        },
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -3901,6 +3956,65 @@ def test_topk_validates_static_contract() -> None:
     with pytest.raises(ProgramValidationError, match="template dtype"):
         build_kernel_program(
             _topk_primfunc(template_dtype="half"), platform="A3"
+        )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_sort32_sorts_each_block_and_bitcasts_indices(platform, dtype) -> None:
+    program = build_kernel_program(_sort32_primfunc(dtype=dtype), platform=platform)
+    load_values, load_indices, sort32, store = program.tasks
+    assert sort32.operation == "sort32"
+    assert sort32.dependencies == tuple(
+        sorted((load_values.task_id, load_indices.task_id))
+    )
+    assert store.dependencies == (sort32.task_id,)
+
+    values = np.array(
+        list(range(32)) + [7, 9, 9, 1] + list(range(28)),
+        dtype=np.dtype(dtype),
+    )
+    indices = np.arange(100, 164, dtype=np.uint32)
+    simulator = FunctionalSimulator(program)
+    simulator.write(load_values.metadata["src"], values)
+    simulator.write(load_indices.metadata["src"], indices)
+    simulator.run()
+    encoded = simulator.read(store.metadata["dst"])
+
+    expected_orders = [
+        np.argsort(-values[offset:offset + 32].astype(np.float64), kind="stable")
+        for offset in (0, 32)
+    ]
+    expected_values = np.concatenate([
+        values[offset:offset + 32][order]
+        for offset, order in zip((0, 32), expected_orders)
+    ])
+    expected_indices = np.concatenate([
+        indices[offset:offset + 32][order]
+        for offset, order in zip((0, 32), expected_orders)
+    ])
+    multiplier = 4 if dtype == "float16" else 2
+    records = encoded.reshape(64, multiplier)
+    np.testing.assert_array_equal(records[:, 0], expected_values)
+    if dtype == "float32":
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(records[:, 1]).view(np.uint32),
+            expected_indices,
+        )
+    else:
+        np.testing.assert_array_equal(records[:, 1].view(np.uint16), 0)
+        np.testing.assert_array_equal(
+            np.ascontiguousarray(records[:, 2:4]).view(np.uint32).reshape(-1),
+            expected_indices,
+        )
+
+
+def test_sort32_validates_repeat_and_destination_extent() -> None:
+    with pytest.raises(ProgramValidationError, match="repeatTimes must be"):
+        build_kernel_program(_sort32_primfunc(repeat_times=0), platform="A2")
+    with pytest.raises(ProgramValidationError, match="destination extent"):
+        build_kernel_program(
+            _sort32_primfunc(output_elements=127), platform="A3"
         )
 
 

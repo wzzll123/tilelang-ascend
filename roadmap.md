@@ -11,7 +11,7 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 58%**。checkbox 裸计数约 68%，但未完成的完整
+- **完整 roadmap：约 59%**。checkbox 裸计数约 69%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
 - **可用功能模拟 MVP：约 94%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
@@ -185,6 +185,10 @@ topk 已支持 workspace 注入后的最终八参数 ABI、float16/float32、静
 静态或 runtime actual count；输出遵循降序交错 `(value, index)` 格式，重复值保持原始
 index 顺序，scratch 作为真实写 region 参与 dependency，并验证 repeat、extent、scope、
 dtype 和 runtime count。
+sort32 已对齐 TileLang 真机 golden 和 EasyASC A2 语义：每个 32 元素 block 独立稳定降序，
+float32 使用两槽 value/index-bitcast 编码，float16 使用四槽 value/reserved/index-low/
+index-high 编码；支持多个 repeat、int32/uint32 index，并验证 UB scope、32B 对齐、dtype、
+footprint 和 repeat 范围。
 transpose 已支持静态 rank-2 UB tile 的非方形转置和常用 B8/B16/B32 dtype，并验证
 source/destination shape 互换、dtype、scope、whole-buffer 和双维度 32B 对齐契约。
 reinterpretcast 已按零拷贝元数据操作实现：执行时将目标 UB allocation 重绑到源
@@ -262,13 +266,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `343 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `348 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 343 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 348 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -454,7 +458,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## P5：索引、排序与 TopK
 
 - [ ] 完成 gather、gather-mask 和 gatherb variants。
-- [ ] 实现 sort、sort32、init_sort_buf 和 merge_sort。
+- [x] ~~实现 sort32 的多 repeat 32-element block 排序、float16/float32 物理 value/index
+  编码、alignment/footprint/dtype validation 和 dependency。~~
+- [ ] 实现 sort、init_sort_buf 和 merge_sort。
 - [x] ~~实现 TopK 的最终 workspace ABI、静态/runtime actual count、float16/float32
   稳定降序 value/index 输出、dependency 和错误路径。~~
 - [ ] 验证重复值、稳定性/index 语义、奇数 valid count、动态 valid length 和 scratch
@@ -514,7 +520,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：343 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：348 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
