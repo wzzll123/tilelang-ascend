@@ -18,6 +18,7 @@ from tilelang.simulator import (  # noqa: E402
     ProgramValidationError,
     SymbolicInt,
     TimingProfile,
+    UninitializedMemoryError,
     UnsupportedSimOpError,
     build_kernel_program,
 )
@@ -1537,6 +1538,78 @@ def _merge_sort_primfunc(
             **{source.data: source for source in sources},
             output.data: output,
         },
+    )
+
+
+def _atomic_add_ub_primfunc(*, dtype="float32", rows=2, cols=None, stride=None):
+    cols = cols or (16 if dtype == "float16" else 8)
+    stride = stride or cols + 4
+    output = tvm.tir.decl_buffer(
+        (rows, stride), dtype, name="output", scope="global"
+    )
+    first = tvm.tir.decl_buffer(
+        (rows, cols), dtype, name="first", scope="shared.ub"
+    )
+    second = tvm.tir.decl_buffer(
+        (rows, cols), dtype, name="second", scope="shared.ub"
+    )
+    template_dtype = {"float16": "half", "float32": "float"}[dtype]
+
+    def fill(buffer, value):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_fill", buffer.access_ptr("w"), value,
+            rows * cols,
+        ))
+
+    def atomic(source):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            f"tl::ascend::atomic_add_ub_to_gm<{template_dtype}, {cols}, {rows}>",
+            source.access_ptr("r"), output.access_ptr("w"), stride, rows, cols,
+        ))
+
+    root = tvm.tir.Block(
+        [], [], [], "root",
+        tvm.tir.SeqStmt([
+            fill(first, 1), fill(second, 2), atomic(first), atomic(second),
+        ]),
+        alloc_buffers=[first, second],
+    )
+    return tvm.tir.PrimFunc(
+        [output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
+def _atomic_add_ub_multicore_primfunc(num_cores=2):
+    output = tvm.tir.decl_buffer((8,), "float32", name="output", scope="global")
+    source = tvm.tir.decl_buffer(
+        (1, 8), "float32", name="source", scope="shared.ub"
+    )
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_fill", source.access_ptr("w"), 1.0, 8,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl::ascend::atomic_add_ub_to_gm<float, 8, 1>",
+            source.access_ptr("r"), output.access_ptr("w"), 8, 1, 8,
+        )),
+    ])
+    root = tvm.tir.BlockRealize(
+        [], True,
+        tvm.tir.Block([], [], [], "root", body, alloc_buffers=[source]),
+    )
+    block_var = tvm.tir.Var("blockIdx.x", "int32")
+    thread_axis = tvm.tir.IterVar(
+        tvm.ir.Range(0, num_cores), block_var,
+        tvm.tir.IterVar.ThreadIndex, "blockIdx.x",
+    )
+    threaded = tvm.tir.AttrStmt(
+        thread_axis, "thread_extent", num_cores, root
+    )
+    return tvm.tir.PrimFunc(
+        [output.data], threaded, buffer_map={output.data: output}
     )
 
 
@@ -4263,6 +4336,68 @@ def test_merge_sort_rejects_bad_extent_and_unsorted_input() -> None:
     )
     with pytest.raises(ProgramValidationError, match="source0 is not descending"):
         simulator.run()
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_atomic_add_ub_accumulates_and_preserves_gm_stride(platform, dtype) -> None:
+    program = build_kernel_program(
+        _atomic_add_ub_primfunc(dtype=dtype), platform=platform
+    )
+    first_fill, second_fill, first_atomic, second_atomic = program.tasks
+    assert first_atomic.operation == "atomic_add_ub_to_gm"
+    assert first_atomic.pipe is Pipe.MTE3
+    assert first_atomic.dependencies == (first_fill.task_id,)
+    assert second_atomic.dependencies == tuple(
+        sorted((second_fill.task_id, first_atomic.task_id))
+    )
+    assert first_atomic.metadata["accumulator"] == first_atomic.metadata["dst"]
+
+    destination = first_atomic.metadata["dst"]
+    rows, cols = destination.shape
+    stride = first_atomic.metadata["atomic"]["stride"]
+    whole_output = BufferRegion(
+        destination.buffer, MemoryScope.GM, (rows, stride), destination.dtype
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        whole_output, np.zeros((rows, stride), dtype=np.dtype(dtype))
+    )
+    simulator.run()
+    result = simulator.read(whole_output)
+    np.testing.assert_array_equal(result[:, :cols], 3)
+    np.testing.assert_array_equal(result[:, cols:], 0)
+
+
+def test_atomic_add_ub_requires_initialized_destination_and_aligned_rows() -> None:
+    program = build_kernel_program(_atomic_add_ub_primfunc(), platform="A2")
+    with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+        FunctionalSimulator(program).run()
+    with pytest.raises(ProgramValidationError, match="32-byte aligned"):
+        build_kernel_program(
+            _atomic_add_ub_primfunc(cols=7), platform="A3"
+        )
+
+
+def test_atomic_add_ub_serializes_shared_gm_updates_across_cores() -> None:
+    program = build_kernel_program(
+        _atomic_add_ub_multicore_primfunc(), platform="A3"
+    )
+    assert tuple(core.core_id for core in program.cores) == (0, 1)
+    first_atomic = program.cores[0].tasks[1]
+    second_atomic = program.cores[1].tasks[1]
+    assert first_atomic.task_id in second_atomic.dependencies
+
+    output = BufferRegion("output", MemoryScope.GM, (8,), "float32")
+    simulator = FunctionalSimulator(program)
+    simulator.write(output, np.zeros(8, dtype=np.float32))
+    result = simulator.run()
+    np.testing.assert_array_equal(simulator.read(output), 2)
+    atomic_records = [
+        record for record in result.schedule.records
+        if record.operation == "atomic_add_ub_to_gm"
+    ]
+    assert atomic_records[1].start_cycle >= atomic_records[0].end_cycle
 
 
 @pytest.mark.parametrize("operation", ["leaky_relu", "axpy"])

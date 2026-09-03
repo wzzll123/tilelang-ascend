@@ -821,6 +821,8 @@ class _TirBridge:
             return self._sort_metadata(arguments, context)
         if short == "merge_sort":
             return self._merge_sort_metadata(arguments, context)
+        if short == "atomic_add_ub_to_gm":
+            return self._atomic_add_ub_metadata(operation, arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2745,6 +2747,81 @@ class _TirBridge:
                 raise ProgramValidationError("merge_sort scratch must use UB scope")
             metadata["scratch"] = scratch
         return metadata
+
+    def _atomic_add_ub_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Lowered DMA ABI: src, dst, GM row stride, valid rows, valid columns.
+        if len(arguments) != 5:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_ub_to_gm requires five operands"
+            )
+        stride = self._runtime_int(arguments[2], context.environment)
+        rows = self._runtime_int(arguments[3], context.environment)
+        cols = self._runtime_int(arguments[4], context.environment)
+        if any(value is None for value in (stride, rows, cols)):
+            raise UnsupportedSimOpError(
+                "atomic_add_ub_to_gm dimensions must be executable"
+            )
+        if all(isinstance(value, int) for value in (stride, rows, cols)):
+            if rows <= 0 or cols <= 0 or stride < cols:
+                raise ProgramValidationError(
+                    "atomic_add_ub_to_gm requires positive rows/cols and stride >= cols"
+                )
+        source = self._access_buffer_region(arguments[0], (rows, cols), context)
+        destination = self._access_buffer_region(
+            arguments[1], (rows, cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        destination = replace(
+            destination,
+            strides_bytes=(
+                _scale_runtime_int(stride, dtype_size_bytes(destination.dtype)),
+                dtype_size_bytes(destination.dtype),
+            ),
+        )
+        if source.scope is not MemoryScope.UB or destination.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm requires UB source and GM destination"
+            )
+        if source.dtype != destination.dtype:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm source/destination dtypes must match"
+            )
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_ub_to_gm currently supports float16/float32"
+            )
+        if isinstance(cols, int) and cols * dtype_size_bytes(source.dtype) % 32:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm row width must be 32-byte aligned"
+            )
+        tag = operation.rsplit("::", 1)[-1]
+        if "<" not in tag or not tag.endswith(">"):
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm requires a dtype template"
+            )
+        parameters = [part.strip() for part in tag.split("<", 1)[1][:-1].split(",")]
+        if not parameters or _ascend_template_dtype(parameters[0]) != destination.dtype:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm template dtype must match operands"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "accumulator": destination,
+            "atomic": {
+                "kind": "add",
+                "rows": rows,
+                "cols": cols,
+                "stride": stride,
+                "source_scope": source.scope.value,
+            },
+        }
 
     def _pow_metadata(
         self,

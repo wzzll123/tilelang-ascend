@@ -258,6 +258,9 @@ class FunctionalSimulator:
         if operation == "merge_sort":
             self._merge_sort(task)
             return
+        if operation == "atomic_add_ub_to_gm":
+            self._atomic_add(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -806,6 +809,17 @@ class FunctionalSimulator:
         result[0::2] = merged_values[order]
         result[1::2] = merged_indices[order]
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _atomic_add(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        source_values = self.read(source, task_core_id=task.core_id)
+        destination_values = self.read(destination, task_core_id=task.core_id)
+        self.write(
+            destination,
+            destination_values + source_values,
+            task_core_id=task.core_id,
+        )
 
     def _block_reduce(self, task: Task) -> None:
         source = _operand(task, "src")
