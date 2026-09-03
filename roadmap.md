@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 55%**。checkbox 裸计数约 65%，但未完成的完整
+- **完整 roadmap：约 56%**。checkbox 裸计数约 66%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 91%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 92%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -179,6 +179,8 @@ gather 已支持 flat UB source、int32/uint32 字节 offset、base address、po
 显式/隐藏 scratch；执行前验证 32B pointer alignment、元素对齐、dtype 和源索引范围。
 gatherb 已支持每 repeat 八个 32B DataBlock、目标 block/repeat stride 和连续 offset
 读取；静态/动态 repeat、模板 dtype、pointer/offset alignment 与源 block bounds 均验证。
+gather_mask 已支持七种 fixed pattern 的稳定压缩与 custom uint32 元素索引；destination
+未选尾部确定性清零，显式/隐藏 scratch、模板/dtype/capacity/source-bounds 均验证。
 transpose 已支持静态 rank-2 UB tile 的非方形转置和常用 B8/B16/B32 dtype，并验证
 source/destination shape 互换、dtype、scope、whole-buffer 和双维度 32B 对齐契约。
 pow 和 clamp/max/min 已支持普通与 scratch forms；pow 的 count 来自真实 access_ptr extent，
@@ -252,13 +254,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `323 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `332 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 323 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 332 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -338,6 +340,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   source-bounds、poison 和 dependency 语义。~~
 - [x] ~~实现 gatherb 的八个 32B block/repeat、目标 block/repeat stride、连续 offset、
   template/control/alignment/source-bounds validation、poison 和 dependency 语义。~~
+- [x] ~~实现 gather_mask 七种 fixed pattern 与 custom uint32 index 的稳定压缩、tail-zero、
+  scratch/template/dtype/capacity/source-bounds validation 和 dependency 语义。~~
 - [x] ~~实现静态 rank-2 UB transpose 的非方形 tile、常用 B8/B16/B32 dtype、shape/scope/
   alignment validation、poison 和 dependency 语义。~~
 - [x] ~~实现 pow 和 clamp/max/min 的普通与 scratch forms。~~
@@ -499,7 +503,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：323 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：332 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。

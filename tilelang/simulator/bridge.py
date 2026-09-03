@@ -799,6 +799,8 @@ class _TirBridge:
             return self._gather_metadata(arguments, context)
         if short == "gatherb":
             return self._gatherb_metadata(arguments, context)
+        if short == "gather_mask":
+            return self._gather_mask_metadata(arguments, context)
         if short == "transpose":
             return self._transpose_metadata(arguments, context)
         if short == "reduce":
@@ -2180,6 +2182,92 @@ class _TirBridge:
             "dst_repeat_stride": dst_repeat_stride,
             "elements_per_block": elements_per_block,
         }
+
+    def _gather_mask_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {4, 5}:
+            return {}
+        template = self._literal(arguments[0])
+        if not (
+            isinstance(template, str)
+            and template.startswith("GatherMask<")
+            and template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "gather_mask template must be GatherMask<dtype>"
+            )
+        destination_arg, source_arg, selector_arg = arguments[1:4]
+
+        def flat_region(pointer: Any) -> Optional[BufferRegion]:
+            data_name = self._access_ptr_data_name(pointer)
+            buffer_name = self.buffer_name_by_data_var.get(data_name or "")
+            if buffer_name is None:
+                return None
+            spec = self.buffers[buffer_name]
+            if spec.scope is not MemoryScope.UB:
+                raise ProgramValidationError("gather_mask operands must use UB scope")
+            if not all(isinstance(extent, int) for extent in spec.shape):
+                raise UnsupportedSimOpError(
+                    "functional gather_mask requires static buffer shapes"
+                )
+            elements = 1
+            for extent in spec.shape:
+                elements *= extent
+            return self._access_buffer_region(pointer, (elements,), context)
+
+        destination = flat_region(destination_arg)
+        source = flat_region(source_arg)
+        if destination is None or source is None:
+            return {}
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError(
+                "gather_mask source/destination dtypes must match"
+            )
+        template_dtype = _ascend_template_dtype(
+            template[len("GatherMask<"):-1]
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "gather_mask template dtype must match destination dtype"
+            )
+        if source.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional gather_mask does not support dtype {source.dtype!r}"
+            )
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        patterns = {"P0101", "P1010", "P0001", "P0010", "P0100", "P1000", "P1111"}
+        if isinstance(selector_arg, self.tir.StringImm):
+            pattern = self._literal(selector_arg)
+            if pattern not in patterns:
+                raise ProgramValidationError(
+                    f"unsupported gather_mask fixed pattern {pattern!r}"
+                )
+            metadata.update(mode="fixed", pattern=pattern)
+        else:
+            offsets = flat_region(selector_arg)
+            if offsets is None:
+                return {}
+            if offsets.dtype != "uint32":
+                raise ProgramValidationError(
+                    f"gather_mask custom indices must use uint32, got {offsets.dtype!r}"
+                )
+            if offsets.shape[0] > destination.shape[0]:
+                raise ProgramValidationError(
+                    "gather_mask destination is smaller than its custom index buffer"
+                )
+            metadata.update(mode="custom", offsets=offsets)
+        if len(arguments) == 5:
+            scratch = flat_region(arguments[4])
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
 
     def _transpose_metadata(
         self,

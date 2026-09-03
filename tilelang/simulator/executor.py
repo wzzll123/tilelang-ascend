@@ -211,6 +211,9 @@ class FunctionalSimulator:
         if operation == "gatherb":
             self._gatherb(task)
             return
+        if operation == "gather_mask":
+            self._gather_mask(task)
+            return
         if operation == "transpose":
             self._transpose(task)
             return
@@ -599,6 +602,50 @@ class FunctionalSimulator:
                 )
             blocks[index] = source_values[source_index:source_index + block_elements]
         self.write(destination, blocks, task_core_id=task.core_id)
+
+    def _gather_mask(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        source_values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        mode = task.metadata.get("mode")
+        if mode == "fixed":
+            pattern = task.metadata.get("pattern")
+            residues = {
+                "P0101": (0, 2),
+                "P1010": (1, 3),
+                "P0001": (0,),
+                "P0010": (1,),
+                "P0100": (2,),
+                "P1000": (3,),
+                "P1111": (0, 1, 2, 3),
+            }[pattern]
+            indices = np.flatnonzero(
+                np.isin(np.arange(source_values.size) % 4, residues)
+            )
+        elif mode == "custom":
+            offsets = _operand(task, "offsets")
+            indices = self.read(
+                offsets, task_core_id=task.core_id
+            ).reshape(-1).astype(np.int64)
+            invalid = indices >= source_values.size
+            if np.any(invalid):
+                bad = int(indices[np.flatnonzero(invalid)[0]])
+                raise ProgramValidationError(
+                    f"gather_mask source index out of range: {bad}"
+                )
+        else:
+            raise UnsupportedSimOpError(f"unsupported gather_mask mode {mode!r}")
+        result = np.zeros(destination.shape, dtype=source_values.dtype).reshape(-1)
+        if indices.size > result.size:
+            raise ProgramValidationError(
+                "gather_mask destination cannot hold all selected elements"
+            )
+        result[:indices.size] = source_values[indices]
+        self.write(
+            destination,
+            result.reshape(destination.shape),
+            task_core_id=task.core_id,
+        )
 
     def _transpose(self, task: Task) -> None:
         destination = _operand(task, "dst")

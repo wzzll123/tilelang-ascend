@@ -1147,6 +1147,76 @@ def _gatherb_primfunc(
     )
 
 
+def _gather_mask_primfunc(
+    *, dtype="float32", pattern="P0101", custom=False,
+    index_dtype="uint32", with_scratch=False,
+):
+    source_count = 32
+    destination_count = 8 if custom else source_count
+    source = tvm.tir.decl_buffer(
+        (source_count,), dtype, name="source", scope="global"
+    )
+    output = tvm.tir.decl_buffer(
+        (destination_count,), dtype, name="output", scope="global"
+    )
+    indices = tvm.tir.decl_buffer(
+        (8,), index_dtype, name="indices", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (source_count,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (destination_count,), dtype, name="ub_output", scope="shared.ub"
+    )
+    ub_indices = tvm.tir.decl_buffer(
+        (8,), index_dtype, name="ub_indices", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer((64,), "uint8", name="scratch", scope="shared.ub")
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    template_dtype = {
+        "float16": "half", "float32": "float", "int8": "int8_t",
+        "uint8": "uint8_t", "int16": "int16_t", "uint16": "uint16_t",
+        "int32": "int", "uint32": "uint32_t",
+    }[dtype]
+    selector = ub_indices.access_ptr("r") if custom else pattern
+    operation_arguments = [
+        f"GatherMask<{template_dtype}>",
+        ub_output.access_ptr("w"), ub_source.access_ptr("r"), selector,
+    ]
+    if with_scratch:
+        operation_arguments.append(scratch.access_ptr("w"))
+    statements = [copy("copy_gm_to_ub", source, ub_source, source_count)]
+    if custom:
+        statements.append(copy("copy_gm_to_ub", indices, ub_indices, 8))
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_gather_mask", *operation_arguments,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, destination_count),
+    ])
+    alloc_buffers = [ub_source, ub_output, ub_indices]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=alloc_buffers,
+    )
+    parameters = [source.data, output.data]
+    buffer_map = {source.data: source, output.data: output}
+    if custom:
+        parameters.insert(1, indices.data)
+        buffer_map[indices.data] = indices
+    return tvm.tir.PrimFunc(
+        parameters, tvm.tir.BlockRealize([], True, root), buffer_map=buffer_map
+    )
+
+
 def _transpose_primfunc(*, shape=(16, 32), dtype="float32", dst_shape=None):
     dst_shape = dst_shape or tuple(reversed(shape))
     source = tvm.tir.decl_buffer(shape, dtype, name="source", scope="global")
@@ -3517,6 +3587,82 @@ def test_gatherb_validates_control_and_offset_dtype() -> None:
         np.zeros(offset_load.metadata["src"].shape, dtype=np.uint32),
     )
     with pytest.raises(ProgramValidationError, match="must not exceed 255"):
+        simulator.run()
+
+
+@pytest.mark.parametrize(
+    ("pattern", "residues"),
+    [
+        ("P0101", (0, 2)),
+        ("P1010", (1, 3)),
+        ("P0001", (0,)),
+        ("P0010", (1,)),
+        ("P0100", (2,)),
+        ("P1000", (3,)),
+        ("P1111", (0, 1, 2, 3)),
+    ],
+)
+def test_gather_mask_fixed_patterns_compact_and_zero_tail(pattern, residues) -> None:
+    program = build_kernel_program(
+        _gather_mask_primfunc(pattern=pattern), platform="A2"
+    )
+    load, gather_mask, store = program.tasks
+    assert gather_mask.operation == "gather_mask"
+    assert gather_mask.dependencies == (load.task_id,)
+    assert store.dependencies == (gather_mask.task_id,)
+    values = np.arange(1, 33, dtype=np.float32)
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    selected = values[np.isin(np.arange(values.size) % 4, residues)]
+    expected = np.zeros_like(values)
+    expected[:selected.size] = selected
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_gather_mask_custom_indices_execute_with_scratch() -> None:
+    program = build_kernel_program(
+        _gather_mask_primfunc(dtype="int32", custom=True, with_scratch=True),
+        platform="A3",
+    )
+    source_load, index_load, gather_mask, store = program.tasks
+    assert set(gather_mask.dependencies) == {
+        source_load.task_id, index_load.task_id,
+    }
+    assert "scratch" in gather_mask.metadata
+    values = np.arange(32, dtype=np.int32) * 3
+    indices = np.array([1, 2, 2, 5, 4, 6, 7, 8], dtype=np.uint32)
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], values)
+    simulator.write(index_load.metadata["src"], indices)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), values[indices]
+    )
+
+
+def test_gather_mask_validates_pattern_indices_and_bounds() -> None:
+    with pytest.raises(ProgramValidationError, match="fixed pattern"):
+        build_kernel_program(
+            _gather_mask_primfunc(pattern="P0110"), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="must use uint32"):
+        build_kernel_program(
+            _gather_mask_primfunc(custom=True, index_dtype="int32"),
+            platform="A3",
+        )
+
+    program = build_kernel_program(
+        _gather_mask_primfunc(custom=True), platform="A2"
+    )
+    source_load, index_load, _, _ = program.tasks
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], np.arange(32, dtype=np.float32))
+    simulator.write(
+        index_load.metadata["src"],
+        np.array([0, 1, 2, 3, 4, 5, 6, 32], dtype=np.uint32),
+    )
+    with pytest.raises(ProgramValidationError, match="index out of range"):
         simulator.run()
 
 
