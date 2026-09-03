@@ -814,6 +814,49 @@ def _fill_primfunc(count=5, scalar=-3.5):
     )
 
 
+def _sequence_primfunc(
+    operation, *, dtype="int32", count=7, first=5, difference=-2,
+    template_dtype=None,
+):
+    output = tvm.tir.decl_buffer((12,), dtype, name="output", scope="global")
+    ub_output = tvm.tir.decl_buffer(
+        (12,), dtype, name="ub_output", scope="shared.ub"
+    )
+    dtype_names = {
+        "float16": "half", "float32": "float", "int16": "int16_t",
+        "int32": "int", "uint16": "uint16_t", "uint32": "uint32_t",
+    }
+    template_name = "CreateVecIndex" if operation == "createvecindex" else "ArithProgression"
+    arguments = [
+        f"{template_name}<{template_dtype or dtype_names[dtype]}>",
+        ub_output.access_ptr("w", offset=2), first,
+    ]
+    if operation == "arith_progression":
+        arguments.append(difference)
+    arguments.append(count)
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_{operation}", *arguments,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_ub_to_gm", ub_output.access_ptr("r", offset=2),
+            output.access_ptr("w", offset=1), count,
+        )),
+    ])
+    root = tvm.tir.Block([], [], [], "root", body, alloc_buffers=[ub_output])
+    parameters = [output.data]
+    for value in (count, first, difference):
+        if isinstance(value, tvm.tir.Var) and not any(
+            value.same_as(parameter) for parameter in parameters
+        ):
+            parameters.append(value)
+    return tvm.tir.PrimFunc(
+        parameters,
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
 def _scalar_vector_primfunc(operation):
     source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
     initial = tvm.tir.decl_buffer((5,), "float32", name="initial", scope="global")
@@ -2833,6 +2876,79 @@ def test_real_tir_fill_initializes_offset_region_and_builds_dependency() -> None
 def test_real_tir_fill_rejects_negative_count() -> None:
     with pytest.raises(ProgramValidationError, match="fill count must not be negative"):
         build_kernel_program(_fill_primfunc(count=-1), platform="A2")
+
+
+@pytest.mark.parametrize(
+    ("operation", "dtype", "first", "difference", "expected"),
+    [
+        ("arith_progression", "int32", 5, -2, [5, 3, 1, -1, -3, -5, -7]),
+        ("arith_progression", "float16", 0.5, 0.25,
+         [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]),
+        ("createvecindex", "uint16", 65534, 99, [65534, 65535, 0, 1, 2, 3, 4]),
+    ],
+)
+def test_sequence_intrinsics_execute_offset_region(
+    operation, dtype, first, difference, expected
+) -> None:
+    program = build_kernel_program(
+        _sequence_primfunc(
+            operation, dtype=dtype, first=first, difference=difference,
+        ),
+        platform="A2",
+    )
+    sequence, store = program.tasks
+    assert sequence.operation == operation
+    assert sequence.metadata["dst"].byte_offset == 2 * np.dtype(dtype).itemsize
+    assert sequence.metadata["count"] == 7
+    assert sequence.metadata["difference"] == (
+        1 if operation == "createvecindex" else difference
+    )
+    assert store.dependencies == (sequence.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), np.asarray(expected, dtype=dtype)
+    )
+
+
+def test_arith_progression_resolves_runtime_integer_scalars_and_count() -> None:
+    count = tvm.tir.Var("count", "int32")
+    first = tvm.tir.Var("first", "int32")
+    difference = tvm.tir.Var("difference", "int32")
+    program = build_kernel_program(
+        _sequence_primfunc(
+            "arith_progression", count=count, first=first, difference=difference,
+        ),
+        platform="A3",
+    )
+    sequence, store = program.tasks
+    assert sequence.metadata["count"] == AffineInt.variable("count")
+    assert sequence.metadata["first_value"] == AffineInt.variable("first")
+    assert sequence.metadata["difference"] == AffineInt.variable("difference")
+
+    simulator = FunctionalSimulator(
+        program, bindings={"count": 5, "first": -4, "difference": 3}
+    )
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.array([-4, -1, 2, 5, 8], dtype=np.int32),
+    )
+
+
+def test_sequence_intrinsics_reject_negative_count_and_dtype_mismatch() -> None:
+    with pytest.raises(ProgramValidationError, match="count must not be negative"):
+        build_kernel_program(
+            _sequence_primfunc("createvecindex", count=-1), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype must match"):
+        build_kernel_program(
+            _sequence_primfunc(
+                "arith_progression", dtype="float32", template_dtype="half"
+            ),
+            platform="A3",
+        )
 
 
 @pytest.mark.parametrize("operation", ["leaky_relu", "axpy"])

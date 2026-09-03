@@ -183,6 +183,9 @@ class FunctionalSimulator:
         if operation == "fill":
             self._fill(task)
             return
+        if operation in {"arith_progression", "createvecindex"}:
+            self._sequence(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -438,6 +441,18 @@ class FunctionalSimulator:
         shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _sequence(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        count = _resolve_int(task.metadata.get("count"), self.bindings)
+        first = _resolve_number(task.metadata.get("first_value"), self.bindings)
+        difference = _resolve_number(task.metadata.get("difference"), self.bindings)
+        values = first + difference * np.arange(count, dtype=np.int64)
+        self.write(
+            destination,
+            np.asarray(values, dtype=_numpy_dtype(destination.dtype)),
+            task_core_id=task.core_id,
+        )
 
     def _block_reduce(self, task: Task) -> None:
         source = _operand(task, "src")
@@ -763,3 +778,11 @@ def _resolve_int(value: Any, bindings: Mapping[str, int]) -> int:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     raise ProgramValidationError(f"simulator integer value is not executable: {value!r}")
+
+
+def _resolve_number(value: Any, bindings: Mapping[str, int]) -> Any:
+    if isinstance(value, (AffineInt, SymbolicInt)):
+        return value.evaluate(bindings)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    raise ProgramValidationError(f"simulator numeric value is not executable: {value!r}")

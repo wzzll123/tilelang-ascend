@@ -751,6 +751,8 @@ class _TirBridge:
             return self._cast_metadata(arguments, context)
         if short == "fill":
             return self._fill_metadata(arguments, context)
+        if short in {"arith_progression", "createvecindex"}:
+            return self._sequence_metadata(short, arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2642,6 +2644,65 @@ class _TirBridge:
         if destination is None:
             return {}
         return {"dst": destination, "scalar": scalar}
+
+    def _sequence_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        expected = 4 if operation == "createvecindex" else 5
+        if len(arguments) != expected:
+            return {}
+        template = self._literal(arguments[0])
+        if not isinstance(template, str) or "<" not in template or not template.endswith(">"):
+            return {}
+        template_dtype = _ascend_template_dtype(template.split("<", 1)[1][:-1].strip())
+        destination_arg = arguments[1]
+        first_arg = arguments[2]
+        if operation == "createvecindex":
+            difference: Any = 1
+            count_arg = arguments[3]
+        else:
+            difference = self._numeric_scalar(arguments[3], context)
+            count_arg = arguments[4]
+        first = self._numeric_scalar(first_arg, context)
+        count = self._runtime_int(count_arg, context.environment)
+        if first is None or difference is None or count is None:
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires executable scalar/count arguments"
+            )
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError(f"{operation} count must not be negative")
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        if destination is None:
+            return {}
+        if template_dtype is None or template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                f"{operation} template dtype must match destination dtype"
+            )
+        if destination.dtype not in {
+            "float16", "float32", "int16", "int32", "uint16", "uint32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional {operation} does not support dtype {destination.dtype!r}"
+            )
+        return {
+            "dst": destination,
+            "first_value": first,
+            "difference": difference,
+            "count": count,
+        }
+
+    def _numeric_scalar(self, value: Any, context: _Context) -> Any:
+        simplified = self.analyzer.simplify(value)
+        literal = self._literal(simplified)
+        if isinstance(literal, (int, float)) and not isinstance(literal, bool):
+            return literal
+        runtime = self._runtime_int(simplified, context.environment)
+        if isinstance(runtime, (int, AffineInt, SymbolicInt)):
+            return runtime
+        return None
 
     def _block_reduce_metadata(
         self,

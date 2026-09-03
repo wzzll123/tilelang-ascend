@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 48%**。checkbox 裸计数约 58%，但未完成的完整
+- **完整 roadmap：约 49%**。checkbox 裸计数约 59%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 83%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 84%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -161,6 +161,9 @@ cast 已贯通 `dst/src/round_mode/count` contract；当前执行 `CAST_NONE/RIN
 ROUND/TRUNC`，其中 ROUND 遵循 ties-away-from-zero；语义未充分确认的 CAST_ODD 明确拒绝。
 fill 已贯通原生 intrinsic 和等价 call_extern contract，支持 literal scalar、runtime
 count、pointer offset、poison 初始化和后续访问 dependency。
+createvecindex 和 arith_progression 已支持 pointer offset、float16/float32 与常用 16/32-bit
+整数 dtype；first/difference/count 可使用 runtime integer binding，结果按目标 dtype 执行
+转换和整数 wraparound，并验证 intrinsic template dtype。
 leaky_relu 已复用 scalar vector contract；axpy 将 destination 同时建模为 accumulator read
 和 output write，因而保留 read-before-write 与 RAW/WAR/WAW dependency。
 sigmoid、silu、sin 和 cos 已支持普通及显式/隐藏 scratch 签名；scratch 作为真实写 region
@@ -236,13 +239,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `270 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `275 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 270 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 275 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -308,6 +311,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   覆盖 float32→float16 和 float32→int32。~~
 - [x] ~~实现 fill 的 literal scalar、runtime count、pointer offset、poison 初始化和
   dependency 语义。~~
+- [x] ~~实现 createvecindex/arith_progression 的 offset、常用 dtype、runtime
+  first/difference/count、wraparound、dependency 和 template dtype 验证。~~
 - [x] ~~实现 leaky_relu 和 in-place accumulator 语义的 axpy。~~
 - [x] ~~实现 sigmoid、silu、sin、cos 的普通与 scratch forms。~~
 - [x] ~~实现 pow 和 clamp/max/min 的普通与 scratch forms。~~
@@ -469,7 +474,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：270 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：275 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -479,8 +484,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 对照 EasyASC `pipe_vec.py` 补齐剩余 mask/dtype variants；duplicate 等 TileLang ABI
-   落地后再接入，禁止按名称猜参数。
+1. 对照 EasyASC `pipe_vec.py` 补齐剩余 mask/dtype 和 bitwise/shift variants；duplicate
+   等 TileLang ABI 落地后再接入，禁止按名称猜参数。
 2. 实现其它 MMA dtype 与 quant/fixpipe variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。
