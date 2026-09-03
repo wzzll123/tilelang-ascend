@@ -217,6 +217,9 @@ class FunctionalSimulator:
         if operation == "transpose":
             self._transpose(task)
             return
+        if operation == "reinterpretcast":
+            self._reinterpretcast(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -655,6 +658,16 @@ class FunctionalSimulator:
             destination,
             np.ascontiguousarray(values.T),
             task_core_id=task.core_id,
+        )
+
+    def _reinterpretcast(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        self.memory.alias(
+            destination.buffer,
+            source.buffer,
+            scope=destination.scope,
+            core_id=task.core_id,
         )
 
     def _block_reduce(self, task: Task) -> None:

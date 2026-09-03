@@ -1254,6 +1254,54 @@ def _transpose_primfunc(*, shape=(16, 32), dtype="float32", dst_shape=None):
     )
 
 
+def _reinterpretcast_primfunc(*, destination_extent=8, cast_type="uint16_t"):
+    source = tvm.tir.decl_buffer((4,), "uint32", name="source", scope="global")
+    view_output = tvm.tir.decl_buffer(
+        (destination_extent,), "uint16", name="view_output", scope="global"
+    )
+    after_output = tvm.tir.decl_buffer(
+        (4,), "uint32", name="after_output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (4,), "uint32", name="ub_source", scope="shared.ub"
+    )
+    ub_view = tvm.tir.decl_buffer(
+        (destination_extent,), "uint16", name="ub_view", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, 4),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_reinterpretcast",
+            ub_view.access_ptr("w"), ub_source.access_ptr("r"), cast_type,
+        )),
+        copy("copy_ub_to_gm", ub_view, view_output, destination_extent),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_fill", ub_view.access_ptr("w"),
+            0x1234, destination_extent,
+        )),
+        copy("copy_ub_to_gm", ub_source, after_output, 4),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_source, ub_view]
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, view_output.data, after_output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            source.data: source,
+            view_output.data: view_output,
+            after_output.data: after_output,
+        },
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -3707,6 +3755,43 @@ def test_transpose_validates_shape_alignment_and_dtype() -> None:
     with pytest.raises(UnsupportedSimOpError, match="does not support dtype"):
         build_kernel_program(
             _transpose_primfunc(shape=(16, 16), dtype="bfloat16"), platform="A2"
+        )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_reinterpretcast_establishes_bidirectional_byte_alias(platform) -> None:
+    program = build_kernel_program(_reinterpretcast_primfunc(), platform=platform)
+    load, reinterpret, view_store, fill, after_store = program.tasks
+    assert reinterpret.operation == "reinterpretcast"
+    assert reinterpret.pipe is Pipe.SCALAR
+    assert reinterpret.dependencies == (load.task_id,)
+    assert reinterpret.task_id in view_store.dependencies
+    assert view_store.task_id in fill.dependencies
+    assert fill.task_id in after_store.dependencies
+
+    values = np.array(
+        [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00], dtype=np.uint32
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(view_store.metadata["dst"]), values.view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        simulator.read(after_store.metadata["dst"]),
+        np.full((4,), 0x12341234, dtype=np.uint32),
+    )
+
+
+def test_reinterpretcast_validates_byte_size_and_cast_type() -> None:
+    with pytest.raises(ProgramValidationError, match="byte sizes must match"):
+        build_kernel_program(
+            _reinterpretcast_primfunc(destination_extent=7), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="casttype must match"):
+        build_kernel_program(
+            _reinterpretcast_primfunc(cast_type="int16_t"), platform="A3"
         )
 
 

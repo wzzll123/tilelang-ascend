@@ -83,6 +83,7 @@ def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
         "set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
         "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
         "auto_wait_cross_flag", "barrier_all", "pipe_barrier", "auto_barrier",
+        "reinterpretcast",
     }:
         return lane, Pipe.SCALAR, short
     if "im2col" in short:
@@ -207,6 +208,7 @@ class _TirBridge:
         self.size_by_var: Dict[str, int] = {}
         self.last_writes: list[Tuple[BufferRegion, str]] = []
         self.last_reads: list[Tuple[BufferRegion, str]] = []
+        self.active_aliases: Dict[Tuple[MemoryScope, Optional[int], str], str] = {}
         self.task_counter = 0
         self.kernel_name = "main"
 
@@ -503,6 +505,12 @@ class _TirBridge:
             self._emit_gemm_v0_trace_tasks(operation, context, metadata)
             return
         self._emit_task(operation, context, metadata=metadata)
+        if _short_operation(operation) == "reinterpretcast":
+            destination = metadata.get("dst")
+            source = metadata.get("src")
+            if isinstance(destination, BufferRegion) and isinstance(source, BufferRegion):
+                owner = destination.core_id
+                self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
 
     def _emit_gemm_v0_trace_tasks(
         self, _operation: str, context: _Context, metadata: Mapping[str, Any]
@@ -803,6 +811,8 @@ class _TirBridge:
             return self._gather_mask_metadata(arguments, context)
         if short == "transpose":
             return self._transpose_metadata(arguments, context)
+        if short == "reinterpretcast":
+            return self._reinterpretcast_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2323,6 +2333,49 @@ class _TirBridge:
             )
         return {"dst": destination, "src": source}
 
+    def _reinterpretcast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 3:
+            return {}
+        destination_extent = self._access_ptr_extent(arguments[0], context)
+        source_extent = self._access_ptr_extent(arguments[1], context)
+        cast_type = self._literal(arguments[2])
+        if destination_extent is None or source_extent is None:
+            return {}
+        if not isinstance(cast_type, str):
+            raise ProgramValidationError("reinterpretcast casttype must be a string")
+        destination = self._access_buffer_region(
+            arguments[0], (destination_extent,), context
+        )
+        source = self._access_buffer_region(arguments[1], (source_extent,), context)
+        if destination is None or source is None:
+            return {}
+        if destination.scope is not MemoryScope.UB or source.scope is not MemoryScope.UB:
+            raise ProgramValidationError("reinterpretcast requires UB operands")
+        if destination.byte_offset != 0 or source.byte_offset != 0:
+            raise UnsupportedSimOpError(
+                "functional reinterpretcast currently requires whole-buffer operands"
+            )
+        destination_bytes = destination_extent * dtype_size_bytes(destination.dtype)
+        source_bytes = source_extent * dtype_size_bytes(source.dtype)
+        if destination_bytes != source_bytes:
+            raise ProgramValidationError(
+                "reinterpretcast source/destination byte sizes must match"
+            )
+        if _ascend_template_dtype(cast_type) != destination.dtype:
+            raise ProgramValidationError(
+                "reinterpretcast casttype must match destination dtype"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "alias_dst": destination.buffer,
+            "alias_src": source.buffer,
+        }
+
     def _pow_metadata(
         self,
         arguments: Tuple[Any, ...],
@@ -3525,9 +3578,11 @@ class _TirBridge:
         if left.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}:
             if left_owner != right_owner:
                 return False
-        left_spec = self.buffers[left.buffer]
-        right_spec = self.buffers[right.buffer]
-        if left.buffer == right.buffer:
+        left_buffer = self._resolve_active_alias(left, left_owner)
+        right_buffer = self._resolve_active_alias(right, right_owner)
+        left_spec = self.buffers[left_buffer]
+        right_spec = self.buffers[right_buffer]
+        if left_buffer == right_buffer:
             left_base = right_base = 0
         else:
             left_base = left_spec.address
@@ -3552,6 +3607,22 @@ class _TirBridge:
             right_base + right_bounds[0], right_base + right_bounds[1]
         )
         return left_start < right_end and right_start < left_end
+
+    def _resolve_active_alias(self, region: BufferRegion, owner: int) -> str:
+        current = region.buffer
+        seen = set()
+        alias_owner = (
+            None
+            if region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+            else owner
+        )
+        while current not in seen:
+            seen.add(current)
+            target = self.active_aliases.get((region.scope, alias_owner, current))
+            if target is None:
+                break
+            current = target
+        return current
 
     def _call_operation(self, call: Any) -> Tuple[str, Tuple[Any, ...]]:
         name = str(call.op.name)

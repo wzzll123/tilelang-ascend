@@ -176,6 +176,33 @@ def test_live_alias_requires_an_explicit_alias_relationship() -> None:
     assert alias_allocation.read(alias_allocation.view()) == b"5678"
 
 
+def test_runtime_alias_rebinds_a_logical_name_bidirectionally() -> None:
+    memory = MemoryRuntime((0,))
+    source = memory.allocate(
+        BufferSpec("source", MemoryScope.UB, (4,), "uint32"), core_id=0
+    )
+    memory.allocate(
+        BufferSpec("view", MemoryScope.UB, (8,), "uint16"), core_id=0
+    )
+
+    source.write(source.view(), bytes.fromhex("4433221188776655ccbbaa9900ffeedd"))
+    memory.alias("view", "source", scope=MemoryScope.UB, core_id=0)
+    view = memory.get("view", scope=MemoryScope.UB, core_id=0)
+    assert view.read(view.view(shape=(8,), dtype="uint16")) == source.read(source.view())
+
+    view.write(view.view(shape=(8,), dtype="uint16"), b"\x34\x12" * 8)
+    assert source.read(source.view()) == b"\x34\x12" * 8
+
+
+def test_runtime_alias_rejects_a_larger_destination() -> None:
+    memory = MemoryRuntime((0,))
+    memory.allocate(BufferSpec("small", MemoryScope.UB, (4,), "uint8"), core_id=0)
+    memory.allocate(BufferSpec("large", MemoryScope.UB, (8,), "uint8"), core_id=0)
+
+    with pytest.raises(MemoryBoundsError, match="requires 8 bytes"):
+        memory.alias("large", "small", scope=MemoryScope.UB, core_id=0)
+
+
 def test_program_uses_storage_rewrite_address() -> None:
     program = KernelProgram(
         "planned-address",

@@ -352,6 +352,31 @@ class MemoryRuntime:
                 f"unknown simulator allocation {name!r} in {scope.value} on core {owner}"
             ) from error
 
+    def alias(
+        self,
+        name: str,
+        target: str,
+        *,
+        scope: MemoryScope,
+        core_id: Optional[int] = None,
+    ) -> None:
+        """Rebind a logical buffer name to an existing physical allocation."""
+        owner = self._normalize_owner(scope, core_id)
+        key = (scope, owner, name)
+        target_key = (scope, owner, target)
+        if key not in self._allocations or target_key not in self._allocations:
+            raise MemoryAccessError(
+                f"cannot alias {name!r} to {target!r} in {scope.value} on core {owner}"
+            )
+        destination = self._allocations[key]
+        source = self._allocations[target_key]
+        if destination.size_bytes > source.size_bytes:
+            raise MemoryBoundsError(
+                f"alias {name!r} requires {destination.size_bytes} bytes, "
+                f"but {target!r} has {source.size_bytes} bytes"
+            )
+        self._allocations[key] = source
+
     def _normalize_owner(
         self, scope: MemoryScope, core_id: Optional[int]
     ) -> Optional[int]:
