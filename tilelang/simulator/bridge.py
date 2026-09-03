@@ -813,6 +813,8 @@ class _TirBridge:
             return self._transpose_metadata(arguments, context)
         if short == "reinterpretcast":
             return self._reinterpretcast_metadata(arguments, context)
+        if short == "topk":
+            return self._topk_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2374,6 +2376,98 @@ class _TirBridge:
             "src": source,
             "alias_dst": destination.buffer,
             "alias_src": source.buffer,
+        }
+
+    def _topk_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final post-workspace-injection ABI:
+        # template, dst, src, tmp, K, repeatTimes, actual_num, max_actual_num.
+        if len(arguments) != 8:
+            raise UnsupportedSimOpError(
+                "functional topk requires the final eight-argument ABI"
+            )
+        template = self._literal(arguments[0])
+        k = self._const_int(arguments[4], context.environment)
+        repeat_times = self._const_int(arguments[5], context.environment)
+        actual_num = self._runtime_int(arguments[6], context.environment)
+        max_actual_num = self._const_int(arguments[7], context.environment)
+        if not isinstance(template, str):
+            raise ProgramValidationError("topk template name must be a string")
+        if k is None or repeat_times is None or max_actual_num is None:
+            raise UnsupportedSimOpError(
+                "functional topk requires static K, repeatTimes, and max_actual_num"
+            )
+        if actual_num is None:
+            raise UnsupportedSimOpError("topk actual_num is not executable")
+        if k <= 0 or max_actual_num <= 0 or k > max_actual_num:
+            raise ProgramValidationError(
+                "topk requires 0 < K <= max_actual_num"
+            )
+        expected_repeats = (max_actual_num + 31) // 32
+        if repeat_times != expected_repeats:
+            raise ProgramValidationError(
+                f"topk repeatTimes must be {expected_repeats}, got {repeat_times}"
+            )
+        if isinstance(actual_num, int) and not (k <= actual_num <= max_actual_num):
+            raise ProgramValidationError(
+                f"topk actual_num must be in [{k}, {max_actual_num}], got {actual_num}"
+            )
+        destination_extent = self._access_ptr_extent(arguments[1], context)
+        source_extent = self._access_ptr_extent(arguments[2], context)
+        scratch_extent = self._access_ptr_extent(arguments[3], context)
+        extents = (destination_extent, source_extent, scratch_extent)
+        if not all(isinstance(extent, int) for extent in extents):
+            raise UnsupportedSimOpError(
+                "functional topk requires static pointer extents"
+            )
+        if destination_extent < 2 * k:
+            raise ProgramValidationError(
+                "topk destination must contain at least 2*K elements"
+            )
+        if source_extent < max_actual_num:
+            raise ProgramValidationError(
+                "topk source extent must cover max_actual_num"
+            )
+        if scratch_extent <= 0:
+            raise ProgramValidationError("topk scratch extent must be positive")
+        destination = self._access_buffer_region(arguments[1], (2 * k,), context)
+        source = self._access_buffer_region(arguments[2], (actual_num,), context)
+        scratch = self._access_buffer_region(
+            arguments[3], (scratch_extent,), context
+        )
+        if destination is None or source is None or scratch is None:
+            return {}
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination, source, scratch)
+        ):
+            raise ProgramValidationError("topk requires UB operands")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("topk source/destination dtypes must match")
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional topk does not support dtype {source.dtype!r}"
+            )
+        if not template.startswith("TopK<") or not template.endswith(">"):
+            raise ProgramValidationError("topk template must be TopK<dtype>")
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError("topk template dtype must match operands")
+        return {
+            "dst": destination,
+            "src": source,
+            "scratch": scratch,
+            "topk": {
+                "k": k,
+                "actual_num": actual_num,
+                "max_actual_num": max_actual_num,
+                "repeat_times": repeat_times,
+            },
         }
 
     def _pow_metadata(

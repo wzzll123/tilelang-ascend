@@ -114,19 +114,30 @@ class FunctionalSimulator:
     def _validate_runtime_contracts(self) -> None:
         for task in self.program.tasks:
             details = task.metadata.get("mma")
-            if not isinstance(details, Mapping):
-                continue
-            actual_cols = _resolve_int(details["n_actual"], self.bindings)
-            template_cols = _resolve_int(details["cols"], self.bindings)
-            if actual_cols <= 0 or actual_cols > template_cols:
-                raise ProgramValidationError(
-                    f"mma n_actual must be in [1, {template_cols}], got {actual_cols}"
+            if isinstance(details, Mapping):
+                actual_cols = _resolve_int(details["n_actual"], self.bindings)
+                template_cols = _resolve_int(details["cols"], self.bindings)
+                if actual_cols <= 0 or actual_cols > template_cols:
+                    raise ProgramValidationError(
+                        f"mma n_actual must be in [1, {template_cols}], got {actual_cols}"
+                    )
+                if actual_cols % 16:
+                    raise ProgramValidationError(
+                        "mma n_actual must be a multiple of 16, "
+                        f"got {actual_cols}"
+                    )
+            topk = task.metadata.get("topk")
+            if isinstance(topk, Mapping):
+                actual_num = _resolve_int(topk["actual_num"], self.bindings)
+                k = _resolve_int(topk["k"], self.bindings)
+                max_actual_num = _resolve_int(
+                    topk["max_actual_num"], self.bindings
                 )
-            if actual_cols % 16:
-                raise ProgramValidationError(
-                    "mma n_actual must be a multiple of 16, "
-                    f"got {actual_cols}"
-                )
+                if actual_num < k or actual_num > max_actual_num:
+                    raise ProgramValidationError(
+                        f"topk actual_num must be in [{k}, {max_actual_num}], "
+                        f"got {actual_num}"
+                    )
 
     def write(self, region: BufferRegion, values: Any, *, task_core_id: int = 0) -> None:
         """Initialize a concrete region from an array-like CPU value."""
@@ -219,6 +230,9 @@ class FunctionalSimulator:
             return
         if operation == "reinterpretcast":
             self._reinterpretcast(task)
+            return
+        if operation == "topk":
+            self._topk(task)
             return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
@@ -669,6 +683,22 @@ class FunctionalSimulator:
             scope=destination.scope,
             core_id=task.core_id,
         )
+
+    def _topk(self, task: Task) -> None:
+        source = _operand(task, "src")
+        destination = _operand(task, "dst")
+        details = task.metadata.get("topk")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"topk task {task.task_id!r} requires topk metadata"
+            )
+        k = _resolve_int(details["k"], self.bindings)
+        values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        order = np.argsort(-values.astype(np.float64), kind="stable")[:k]
+        result = np.empty(2 * k, dtype=_numpy_dtype(destination.dtype))
+        result[0::2] = values[order]
+        result[1::2] = order
+        self.write(destination, result, task_core_id=task.core_id)
 
     def _block_reduce(self, task: Task) -> None:
         source = _operand(task, "src")

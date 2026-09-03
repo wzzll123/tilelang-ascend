@@ -1302,6 +1302,60 @@ def _reinterpretcast_primfunc(*, destination_extent=8, cast_type="uint16_t"):
     )
 
 
+def _topk_primfunc(
+    *, dtype="float32", k=4, actual_num=7, max_actual_num=9,
+    repeat_times=None, destination_extent=None, template_dtype=None,
+):
+    aligned_count = ((max_actual_num + 31) // 32) * 32
+    repeat_times = repeat_times or aligned_count // 32
+    destination_extent = destination_extent or 2 * k
+    source = tvm.tir.decl_buffer(
+        (aligned_count,), dtype, name="source", scope="global"
+    )
+    output = tvm.tir.decl_buffer(
+        (destination_extent,), dtype, name="output", scope="global"
+    )
+    ub_source = tvm.tir.decl_buffer(
+        (aligned_count,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (destination_extent,), dtype, name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (aligned_count * 6,), dtype, name="scratch", scope="shared.ub"
+    )
+    dtype_name = template_dtype or {"float16": "half", "float32": "float"}[dtype]
+
+    def copy(name, source_buffer, destination_buffer, count):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), count,
+        ))
+
+    body = tvm.tir.SeqStmt([
+        copy("copy_gm_to_ub", source, ub_source, aligned_count),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_topk", f"TopK<{dtype_name}>",
+            ub_output.access_ptr("w"), ub_source.access_ptr("r"),
+            scratch.access_ptr("w"), k, repeat_times, actual_num,
+            max_actual_num,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, 2 * k),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body,
+        alloc_buffers=[ub_source, ub_output, scratch],
+    )
+    parameters = [source.data, output.data]
+    if isinstance(actual_num, tvm.tir.Var):
+        parameters.append(actual_num)
+    return tvm.tir.PrimFunc(
+        parameters,
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -3792,6 +3846,61 @@ def test_reinterpretcast_validates_byte_size_and_cast_type() -> None:
     with pytest.raises(ProgramValidationError, match="casttype must match"):
         build_kernel_program(
             _reinterpretcast_primfunc(cast_type="int16_t"), platform="A3"
+        )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_topk_executes_stable_interleaved_value_index_output(platform, dtype) -> None:
+    program = build_kernel_program(_topk_primfunc(dtype=dtype), platform=platform)
+    load, topk, store = program.tasks
+    assert topk.operation == "topk"
+    assert topk.pipe is Pipe.VECTOR
+    assert topk.dependencies == (load.task_id,)
+    assert store.dependencies == (topk.task_id,)
+    assert topk.metadata["scratch"].scope is MemoryScope.UB
+
+    values = np.array(
+        [3, 8, 8, -2, 11, 1, 7] + [1000] * 25,
+        dtype=np.dtype(dtype),
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    expected = np.array([11, 4, 8, 1, 8, 2, 7, 6], dtype=np.dtype(dtype))
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_topk_resolves_runtime_actual_num() -> None:
+    actual_num = tvm.tir.Var("actual_num", "int32")
+    program = build_kernel_program(
+        _topk_primfunc(k=3, actual_num=actual_num, max_actual_num=12),
+        platform="A3",
+    )
+    load, topk, store = program.tasks
+    assert isinstance(topk.metadata["topk"]["actual_num"], AffineInt)
+    values = np.array([2, 9, 4, 8, 5] + [100] * 27, dtype=np.float32)
+    simulator = FunctionalSimulator(program, bindings={"actual_num": 5})
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]),
+        np.array([9, 1, 8, 3, 5, 4], dtype=np.float32),
+    )
+    with pytest.raises(ProgramValidationError, match=r"must be in \[3, 12\]"):
+        FunctionalSimulator(program, bindings={"actual_num": 2})
+
+
+def test_topk_validates_static_contract() -> None:
+    with pytest.raises(ProgramValidationError, match="repeatTimes must be"):
+        build_kernel_program(_topk_primfunc(repeat_times=2), platform="A2")
+    with pytest.raises(ProgramValidationError, match=r"at least 2\*K"):
+        build_kernel_program(
+            _topk_primfunc(destination_extent=7), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype"):
+        build_kernel_program(
+            _topk_primfunc(template_dtype="half"), platform="A3"
         )
 
 
