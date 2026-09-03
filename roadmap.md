@@ -11,7 +11,7 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 63%**。checkbox 裸计数约 72%，但未完成的完整
+- **完整 roadmap：约 64%**。checkbox 裸计数约 72%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
 - **可用功能模拟 MVP：约 98%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
@@ -247,7 +247,8 @@ L0C region、有效列数一致的 MMA release 配对，fixpipe source footprint
 整条功能模拟路径不调用 BiSheng。显式 MMA 已支持静态、16 列粒度的 partial `n_actual`，
 并将 L0B/L0C footprint 收窄到有效列；还支持 MMA `0b10` hold、累加 MMA `0b11`
 release、fixpipe `0b11` consume 的配对链，pair task id/role 会进入 trace metadata。
-bias 和其它 dtype 仍 fail-closed。整数 `BufferLoad` 形式的 `n_actual` 会保留为稳定绑定名
+bias、bf16/fp32 input 等其它 dtype 仍 fail-closed。整数 `BufferLoad` 形式的 `n_actual`
+会保留为稳定绑定名
 （如 `nact[0]`），在 `FunctionalSimulator(bindings=...)` 创建时解析并检查范围和对齐。
 高层 half→float32 `gemm_v0` 也可直接执行，支持 A/B transpose、K-tail、init/accumulate，
 并已打通 GM→L1→gemm_v0→L0C→GM，同时复现模板的 kL0Size、N tiling 和 L0A/L0B slot
@@ -262,6 +263,10 @@ timing key、transfer bytes/math ops 和 MTE1↔M event annotation；周期仍�
 只加载/计算 16 列对齐的输出前缀，并在多 K tile 下保持正确 zN stride 和 L0C 累加；
 非 transpose-B partial-N 仍拒绝；transpose-B 的整数 `BufferLoad n_actual` 已支持，并让
 符号 L1→L0B、MMA 和 L0C footprint 在运行时使用同一个绑定值。
+显式 `mma` 与高层 `gemm_v0` 还支持仓库已有真机 contract 的 int8×int8→int32 路径；
+layout codec 按 32B C0 自动采用 int8 的 32-element K block，执行使用 int32 matmul 与
+累加。测试覆盖 A2/A3、K-tail、init/accumulate、transpose，以及多 K-stage 的 L1 source
+window 与 L0A/L0B ping-pong 展开，并对非法 int8 accumulator dtype 保持 fail closed。
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
@@ -282,13 +287,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `374 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `387 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 374 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 387 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -447,7 +452,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   收窄 L0B/L0C footprint，并覆盖 init/accumulate 与多 K tile。~~
 - [x] ~~实现 explicit MMA 与 transpose-B `gemm_v0` 的整数 BufferLoad `n_actual`，通过
   simulator bindings 解析符号 footprint，并在执行前校验范围和 16 列粒度。~~
-- [ ] 实现其它 MMA dtype。
+- [x] ~~实现显式 `mma` 与高层 `gemm_v0` 的 int8×int8→int32 功能路径，覆盖 K-tail、
+  init/accumulate、transpose 和多 K-stage 展开。~~
+- [ ] 实现 bf16/fp32 input 等其它硬件支持的 MMA dtype，并明确各模式的精度语义。
 - [x] ~~实现 MMA/fixpipe `unitFlag` 配对协议，覆盖 `0b10` hold、`0b11` release/consume、
   partial-N source footprint、同 L0C region/列数校验和 trace pair metadata。~~
 - [ ] 实现 quant、非 RowMajor 输出和其它 fixpipe variants。
@@ -548,7 +555,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：374 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：387 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -559,6 +566,6 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 下一批工作
 
 1. 修复/确认 init_sort_buf ABI，并补齐排序族的 float16 merge、offset、NaN 和边界语义。
-2. 实现其它 MMA dtype 与 quant/fixpipe variants。
+2. 实现 bf16/fp32 input MMA 与 quant/fixpipe variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

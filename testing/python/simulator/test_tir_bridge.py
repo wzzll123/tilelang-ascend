@@ -22,7 +22,11 @@ from tilelang.simulator import (  # noqa: E402
     UnsupportedSimOpError,
     build_kernel_program,
 )
-from tilelang.simulator.layout import pack_matrix, unpack_matrix  # noqa: E402
+from tilelang.simulator.layout import (  # noqa: E402
+    pack_matrix,
+    storage_elements,
+    unpack_matrix,
+)
 
 
 @T.prim_func
@@ -262,22 +266,35 @@ def _atomic_add_l0c_primfunc(
     )
 
 
-def _mma_primfunc(init=True, inner=13, n_actual=None, unit_flag=0, cols=16):
+def _mma_primfunc(
+    init=True, inner=13, n_actual=None, unit_flag=0, cols=16,
+    input_dtype="float16", accumulator_dtype="float32",
+):
     rows = 16
-    a_elements = rows * ((inner + 15) // 16 * 16)
-    b_elements = ((inner + 15) // 16 * 16) * cols
-    c_elements = rows * cols
+    a_elements = storage_elements(
+        "l0a", (rows, inner), np.dtype(input_dtype).itemsize
+    )
+    b_elements = storage_elements(
+        "l0b", (inner, cols), np.dtype(input_dtype).itemsize
+    )
+    c_elements = storage_elements(
+        "l0c", (rows, cols), np.dtype(accumulator_dtype).itemsize
+    )
     l0a = tvm.tir.decl_buffer(
-        (a_elements,), "float16", name="l0a", scope="wmma.matrix_a"
+        (a_elements,), input_dtype, name="l0a", scope="wmma.matrix_a"
     )
     l0b = tvm.tir.decl_buffer(
-        (b_elements,), "float16", name="l0b", scope="wmma.matrix_b"
+        (b_elements,), input_dtype, name="l0b", scope="wmma.matrix_b"
     )
     l0c = tvm.tir.decl_buffer(
-        (c_elements,), "float32", name="l0c", scope="wmma.accumulator"
+        (c_elements,), accumulator_dtype, name="l0c", scope="wmma.accumulator"
     )
+    input_token = {"float16": "half", "int8": "int8_t"}[input_dtype]
+    accumulator_token = {"float32": "float", "int32": "int"}[
+        accumulator_dtype
+    ]
     arguments = [
-        f"mma<half, float, 16, {cols}>",
+        f"mma<{input_token}, {accumulator_token}, 16, {cols}>",
         l0a.access_ptr("r"),
         l0b.access_ptr("r"),
         l0c.access_ptr("w" if init else "rw"),
@@ -415,29 +432,36 @@ def _mma_fixpipe_primfunc(
 def _gemm_v0_primfunc(
     transpose_a=False, transpose_b=False, init=True, n_actual=None,
     k_l0_size=16, inner=13, rows=16, cols=16,
+    input_dtype="float16", accumulator_dtype="float32",
 ):
     shape_a = (inner, rows) if transpose_a else (rows, inner)
     shape_b = (cols, inner) if transpose_b else (inner, cols)
-    a_elements = ((shape_a[0] + 15) // 16 * 16) * (
-        (shape_a[1] + 15) // 16 * 16
+    a_elements = storage_elements(
+        "zn", shape_a, np.dtype(input_dtype).itemsize
     )
-    b_elements = ((shape_b[0] + 15) // 16 * 16) * (
-        (shape_b[1] + 15) // 16 * 16
+    b_elements = storage_elements(
+        "zn", shape_b, np.dtype(input_dtype).itemsize
     )
-    c_elements = ((rows + 15) // 16 * 16) * ((cols + 15) // 16 * 16)
+    c_elements = storage_elements(
+        "l0c", (rows, cols), np.dtype(accumulator_dtype).itemsize
+    )
     l1a = tvm.tir.decl_buffer(
-        (a_elements,), "float16", name="l1a", scope="shared.l1"
+        (a_elements,), input_dtype, name="l1a", scope="shared.l1"
     )
     l1b = tvm.tir.decl_buffer(
-        (b_elements,), "float16", name="l1b", scope="shared.l1"
+        (b_elements,), input_dtype, name="l1b", scope="shared.l1"
     )
     l0c = tvm.tir.decl_buffer(
-        (c_elements,), "float32", name="l0c", scope="wmma.accumulator"
+        (c_elements,), accumulator_dtype, name="l0c", scope="wmma.accumulator"
     )
+    input_token = {"float16": "half", "int8": "int8_t"}[input_dtype]
+    accumulator_token = {"float32": "float", "int32": "int"}[
+        accumulator_dtype
+    ]
     call = tvm.tir.call_extern(
         "handle",
         "tl.ascend_gemm_v0",
-        f"gemm_v0<half, float, {rows}, {cols}, {inner}, "
+        f"gemm_v0<{input_token}, {accumulator_token}, {rows}, {cols}, {inner}, "
         f"{str(transpose_a).lower()}, {str(transpose_b).lower()}, {k_l0_size}>",
         l1a.access_ptr("r"),
         l1b.access_ptr("r"),
@@ -3006,6 +3030,47 @@ def test_real_tir_mma_executes_k_tail_and_accumulation(initialize) -> None:
     )
 
 
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("initialize", [True, False])
+def test_real_tir_mma_executes_int8_to_int32(platform, initialize) -> None:
+    program = build_kernel_program(
+        _mma_primfunc(
+            init=initialize,
+            inner=35,
+            input_dtype="int8",
+            accumulator_dtype="int32",
+        ),
+        platform=platform,
+    )
+    task = program.tasks[0]
+    simulator = FunctionalSimulator(program)
+    left = (np.arange(16 * 35).reshape(16, 35) % 11 - 5).astype(np.int8)
+    right = (np.arange(35 * 16).reshape(35, 16) % 13 - 6).astype(np.int8)
+    simulator.write(task.metadata["lhs"], pack_matrix(left, "l0a"))
+    simulator.write(task.metadata["rhs"], pack_matrix(right, "l0b"))
+    expected = left.astype(np.int32) @ right.astype(np.int32)
+    if not initialize:
+        previous = np.arange(16 * 16, dtype=np.int32).reshape(16, 16)
+        simulator.write(
+            task.metadata["accumulator"], pack_matrix(previous, "l0c")
+        )
+        expected += previous
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        unpack_matrix(simulator.read(task.metadata["dst"]), "l0c", (16, 16)),
+        expected,
+    )
+
+
+def test_mma_rejects_unsupported_int8_accumulator_dtype() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="int8-to-int32"):
+        build_kernel_program(
+            _mma_primfunc(input_dtype="int8", accumulator_dtype="float32"),
+            platform="A2",
+        )
+
+
 @pytest.mark.parametrize("initialize", [True, False])
 def test_real_tir_mma_executes_partial_n_actual(initialize) -> None:
     program = build_kernel_program(
@@ -3151,6 +3216,57 @@ def test_real_tir_gemm_v0_executes_transpose_and_accumulation(
         expected,
         rtol=1e-6,
         atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("transpose_a,transpose_b", [(False, False), (True, True)])
+@pytest.mark.parametrize("initialize", [True, False])
+def test_gemm_v0_int8_to_int32_expands_k_tail(
+    platform, transpose_a, transpose_b, initialize
+) -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(
+        transpose_a=transpose_a,
+        transpose_b=transpose_b,
+        init=initialize,
+        inner=61,
+        k_l0_size=32,
+        input_dtype="int8",
+        accumulator_dtype="int32",
+    )
+    program = build_kernel_program(prim_func, platform=platform)
+    assert [task.operation for task in program.tasks] == [
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+        "copy_l1_to_l0a", "copy_l1_to_l0b", "mma",
+    ]
+    left = (np.arange(np.prod(shape_a)).reshape(shape_a) % 11 - 5).astype(np.int8)
+    right = (np.arange(np.prod(shape_b)).reshape(shape_b) % 13 - 6).astype(np.int8)
+    packed_left = pack_matrix(left, "zn")
+    packed_right = pack_matrix(right, "zn")
+    output = BufferRegion(
+        "l0c", MemoryScope.L0C,
+        (storage_elements("l0c", (16, 16), 4),), "int32",
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        BufferRegion("l1a", MemoryScope.L1, packed_left.shape, "int8"),
+        packed_left,
+    )
+    simulator.write(
+        BufferRegion("l1b", MemoryScope.L1, packed_right.shape, "int8"),
+        packed_right,
+    )
+    expected = (left.T if transpose_a else left).astype(np.int32) @ (
+        right.T if transpose_b else right
+    ).astype(np.int32)
+    if not initialize:
+        previous = np.arange(16 * 16, dtype=np.int32).reshape(16, 16)
+        simulator.write(output, pack_matrix(previous, "l0c"))
+        expected += previous
+    simulator.run()
+
+    np.testing.assert_array_equal(
+        unpack_matrix(simulator.read(output), "l0c", (16, 16)), expected
     )
 
 

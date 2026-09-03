@@ -1498,9 +1498,12 @@ class _TirBridge:
 
         input_dtype = _ascend_template_dtype(parameters[0])
         accumulator_dtype = _ascend_template_dtype(parameters[1])
-        if (input_dtype, accumulator_dtype) != ("float16", "float32"):
+        if (input_dtype, accumulator_dtype) not in {
+            ("float16", "float32"),
+            ("int8", "int32"),
+        }:
             raise UnsupportedSimOpError(
-                "functional mma currently supports half inputs and float accumulation"
+                "functional mma supports half-to-float and int8-to-int32"
             )
         a_elements = storage_elements(
             "l0a", (rows, inner), dtype_size_bytes(input_dtype)
@@ -1716,9 +1719,12 @@ class _TirBridge:
 
         input_dtype = _ascend_template_dtype(parameters[0])
         accumulator_dtype = _ascend_template_dtype(parameters[1])
-        if (input_dtype, accumulator_dtype) != ("float16", "float32"):
+        if (input_dtype, accumulator_dtype) not in {
+            ("float16", "float32"),
+            ("int8", "int32"),
+        }:
             raise UnsupportedSimOpError(
-                "functional gemm_v0 currently supports half inputs and float accumulation"
+                "functional gemm_v0 supports half-to-float and int8-to-int32"
             )
         input_bytes = dtype_size_bytes(input_dtype)
         max_n_by_l0b = (32 * 1024) // (k_l0_size * input_bytes)

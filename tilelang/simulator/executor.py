@@ -451,7 +451,10 @@ class FunctionalSimulator:
         b_values = unpack_matrix(
             self.read(right, task_core_id=task.core_id), "l0b", shape_b
         )
-        result = np.matmul(a_values.astype(np.float32), b_values.astype(np.float32))
+        compute_dtype = _numpy_dtype(destination.dtype)
+        result = np.matmul(
+            a_values.astype(compute_dtype), b_values.astype(compute_dtype)
+        )
         if not details["init"]:
             accumulator = _operand(task, "accumulator")
             previous = unpack_matrix(
@@ -460,7 +463,7 @@ class FunctionalSimulator:
             result = previous + result
         self.write(
             destination,
-            pack_matrix(result.astype(np.float32), "l0c"),
+            pack_matrix(result.astype(compute_dtype), "l0c"),
             task_core_id=task.core_id,
         )
 
@@ -483,7 +486,10 @@ class FunctionalSimulator:
             a_values = a_values.T
         if details["transpose_b"]:
             b_values = b_values.T
-        result = np.matmul(a_values.astype(np.float32), b_values.astype(np.float32))
+        compute_dtype = _numpy_dtype(destination.dtype)
+        result = np.matmul(
+            a_values.astype(compute_dtype), b_values.astype(compute_dtype)
+        )
         if not details["init"]:
             accumulator = _operand(task, "accumulator")
             previous = unpack_matrix(
@@ -494,7 +500,7 @@ class FunctionalSimulator:
             result = previous + result
         self.write(
             destination,
-            pack_matrix(result.astype(np.float32), "l0c"),
+            pack_matrix(result.astype(compute_dtype), "l0c"),
             task_core_id=task.core_id,
         )
 
