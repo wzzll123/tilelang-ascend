@@ -1468,6 +1468,78 @@ def _sort_primfunc(
     )
 
 
+def _merge_sort_primfunc(
+    num_ways=2, *, with_scratch=False, destination_extent=None, block_length=4,
+):
+    source_extent = 2 * block_length
+    destination_extent = destination_extent or num_ways * source_extent
+    sources = [
+        tvm.tir.decl_buffer(
+            (source_extent,), "float32", name=f"source{index}", scope="global"
+        )
+        for index in range(num_ways)
+    ]
+    output = tvm.tir.decl_buffer(
+        (num_ways * source_extent,), "float32", name="output", scope="global"
+    )
+    ub_sources = [
+        tvm.tir.decl_buffer(
+            (source_extent,), "float32", name=f"ub_source{index}",
+            scope="shared.ub",
+        )
+        for index in range(num_ways)
+    ]
+    ub_output = tvm.tir.decl_buffer(
+        (destination_extent,), "float32", name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (num_ways * source_extent * 4,), "uint8", name="scratch",
+        scope="shared.ub",
+    )
+
+    def copy(name, source_buffer, destination_buffer, extent):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), extent,
+        ))
+
+    arguments = [
+        "MergeSort<float>", num_ways, ub_output.access_ptr("w"),
+    ]
+    if with_scratch:
+        arguments.append(scratch.access_ptr("w"))
+    arguments.extend(source.access_ptr("r") for source in ub_sources)
+    arguments.extend([block_length] * num_ways)
+    statements = [
+        copy("copy_gm_to_ub", source, ub_source, source_extent)
+        for source, ub_source in zip(sources, ub_sources)
+    ]
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_merge_sort", *arguments,
+        )),
+        copy(
+            "copy_ub_to_gm", ub_output, output,
+            num_ways * source_extent,
+        ),
+    ])
+    alloc_buffers = [*ub_sources, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=alloc_buffers,
+    )
+    return tvm.tir.PrimFunc(
+        [*(source.data for source in sources), output.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            **{source.data: source for source in sources},
+            output.data: output,
+        },
+    )
+
+
 def _scratch_unary_primfunc(
     operation, *, with_scratch=False, in_place=False, dtype="float32"
 ):
@@ -4130,6 +4202,67 @@ def test_sort_validates_repeat_extent_and_template() -> None:
         build_kernel_program(
             _sort_primfunc(template_dtype="half"), platform="A3"
         )
+
+
+@pytest.mark.parametrize("num_ways", [2, 3, 4])
+@pytest.mark.parametrize(
+    ("platform", "with_scratch"), [("A2", False), ("A3", True)]
+)
+def test_merge_sort_executes_two_to_four_way_abi(
+    num_ways, platform, with_scratch
+) -> None:
+    program = build_kernel_program(
+        _merge_sort_primfunc(num_ways, with_scratch=with_scratch),
+        platform=platform,
+    )
+    *loads, merge, store = program.tasks
+    assert merge.operation == "merge_sort"
+    assert merge.dependencies == tuple(sorted(task.task_id for task in loads))
+    assert store.dependencies == (merge.task_id,)
+    assert ("scratch" in merge.metadata) is with_scratch
+
+    source_pairs = []
+    simulator = FunctionalSimulator(program)
+    for source_number, load in enumerate(loads):
+        values = np.array(
+            [12 - source_number, 8, 4 + source_number, -source_number],
+            dtype=np.float32,
+        )
+        indices = np.arange(
+            source_number * 10, source_number * 10 + 4, dtype=np.float32
+        )
+        pairs = np.empty(8, dtype=np.float32)
+        pairs[0::2] = values
+        pairs[1::2] = indices
+        source_pairs.append(pairs.reshape(4, 2))
+        simulator.write(load.metadata["src"], pairs)
+    simulator.run()
+
+    concatenated = np.concatenate(source_pairs)
+    order = np.argsort(-concatenated[:, 0].astype(np.float64), kind="stable")
+    expected = concatenated[order].reshape(-1)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_merge_sort_rejects_bad_extent_and_unsorted_input() -> None:
+    with pytest.raises(ProgramValidationError, match="destination extent"):
+        build_kernel_program(
+            _merge_sort_primfunc(destination_extent=15), platform="A2"
+        )
+
+    program = build_kernel_program(_merge_sort_primfunc(), platform="A3")
+    first, second, _, _ = program.tasks
+    simulator = FunctionalSimulator(program)
+    simulator.write(
+        first.metadata["src"],
+        np.array([1, 0, 3, 1, 2, 2, 0, 3], dtype=np.float32),
+    )
+    simulator.write(
+        second.metadata["src"],
+        np.array([4, 4, 3, 5, 2, 6, 1, 7], dtype=np.float32),
+    )
+    with pytest.raises(ProgramValidationError, match="source0 is not descending"):
+        simulator.run()
 
 
 @pytest.mark.parametrize("operation", ["leaky_relu", "axpy"])

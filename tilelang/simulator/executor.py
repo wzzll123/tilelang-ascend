@@ -255,6 +255,9 @@ class FunctionalSimulator:
         if operation == "sort":
             self._sort(task)
             return
+        if operation == "merge_sort":
+            self._merge_sort(task)
+            return
         if operation in {"clamp", "clamp_max", "clamp_min"}:
             self._clamp(task, operation)
             return
@@ -773,6 +776,35 @@ class FunctionalSimulator:
         result = np.empty(values.size * 2, dtype=_numpy_dtype(destination.dtype))
         result[0::2] = values[order]
         result[1::2] = order
+        self.write(destination, result, task_core_id=task.core_id)
+
+    def _merge_sort(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        sources = task.metadata.get("src_regions")
+        if not isinstance(sources, (tuple, list)) or not all(
+            isinstance(source, BufferRegion) for source in sources
+        ):
+            raise ProgramValidationError(
+                f"merge_sort task {task.task_id!r} requires source regions"
+            )
+        values = []
+        indices = []
+        for source_number, source in enumerate(sources):
+            pairs = self.read(
+                source, task_core_id=task.core_id
+            ).reshape(-1, 2)
+            if np.any(pairs[:-1, 0] < pairs[1:, 0]):
+                raise ProgramValidationError(
+                    f"merge_sort source{source_number} is not descending"
+                )
+            values.append(pairs[:, 0])
+            indices.append(pairs[:, 1])
+        merged_values = np.concatenate(values)
+        merged_indices = np.concatenate(indices)
+        order = np.argsort(-merged_values.astype(np.float64), kind="stable")
+        result = np.empty(merged_values.size * 2, dtype=np.float32)
+        result[0::2] = merged_values[order]
+        result[1::2] = merged_indices[order]
         self.write(destination, result, task_core_id=task.core_id)
 
     def _block_reduce(self, task: Task) -> None:

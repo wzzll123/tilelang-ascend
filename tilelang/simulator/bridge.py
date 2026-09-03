@@ -819,6 +819,8 @@ class _TirBridge:
             return self._sort32_metadata(arguments, context)
         if short == "sort":
             return self._sort_metadata(arguments, context)
+        if short == "merge_sort":
+            return self._merge_sort_metadata(arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
@@ -2635,6 +2637,114 @@ class _TirBridge:
                 "source_capacity": source_extent,
             },
         }
+
+    def _merge_sort_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # AscendC ABI: template, numWays, dst, src..., blockLen...
+        # PTO ABI:     template, numWays, dst, tmp, src..., blockLen...
+        if len(arguments) < 7:
+            raise UnsupportedSimOpError("functional merge_sort ABI is malformed")
+        template = self._literal(arguments[0])
+        num_ways = self._const_int(arguments[1], context.environment)
+        if num_ways not in {2, 3, 4}:
+            raise ProgramValidationError(
+                f"merge_sort numWays must be 2, 3, or 4, got {num_ways!r}"
+            )
+        implicit_count = 3 + 2 * num_ways
+        has_scratch = len(arguments) == implicit_count + 1
+        if len(arguments) not in {implicit_count, implicit_count + 1}:
+            raise UnsupportedSimOpError(
+                f"functional {num_ways}-way merge_sort has {len(arguments)} arguments"
+            )
+        source_start = 4 if has_scratch else 3
+        length_start = source_start + num_ways
+        lengths = tuple(
+            self._const_int(argument, context.environment)
+            for argument in arguments[length_start:length_start + num_ways]
+        )
+        if any(length is None or length <= 0 for length in lengths):
+            raise ProgramValidationError("merge_sort block lengths must be positive")
+        destination_extent = self._access_ptr_extent(arguments[2], context)
+        source_extents = tuple(
+            self._access_ptr_extent(argument, context)
+            for argument in arguments[source_start:length_start]
+        )
+        if not isinstance(destination_extent, int) or not all(
+            isinstance(extent, int) for extent in source_extents
+        ):
+            raise UnsupportedSimOpError(
+                "functional merge_sort requires static pointer extents"
+            )
+        output_elements = 2 * sum(lengths)
+        if destination_extent < output_elements:
+            raise ProgramValidationError(
+                "merge_sort destination extent is too small for all pairs"
+            )
+        if any(
+            extent < 2 * length
+            for extent, length in zip(source_extents, lengths)
+        ):
+            raise ProgramValidationError(
+                "merge_sort source extent is smaller than its block length"
+            )
+        destination = self._access_buffer_region(
+            arguments[2], (output_elements,), context
+        )
+        sources = tuple(
+            self._access_buffer_region(argument, (2 * length,), context)
+            for argument, length in zip(
+                arguments[source_start:length_start], lengths
+            )
+        )
+        if destination is None or any(source is None for source in sources):
+            return {}
+        typed_sources = tuple(source for source in sources if source is not None)
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination,) + typed_sources
+        ):
+            raise ProgramValidationError("merge_sort requires UB operands")
+        if destination.dtype != "float32" or any(
+            source.dtype != "float32" for source in typed_sources
+        ):
+            raise UnsupportedSimOpError(
+                "functional merge_sort currently supports verified float32 pairs only"
+            )
+        for label, region in (("destination", destination),) + tuple(
+            (f"source{index}", source)
+            for index, source in enumerate(typed_sources)
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"merge_sort {label} pointer must be 32-byte aligned"
+                )
+        if not isinstance(template, str) or template != "MergeSort<float>":
+            raise ProgramValidationError(
+                "merge_sort template must be MergeSort<float>"
+            )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src_regions": typed_sources,
+            "merge_sort": {"num_ways": num_ways, "lengths": lengths},
+        }
+        if has_scratch:
+            scratch_extent = self._access_ptr_extent(arguments[3], context)
+            if not isinstance(scratch_extent, int) or scratch_extent <= 0:
+                raise ProgramValidationError(
+                    "merge_sort scratch extent must be a positive static integer"
+                )
+            scratch = self._access_buffer_region(
+                arguments[3], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            if scratch.scope is not MemoryScope.UB:
+                raise ProgramValidationError("merge_sort scratch must use UB scope")
+            metadata["scratch"] = scratch
+        return metadata
 
     def _pow_metadata(
         self,

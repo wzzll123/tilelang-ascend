@@ -11,10 +11,10 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 60%**。checkbox 裸计数约 70%，但未完成的完整
+- **完整 roadmap：约 61%**。checkbox 裸计数约 71%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 95%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
+- **可用功能模拟 MVP：约 96%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
   vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
@@ -193,6 +193,10 @@ sort 已支持 workspace 注入后的最终六参数 ABI、float16/float32 和�
 count；只读取有效前缀并产生全局稳定降序的数值型 `(value, index)` 交错输出，aligned
 capacity 尾部不进入排序，scratch 参与 dependency，并在运行前验证 repeat 与
 `ceil(actual_num/32)` 一致。
+merge_sort 已支持仓库验证过的 float32 数值型 value/index pair、2/3/4 路输入，以及
+AscendC 无 scratch 和 PTO 有 scratch 两种最终 ABI；各 source footprint 独立参与 RAW，
+输出保持跨 source 的稳定降序，并拒绝非降序输入、非法 block length、extent、scope、
+alignment 和 template。
 transpose 已支持静态 rank-2 UB tile 的非方形转置和常用 B8/B16/B32 dtype，并验证
 source/destination shape 互换、dtype、scope、whole-buffer 和双维度 32B 对齐契约。
 reinterpretcast 已按零拷贝元数据操作实现：执行时将目标 UB allocation 重绑到源
@@ -270,13 +274,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `354 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `361 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 354 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 361 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -466,7 +470,11 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   编码、alignment/footprint/dtype validation 和 dependency。~~
 - [x] ~~实现 sort 的最终 workspace ABI、静态/runtime actual count、float16/float32
   有效前缀稳定排序、数值型 value/index 输出和 runtime contract validation。~~
-- [ ] 实现 init_sort_buf 和 merge_sort。
+- [x] ~~实现 merge_sort 的 float32 数值型 pair、2/3/4-way、AscendC/PTO 两种最终 ABI、
+  多源 dependency、稳定合并和输入/extent/scope/alignment validation。~~
+- [ ] 修复并确认 init_sort_buf ABI 后实现；当前语言层发出 `(template, buffer, rsv, num)`，
+  AscendC codegen 却只将 `rsv` 作为 `eleNum` 传入并丢弃 `num`，且仓库没有调用 golden，
+  模拟器继续 fail-closed。
 - [x] ~~实现 TopK 的最终 workspace ABI、静态/runtime actual count、float16/float32
   稳定降序 value/index 输出、dependency 和错误路径。~~
 - [ ] 验证重复值、稳定性/index 语义、奇数 valid count、动态 valid length 和 scratch
@@ -526,7 +534,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：354 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：361 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -536,7 +544,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 实现 sort/sort32/init_sort_buf/merge_sort，并补齐 TopK 的 offset、NaN 和边界语义。
+1. 修复/确认 init_sort_buf ABI，并补齐排序族的 float16 merge、offset、NaN 和边界语义。
 2. 实现其它 MMA dtype 与 quant/fixpipe variants。
 3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。
