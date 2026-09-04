@@ -317,9 +317,14 @@ class FunctionalSimulator:
 
     def _copy(self, task: Task) -> None:
         source = _operand(task, "src")
-        destination = _operand(task, "dst")
         pad_destination = task.metadata.get("pad_dst")
         copy_details = task.metadata.get("copy", {})
+        written_regions = task.metadata.get("dst_regions")
+        if isinstance(written_regions, (tuple, list)):
+            destinations = list(written_regions)
+        else:
+            destinations = [_operand(task, "dst")]
+        destination = destinations[0]
         if isinstance(pad_destination, BufferRegion):
             pad_value = copy_details.get("pad_value")
             if not isinstance(pad_value, (bool, int, float)):
@@ -380,6 +385,29 @@ class FunctionalSimulator:
                 _resolve_int(copy_details["physical_rows"], self.bindings),
                 _resolve_int(copy_details["physical_cols"], self.bindings),
             )
+            written_rows = copy_details.get("written_rows")
+            if written_rows is not None:
+                # Spliced sub-tile copy: only the fractal rows touched by the
+                # valid rectangle are written, one packed segment per
+                # fractal-column band, so bands written by earlier DMAs of the
+                # same zN view stay intact.
+                written_rows = _resolve_int(written_rows, self.bindings)
+                logical = np.zeros(
+                    (written_rows, physical_shape[1]),
+                    dtype=_numpy_dtype(destination.dtype),
+                )
+                logical[:values.shape[0], :values.shape[1]] = values
+                packed = pack_matrix(logical, "zN")
+                chunks = packed.reshape(
+                    len(destinations), packed.size // len(destinations)
+                )
+                for region, chunk in zip(destinations, chunks):
+                    self.write(
+                        region,
+                        np.ascontiguousarray(chunk),
+                        task_core_id=task.core_id,
+                    )
+                return
             logical = np.zeros(
                 physical_shape, dtype=_numpy_dtype(destination.dtype)
             )

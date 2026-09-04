@@ -2707,6 +2707,198 @@ def test_zn_gm_to_l1_rejects_non_fractal_physical_tile() -> None:
         build_kernel_program(_gm_to_l1_zn_primfunc(physical_rows=15), platform="A2")
 
 
+def _gm_to_l1_zn_splice_primfunc(
+    *,
+    physical_rows=48,
+    cols=16,
+    first_valid_rows=32,
+    second_valid_rows=16,
+    anchor_row=32,
+    dst_offset_elements=None,
+    capacity_rows=None,
+    second_dma=True,
+):
+    elements_per_fractal = 512 // 2
+    if dst_offset_elements is None:
+        dst_offset_elements = anchor_row // 16 * elements_per_fractal
+    first_source = tvm.tir.decl_buffer(
+        (first_valid_rows, cols), "float16", name="source0", scope="global"
+    )
+    second_source = tvm.tir.decl_buffer(
+        (second_valid_rows, cols), "float16", name="source1", scope="global"
+    )
+    capacity_rows = physical_rows if capacity_rows is None else capacity_rows
+    l1 = tvm.tir.decl_buffer(
+        (capacity_rows * cols,), "float16", name="l1", scope="shared.l1"
+    )
+
+    def splice_copy(source_buffer, dst_offset):
+        return tvm.tir.call_extern(
+            "handle",
+            f"tl::ascend::copy_gm_to_l1<half, {physical_rows}, {cols}>",
+            source_buffer.access_ptr("r"),
+            l1.access_ptr("w", offset=dst_offset),
+            cols,
+            (
+                first_valid_rows
+                if source_buffer is first_source
+                else second_valid_rows
+            ),
+            cols,
+            physical_rows,
+            cols,
+        )
+
+    if second_dma:
+        body = tvm.tir.SeqStmt([
+            tvm.tir.Evaluate(splice_copy(first_source, 0)),
+            tvm.tir.Evaluate(splice_copy(second_source, dst_offset_elements)),
+        ])
+    else:
+        body = tvm.tir.Evaluate(splice_copy(second_source, dst_offset_elements))
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[l1],
+    )
+    return tvm.tir.PrimFunc(
+        [first_source.data, second_source.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={
+            first_source.data: first_source,
+            second_source.data: second_source,
+        },
+    )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_zn_gm_to_l1_splice_merges_without_clobbering(platform) -> None:
+    program = build_kernel_program(_gm_to_l1_zn_splice_primfunc(), platform=platform)
+    primary, splice = program.tasks
+    assert "dst" in primary.metadata and "dst_regions" not in primary.metadata
+    assert primary.metadata["copy"]["need_clear"] is True
+    assert "dst" not in splice.metadata
+    written = splice.metadata["dst_regions"]
+    assert len(written) == 1
+    assert written[0].shape == (16 * 16,)
+    assert written[0].byte_offset == 512 * 2
+    assert splice.metadata["copy"]["written_rows"] == 16
+    assert splice.metadata["copy"]["need_clear"] is False
+    assert splice.dependencies == (primary.task_id,)
+
+    first = np.arange(32 * 16, dtype=np.float16).reshape(32, 16) + 1
+    second = -(np.arange(16 * 16, dtype=np.float16).reshape(16, 16) + 1)
+    simulator = FunctionalSimulator(program)
+    simulator.write(primary.metadata["src"], first)
+    simulator.write(splice.metadata["src"], second)
+    simulator.run()
+    logical = unpack_matrix(simulator.read(primary.metadata["dst"]), "zN", (48, 16))
+    expected = np.zeros((48, 16), dtype=np.float16)
+    expected[:32] = first
+    expected[32:] = second
+    np.testing.assert_array_equal(logical, expected)
+
+
+def test_zn_gm_to_l1_splice_writes_every_fractal_column_band() -> None:
+    program = build_kernel_program(
+        _gm_to_l1_zn_splice_primfunc(cols=32), platform="A3"
+    )
+    primary, splice = program.tasks
+    written = splice.metadata["dst_regions"]
+    assert len(written) == 2
+    assert written[0].byte_offset == 512 * 2
+    assert written[1].byte_offset == (512 + 48 * 16) * 2
+    assert all(region.shape == (16 * 16,) for region in written)
+    assert splice.dependencies == (primary.task_id,)
+
+    first = np.arange(32 * 32, dtype=np.float16).reshape(32, 32) + 3
+    second = -(np.arange(16 * 32, dtype=np.float16).reshape(16, 32) + 3)
+    simulator = FunctionalSimulator(program)
+    simulator.write(primary.metadata["src"], first)
+    simulator.write(splice.metadata["src"], second)
+    simulator.run()
+    logical = unpack_matrix(simulator.read(primary.metadata["dst"]), "zN", (48, 32))
+    expected = np.zeros((48, 32), dtype=np.float16)
+    expected[:32] = first
+    expected[32:] = second
+    np.testing.assert_array_equal(logical, expected)
+
+
+def test_zn_gm_to_l1_splice_alone_keeps_other_rows_poisoned() -> None:
+    program = build_kernel_program(
+        _gm_to_l1_zn_splice_primfunc(second_dma=False), platform="A2"
+    )
+    (splice,) = program.tasks
+    assert splice.metadata["dst_regions"][0].byte_offset == 512 * 2
+
+    second = np.full((16, 16), -7, dtype=np.float16)
+    simulator = FunctionalSimulator(program)
+    simulator.write(splice.metadata["src"], second)
+    simulator.run()
+    written = simulator.read(
+        BufferRegion(
+            splice.metadata["dst_regions"][0].buffer,
+            MemoryScope.L1,
+            (16 * 16,),
+            "float16",
+            byte_offset=512 * 2,
+        )
+    )
+    np.testing.assert_array_equal(
+        unpack_matrix(written, "zN", (16, 16)), second
+    )
+    with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+        simulator.read(
+            BufferRegion(
+                splice.metadata["dst_regions"][0].buffer,
+                MemoryScope.L1,
+                (32 * 16,),
+                "float16",
+            )
+        )
+
+
+def test_zn_gm_to_l1_splice_rejects_unaligned_offset_and_overflow() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="fractal-row-aligned"):
+        build_kernel_program(
+            _gm_to_l1_zn_splice_primfunc(second_dma=False, dst_offset_elements=100),
+            platform="A2",
+        )
+    with pytest.raises(ProgramValidationError, match="bands exceed"):
+        build_kernel_program(
+            _gm_to_l1_zn_splice_primfunc(
+                second_dma=False, capacity_rows=32,
+            ),
+            platform="A2",
+        )
+
+
+def test_zn_gm_to_l1_ring_slot_offset_stays_primary() -> None:
+    program = build_kernel_program(
+        _gm_to_l1_zn_primfunc(), platform="A2"
+    )
+    primary = program.tasks[0]
+    tile_elements = primary.metadata["copy"]["physical_rows"] * (
+        primary.metadata["copy"]["physical_cols"]
+    )
+    ring_slot = build_kernel_program(
+        _gm_to_l1_zn_splice_primfunc(
+            physical_rows=16,
+            cols=16,
+            first_valid_rows=13,
+            second_valid_rows=13,
+            anchor_row=0,
+            second_dma=False,
+            dst_offset_elements=tile_elements,
+            capacity_rows=32,
+        ),
+        platform="A2",
+    )
+    (task,) = ring_slot.tasks
+    assert "dst" in task.metadata and "dst_regions" not in task.metadata
+    assert task.metadata["dst"].byte_offset == tile_elements * 2
+    assert task.metadata["copy"]["need_clear"] is True
+    assert primary.metadata["dst"].byte_offset == 0
+
+
 @pytest.mark.parametrize(
     ("destination_scope", "destination_layout"),
     [("wmma.matrix_a", "l0a"), ("wmma.matrix_b", "l0b")],

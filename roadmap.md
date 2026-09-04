@@ -241,7 +241,10 @@ mask/repeat/stride contract；max/min 覆盖 `ORDER_ONLY_VALUE` 和 value/index 
 256B repeat 和 clear=true。
 Cube copy 已有两条 GM→L1 路径：显式 RowMajor 路径按二维 stride 搬运；默认路径将有效
 矩形按仓库 `ascend_layout.py` 的 zN 公式写入真实物理存储，并复现 tail tile 清零。默认
-路径当前只接受 fractal/C0 对齐、tile-base 对齐的静态物理 tile；子 tile 拼接继续拒绝。
+路径接受 fractal/C0 对齐的静态物理 tile：tile-base（或整 tile 环形槽）偏移作为 primary
+copy 清零整个物理 tile；非整 tile 偏移按 codegen 的 splice / vertical-merge 语义建模，
+锚点须落在同一 zN 视图的分形行边界上，只写有效矩形触碰的分形行、逐 fractal 列带分段
+写入，不清零也不破坏同 tile 内先前的 DMA 数据。
 L1→L0 已支持 tile-base 路径：L0A 执行 zN→zZ，L0B 执行 zN→nZ；transpose 路径利用
 zN(A) 与 nZ(Aᵀ) 的物理等价关系，并保留 L1 写入到 L0 读取的 RAW dependency。
 L1→L0 还支持 32-byte 对齐的 L1 source window：从 zN/nZ 物理 offset 反解逻辑 origin，
@@ -299,13 +302,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `403 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `409 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 403 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 409 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -446,7 +449,12 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   hazard footprint。~~
 - [x] ~~将跨 C0 sliced L1→L0 拆成多段 strided source regions，并用于功能读取和
   dependency footprint。~~
-- [ ] 实现非对齐/子 tile GM→L1 和其它 L0C→GM variants。
+- [x] ~~实现非对齐/子 tile GM→L1：非整 tile 偏移的 copy_gm_to_l1 按 codegen
+  splice / vertical-merge 语义建模——锚点须为同一 (dstM, dstN) zN 视图的分形行边界，
+  逐 fractal 列带分段写入有效矩形触碰的分形行（`dst_regions` 参与 RAW/WAR/WAW），
+  不清零先前 DMA 数据；整 tile 偏移（含环形槽 base）保持 primary clear 语义。覆盖
+  单带/多带 golden、无 clobber、未写行 poison、错位偏移和容量错误路径。~~
+- [ ] 实现其它 L0C→GM variants。
 - [x] ~~实现 half→float32 `gemm_v0` 功能语义，覆盖 A/B transpose、K-tail、
   init/accumulate 和无 BiSheng 端到端路径。~~
 - [x] ~~将多 step `gemm_v0` 展开为 MTE1/MATRIX trace stages，建模双 slot reuse dependency
@@ -573,7 +581,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：403 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：409 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -586,5 +594,6 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 1. 补齐排序族的 float16 merge、offset、NaN 和边界语义（init_sort_buf ABI 已修复并实现，
    float16 workspace 预填等待可靠 golden）。
 2. 实现 fixpipe quant variants；bf16/fp32 input MMA 等待可靠的位级精度 contract。
-3. 实现非对齐/子 tile GM→L1 和剩余 Cube copy variants。
+3. 实现剩余 Cube copy variants（子 tile GM→L1 splice 已落地）；评估 L0C→GM
+   非 RowMajor 输出。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

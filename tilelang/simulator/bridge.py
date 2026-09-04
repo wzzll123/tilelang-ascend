@@ -9,7 +9,13 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .errors import ProgramValidationError, UnsupportedSimOpError
-from .layout import BYTE_PER_C0, C0_NUM_PER_FRACTAL, physical_index, storage_elements
+from .layout import (
+    BYTE_PER_C0,
+    BYTE_PER_FRACTAL,
+    C0_NUM_PER_FRACTAL,
+    physical_index,
+    storage_elements,
+)
 from .memory import contiguous_strides_bytes, dtype_size_bytes
 from .profile import TimingProfile, default_timing_profile, normalize_platform
 from .program import (
@@ -1062,24 +1068,72 @@ class _TirBridge:
         if destination is None:
             return {}
         tile_bytes = physical_elements * itemsize
-        if (
-            not isinstance(destination.byte_offset, int)
-            or destination.byte_offset % tile_bytes
-        ):
-            raise UnsupportedSimOpError(
-                "functional copy_gm_to_l1 requires a tile-base-aligned destination"
-            )
         destination_size = _buffer_size_bytes(destination_spec)
-        if (
-            destination_size is not None
-            and destination.byte_offset + tile_bytes > destination_size
-        ):
-            raise ProgramValidationError(
-                "GM-to-L1 zN physical tile exceeds the destination buffer"
+        if not isinstance(destination.byte_offset, int):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a static destination offset"
             )
+        # The codegen treats a destination offset that is a whole-tile multiple
+        # as the primary copy owner (tile base or ring-slot base): it may
+        # zero-fill the full physical tile before the valid rectangle lands.
+        # Any other offset is the second DMA of a splice / vertical-merge
+        # pattern: it must anchor at a fractal-row boundary of the same
+        # (dstM, dstN) zN view and writes only the fractal rows its valid
+        # rectangle touches, so previously written bands stay intact.
+        if destination.byte_offset % tile_bytes == 0:
+            if destination_size is not None and (
+                destination.byte_offset + tile_bytes > destination_size
+            ):
+                raise ProgramValidationError(
+                    "GM-to-L1 zN physical tile exceeds the destination buffer"
+                )
+            return {
+                "src": source,
+                "dst": destination,
+                "copy": {
+                    "layout": "zN",
+                    "valid_rows": valid_rows,
+                    "valid_cols": valid_cols,
+                    "source_cols": source_cols,
+                    "physical_rows": physical_rows,
+                    "physical_cols": physical_cols,
+                    "need_clear": (
+                        valid_rows != physical_rows or valid_cols != physical_cols
+                    ),
+                },
+            }
+        elements_per_fractal = BYTE_PER_FRACTAL // itemsize
+        if destination.byte_offset % (elements_per_fractal * itemsize):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 sub-tile copies require a "
+                "fractal-row-aligned destination offset inside the "
+                f"{physical_rows}x{physical_cols} zN tile"
+            )
+        written_rows = (
+            -(-valid_rows // C0_NUM_PER_FRACTAL) * C0_NUM_PER_FRACTAL
+        )
+        band_stride_elements = physical_rows * elements_per_c0
+        base_elements = destination.byte_offset // itemsize
+        written_elements_per_band = written_rows * elements_per_c0
+        if destination_size is not None and (
+            base_elements
+            + (physical_cols // elements_per_c0 - 1) * band_stride_elements
+            + written_elements_per_band
+        ) * itemsize > destination_size:
+            raise ProgramValidationError(
+                "GM-to-L1 zN sub-tile bands exceed the destination buffer"
+            )
+        written_regions = tuple(
+            replace(
+                destination,
+                shape=(written_elements_per_band,),
+                byte_offset=(base_elements + band * band_stride_elements) * itemsize,
+            )
+            for band in range(physical_cols // elements_per_c0)
+        )
         return {
             "src": source,
-            "dst": destination,
+            "dst_regions": written_regions,
             "copy": {
                 "layout": "zN",
                 "valid_rows": valid_rows,
@@ -1087,9 +1141,8 @@ class _TirBridge:
                 "source_cols": source_cols,
                 "physical_rows": physical_rows,
                 "physical_cols": physical_cols,
-                "need_clear": (
-                    valid_rows != physical_rows or valid_cols != physical_cols
-                ),
+                "written_rows": written_rows,
+                "need_clear": False,
             },
         }
 
@@ -4271,7 +4324,7 @@ class _TirBridge:
             ),
         )
         writes = self._operand_regions(
-            metadata, ("dst", "pad_dst", "scratch", "output_scratch")
+            metadata, ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch")
         )
         dependencies = {
             task_id
@@ -4296,7 +4349,8 @@ class _TirBridge:
             ),
         )
         writes = self._operand_regions(
-            task.metadata, ("dst", "pad_dst", "scratch", "output_scratch")
+            task.metadata,
+            ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch"),
         )
         for region in writes:
             self.last_writes = [
