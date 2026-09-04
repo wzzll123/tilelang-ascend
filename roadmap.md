@@ -478,6 +478,11 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 MMA/fixpipe `unitFlag` 配对协议，覆盖 `0b10` hold、`0b11` release/consume、
   partial-N source footprint、同 L0C region/列数校验和 trace pair metadata。~~
 - [ ] 实现 quant、非 RowMajor 输出和其它 fixpipe variants。
+  说明（2026-09-04 调研）：当前仓库没有任何 quant fixpipe 发射点——
+  `tl_templates/ascend/common.h` 的 `copy_l0c_to_gm` 硬编码
+  `ScaleGranularity::NO_QUANT`，语言层与 codegen 亦无 quant op；GM 输出 layout 仅
+  `LayoutGM = layout::RowMajor`。两者在语言层/codegen 暴露实际 TIR contract 前无法
+  按可信源实现，继续 fail-closed。
 - [ ] 支持 A/B transpose，以及 NZ、ZN、fractal 等核心 layout。
 - [ ] 使用 NumPy/PyTorch golden 覆盖 M/N/K tail、多 core 分块和 pipeline overlap。
 
@@ -593,7 +598,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 1. 补齐排序族的 float16 merge、offset、NaN 和边界语义（init_sort_buf ABI 已修复并实现，
    float16 workspace 预填等待可靠 golden）。
-2. 实现 fixpipe quant variants；bf16/fp32 input MMA 等待可靠的位级精度 contract。
+2. fixpipe quant variants 等待语言层/codegen 暴露实际 TIR contract（当前仓库仅有
+   `NO_QUANT` 路径）；bf16/fp32 input MMA 等待可靠的位级精度 contract。
 3. 实现剩余 Cube copy variants（子 tile GM→L1 splice 已落地）；评估 L0C→GM
    非 RowMajor 输出。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。
