@@ -67,6 +67,16 @@ _TAIL_REDUCE_OPERATIONS = frozenset({"reduce_max", "reduce_min", "reduce_sum"})
 # reinterpreted int32 view; see src/tl_templates/ascend/common.h.
 _INIT_SORT_BUF_BLOCK_ELEMENTS = 64
 
+# copy_ub_to_ub widens these (destination, source) dtype pairs without
+# rounding (CAST_NONE); every other mixed-dtype pair uses CAST_RINT.
+_UB_TO_UB_CAST_NONE = frozenset({
+    ("float32", "float16"),
+    ("float32", "bfloat16"),
+    ("float32", "int16"),
+    ("float16", "int8"),
+    ("int16", "int32"),
+})
+
 
 @dataclass(frozen=True)
 class _Context:
@@ -105,9 +115,13 @@ def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
             return Lane.CUBE, Pipe.MTE1, short
         if "l0c_to_gm" in short or "copy_cv" in short:
             return Lane.CUBE, Pipe.FIX, short
+        if short == "copy_ub_to_l1":
+            return _vector_lane(lane), Pipe.MTE3, short
         if "ub_to_gm" in short:
             return _vector_lane(lane), Pipe.MTE3, short
         if "copy_vc" in short:
+            return _vector_lane(lane), Pipe.VECTOR, short
+        if short == "copy_ub_to_ub":
             return _vector_lane(lane), Pipe.VECTOR, short
         return lane if lane is not Lane.CONTROL else Lane.CUBE, Pipe.MTE2, short
     if "atomic" in short:
@@ -851,6 +865,10 @@ class _TirBridge:
             return self._gm_to_l1_linear_metadata(arguments, context)
         if short == "copy_gm_to_l1":
             return self._gm_to_l1_zn_metadata(arguments, context)
+        if short == "copy_ub_to_ub":
+            return self._ub_to_ub_metadata(normalized, arguments, context)
+        if short == "copy_ub_to_l1":
+            return self._ub_to_l1_metadata(normalized, arguments, context)
         if short in {"copy_l1_to_l0a", "copy_l1_to_l0b"}:
             return self._l1_to_l0_metadata(
                 short, normalized, arguments, context
@@ -1142,6 +1160,225 @@ class _TirBridge:
                 "physical_rows": physical_rows,
                 "physical_cols": physical_cols,
                 "written_rows": written_rows,
+                "need_clear": False,
+            },
+        }
+
+    def _ub_to_ub_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, src_rows, src_cols, src_stride,
+        # dst_rows, dst_cols, dst_stride.  The operation name carries the
+        # (dst dtype, src dtype, len) template.
+        if len(arguments) != 8:
+            return {}
+        template = operation
+        for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+            if template.lower().startswith(prefix):
+                template = template[len(prefix):]
+                break
+        if (
+            not isinstance(template, str)
+            or not template.startswith("copy_ub_to_ub<")
+            or not template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "copy_ub_to_ub template must be copy_ub_to_ub<dtype, dtype, len>"
+            )
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:8]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_ub requires static tile extents"
+            )
+        (
+            src_rows, src_cols, src_stride, dst_rows, dst_cols, dst_stride,
+        ) = dimensions
+        if any(value < 0 for value in dimensions):
+            raise ProgramValidationError(
+                "copy_ub_to_ub extents must not be negative"
+            )
+        if src_cols > src_stride or dst_cols > dst_stride:
+            raise ProgramValidationError(
+                "copy_ub_to_ub tile columns must not exceed the row stride"
+            )
+        source = self._access_buffer_region(
+            arguments[0], (src_rows, src_cols), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (dst_rows, dst_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.UB or destination.scope is not MemoryScope.UB:
+            raise ProgramValidationError(
+                "copy_ub_to_ub requires UB source and UB destination"
+            )
+        for label, stride, region in (
+            ("source", src_stride, source),
+            ("destination", dst_stride, destination),
+        ):
+            itemsize = dtype_size_bytes(region.dtype)
+            physical_stride = (
+                region.strides_bytes[0] // itemsize
+                if region.strides_bytes is not None
+                else region.shape[-1]
+            )
+            if (
+                isinstance(physical_stride, int)
+                and stride != physical_stride
+            ):
+                raise ProgramValidationError(
+                    f"copy_ub_to_ub {label} row stride {stride} disagrees with "
+                    f"the buffer's physical row width {physical_stride}"
+                )
+        cast_mode: Optional[str]
+        if source.dtype == destination.dtype:
+            cast_mode = None
+            if (src_rows, src_cols) != (dst_rows, dst_cols):
+                raise ProgramValidationError(
+                    "copy_ub_to_ub matching-dtype tiles must have identical extents"
+                )
+        else:
+            if (src_rows, src_cols) != (dst_rows, dst_cols):
+                raise ProgramValidationError(
+                    "copy_ub_to_ub cast tiles must have identical extents"
+                )
+            if source.dtype == "bfloat16" or destination.dtype == "bfloat16":
+                raise UnsupportedSimOpError(
+                    "functional copy_ub_to_ub does not support bfloat16 casts"
+                )
+            if (destination.dtype, source.dtype) in _UB_TO_UB_CAST_NONE:
+                cast_mode = "CAST_NONE"
+            else:
+                cast_mode = "CAST_RINT"
+        template_tokens = template[template.index("<") + 1:-1].split(",")
+        if len(template_tokens) != 3:
+            raise ProgramValidationError(
+                "copy_ub_to_ub template must be copy_ub_to_ub<dtype, dtype, len>"
+            )
+        template_dst = _ascend_template_dtype(template_tokens[0])
+        template_src = _ascend_template_dtype(template_tokens[1])
+        if template_dst != destination.dtype or template_src != source.dtype:
+            raise ProgramValidationError(
+                "copy_ub_to_ub template dtypes must match the source/destination "
+                "buffers (destination first)"
+            )
+        try:
+            template_len = int(template_tokens[2])
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_ub requires a static template length"
+            ) from error
+        if template_len != src_rows * src_cols:
+            raise ProgramValidationError(
+                f"copy_ub_to_ub template length {template_len} must equal the "
+                f"tile size {src_rows * src_cols}"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "ub_to_ub",
+                "valid_rows": src_rows,
+                "valid_cols": src_cols,
+                "cast_mode": cast_mode,
+            },
+        }
+
+    def _ub_to_l1_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src(UB), dst(L1), src_N, src_M, dst_M, dst_N.  The
+        # operation name carries the (dtype, N, M) template; the wrapper
+        # lowers to one Nd2Nz of a fully aligned (M, N) half tile.
+        if len(arguments) != 6:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:6]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_l1 requires static tile extents"
+            )
+        src_cols, src_rows, dst_rows, dst_cols = dimensions
+        if src_rows != dst_rows or src_cols != dst_cols:
+            raise ProgramValidationError(
+                "copy_ub_to_l1 requires identical source and destination tile extents"
+            )
+        if src_rows <= 0 or src_cols <= 0:
+            raise ProgramValidationError(
+                "copy_ub_to_l1 tile extents must be positive"
+            )
+        source = self._access_buffer_region(
+            arguments[0], (src_rows, src_cols), context
+        )
+        if source is None:
+            return {}
+        if source.scope is not MemoryScope.UB:
+            raise ProgramValidationError("copy_ub_to_l1 requires a UB source")
+        template = operation
+        for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+            if template.lower().startswith(prefix):
+                template = template[len(prefix):]
+                break
+        if (
+            isinstance(template, str)
+            and template.startswith("copy_ub_to_l1<")
+            and template.endswith(">")
+        ):
+            template_dtype = _ascend_template_dtype(
+                template[template.index("<") + 1:-1].split(",")[0]
+            )
+            if template_dtype is not None and template_dtype != source.dtype:
+                raise ProgramValidationError(
+                    "copy_ub_to_l1 template dtype must match the source buffer"
+                )
+        if source.dtype != "float16":
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_l1 supports half tiles only"
+            )
+        if src_rows % C0_NUM_PER_FRACTAL or src_cols % (
+            BYTE_PER_C0 // dtype_size_bytes(source.dtype)
+        ):
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_l1 requires a fractal/C0-aligned tile"
+            )
+        destination_elements = storage_elements(
+            "zN", (src_rows, src_cols), dtype_size_bytes(source.dtype)
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (destination_elements,), context
+        )
+        if destination is None:
+            return {}
+        if destination.scope is not MemoryScope.L1:
+            raise ProgramValidationError(
+                "copy_ub_to_l1 requires an L1 destination"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "zN",
+                "valid_rows": src_rows,
+                "valid_cols": src_cols,
+                "source_cols": src_cols,
+                "physical_rows": src_rows,
+                "physical_cols": src_cols,
                 "need_clear": False,
             },
         }

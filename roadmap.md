@@ -245,6 +245,11 @@ Cube copy 已有两条 GM→L1 路径：显式 RowMajor 路径按二维 stride �
 copy 清零整个物理 tile；非整 tile 偏移按 codegen 的 splice / vertical-merge 语义建模，
 锚点须落在同一 zN 视图的分形行边界上，只写有效矩形触碰的分形行、逐 fractal 列带分段
 写入，不清零也不破坏同 tile 内先前的 DMA 数据。
+UB→UB copy 已支持 op lowering 的最终 8 参 ABI（模板 `<dstT, srcT, len>` 随操作名传
+递）：同 dtype 按二维 tile/row stride 连续或跨行搬运，异 dtype 按包装层方向表执行
+CAST_NONE（五种 widening 组合）或 CAST_RINT（整型目标舍入到最近偶数、浮点目标 IEEE
+最近偶数转换），bfloat16 继续 fail-closed；分类为 AIV/VECTOR pipe。UB→L1 copy 已支持
+Nd2Nz 语义（half、fractal/C0 对齐静态 tile，AIV/MTE3），复用 zN 物理打包路径。
 L1→L0 已支持 tile-base 路径：L0A 执行 zN→zZ，L0B 执行 zN→nZ；transpose 路径利用
 zN(A) 与 nZ(Aᵀ) 的物理等价关系，并保留 L1 写入到 L0 读取的 RAW dependency。
 L1→L0 还支持 32-byte 对齐的 L1 source window：从 zN/nZ 物理 offset 反解逻辑 origin，
@@ -302,13 +307,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `409 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `418 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 409 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 418 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -489,7 +494,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## P3：完整搬运、Vector 与 Reduction
 
 - [ ] 覆盖最终 TIR 中全部合法 A2/A3 copy 方向。
-- [ ] 实现 UB→L1，以及 L0C→UB 的 GM workspace/CV handoff 路径。
+- [x] ~~实现 UB→L1 的 `copy_ub_to_l1` Nd2Nz 路径（half、fractal/C0 对齐静态 tile、
+  AIV/MTE3 分类、zN 物理打包、模板 dtype 与 scope 校验）。~~
+- [ ] 实现 L0C→UB 的 GM workspace/CV handoff 路径；`copy_l0c_to_ub` 目前会被
+  reduction 改写为 `copy_l0c_to_gm` 且 codegen 无独立 handler，需先确认实际 contract。
 - [ ] 完成 vector operation family、standalone transpose 和完整 reduction family。
 - [ ] 实现 gather、gather-mask、gatherb 所需的底层地址与 mask 语义。
 - [ ] 建立 operation × dtype × scope × alignment 支持矩阵。
@@ -586,7 +594,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：409 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：418 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -600,6 +608,6 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
    float16 workspace 预填等待可靠 golden）。
 2. fixpipe quant variants 等待语言层/codegen 暴露实际 TIR contract（当前仓库仅有
    `NO_QUANT` 路径）；bf16/fp32 input MMA 等待可靠的位级精度 contract。
-3. 实现剩余 Cube copy variants（子 tile GM→L1 splice 已落地）；评估 L0C→GM
-   非 RowMajor 输出。
+3. 实现剩余 Cube copy variants（子 tile GM→L1 splice 与 UB→UB/UB→L1 已落地）；
+   确认 `copy_l0c_to_ub` 的实际 contract 后实现 CV handoff。
 4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

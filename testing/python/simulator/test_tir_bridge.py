@@ -2899,6 +2899,227 @@ def test_zn_gm_to_l1_ring_slot_offset_stays_primary() -> None:
     assert primary.metadata["dst"].byte_offset == 0
 
 
+_TEMPLATE_DTYPE_NAMES = {"float16": "half", "float32": "float"}
+
+
+def _ub_to_ub_primfunc(
+    *,
+    src_dtype="float16",
+    dst_dtype="float32",
+    rows=4,
+    cols=6,
+    src_stride=None,
+    dst_stride=None,
+    template_dst_dtype=None,
+    template_len=None,
+):
+    src_stride = src_stride if src_stride is not None else cols
+    dst_stride = dst_stride if dst_stride is not None else cols
+    template_len = template_len if template_len is not None else rows * cols
+    ub_src = tvm.tir.decl_buffer(
+        (rows, src_stride), src_dtype, name="ub_src", scope="shared.ub"
+    )
+    ub_dst = tvm.tir.decl_buffer(
+        (rows, dst_stride), dst_dtype, name="ub_dst", scope="shared.ub"
+    )
+    dst_name = template_dst_dtype or dst_dtype
+    template = (
+        f"tl::ascend::copy_ub_to_ub<"
+        f"{_TEMPLATE_DTYPE_NAMES.get(dst_name, dst_name)}, "
+        f"{_TEMPLATE_DTYPE_NAMES.get(src_dtype, src_dtype)}, {template_len}>"
+    )
+    copy = tvm.tir.call_extern(
+        "handle", template,
+        ub_src.access_ptr("r"), ub_dst.access_ptr("w"),
+        rows, cols, src_stride, rows, cols, dst_stride,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[ub_src, ub_dst],
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_ub_to_ub_copies_contiguous_tiles(platform) -> None:
+    program = build_kernel_program(_ub_to_ub_primfunc(), platform=platform)
+    (copy,) = program.tasks
+    assert (copy.operation, copy.lane, copy.pipe) == (
+        "copy_ub_to_ub", Lane.VECTOR_0, Pipe.VECTOR,
+    )
+    assert copy.metadata["copy"]["cast_mode"] == "CAST_NONE"
+
+    values = np.array(
+        [[1, -2, 0.25, 65504, -0.5, 3], [7, -8, 0.125, 9, -10, 11.5]] * 2,
+        dtype=np.float16,
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(copy.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(copy.metadata["dst"]), values.astype(np.float32)
+    )
+
+
+def test_ub_to_ub_copies_strided_tiles_without_touching_gaps() -> None:
+    program = build_kernel_program(
+        _ub_to_ub_primfunc(
+            src_dtype="float32", dst_dtype="float32", src_stride=8, dst_stride=8
+        ),
+        platform="A2",
+    )
+    (copy,) = program.tasks
+    assert copy.metadata["copy"]["cast_mode"] is None
+
+    values = (np.arange(4 * 6, dtype=np.float32).reshape(4, 6) - 11) / 4
+    simulator = FunctionalSimulator(program)
+    simulator.write(copy.metadata["src"], values)
+    simulator.run()
+    result = simulator.read(copy.metadata["dst"])
+    np.testing.assert_array_equal(result, values)
+    with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+        simulator.read(
+            BufferRegion(
+                copy.metadata["dst"].buffer,
+                MemoryScope.UB,
+                (4, 2),
+                "float32",
+                byte_offset=6 * 4,
+                strides_bytes=(8 * 4, 4),
+            )
+        )
+
+
+def test_ub_to_ub_narrows_float_with_nearest_even_conversion() -> None:
+    program = build_kernel_program(
+        _ub_to_ub_primfunc(src_dtype="float32", dst_dtype="float16"),
+        platform="A2",
+    )
+    (copy,) = program.tasks
+    assert copy.metadata["copy"]["cast_mode"] == "CAST_RINT"
+
+    values = np.array(
+        [[2.51, 3.49, -2.75, -0.333, 65504, 1.6],
+         [4.5, 5.5, -4.5, -5.5, 2.49, 2.51]] * 2,
+        dtype=np.float32,
+    )
+    simulator = FunctionalSimulator(program)
+    simulator.write(copy.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(copy.metadata["dst"]),
+        values.astype(np.float16),
+    )
+
+
+def test_ub_to_ub_orders_raw_against_producer() -> None:
+    gm_source = tvm.tir.decl_buffer(
+        (4, 6), "float32", name="gm_source", scope="global"
+    )
+    ub_src = tvm.tir.decl_buffer(
+        (4, 6), "float32", name="ub_src", scope="shared.ub"
+    )
+    ub_dst = tvm.tir.decl_buffer(
+        (4, 6), "float32", name="ub_dst", scope="shared.ub"
+    )
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_gm_to_ub",
+            gm_source.access_ptr("r"), ub_src.access_ptr("w"), 24,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle",
+            "tl::ascend::copy_ub_to_ub<float, float, 24>",
+            ub_src.access_ptr("r"), ub_dst.access_ptr("w"),
+            4, 6, 6, 4, 6, 6,
+        )),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_src, ub_dst],
+    )
+    primfunc = tvm.tir.PrimFunc(
+        [],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={gm_source.data: gm_source},
+    )
+    program = build_kernel_program(primfunc, platform="A2")
+    load, copy = program.tasks
+    assert copy.dependencies == (load.task_id,)
+
+    values = (np.arange(24, dtype=np.float32).reshape(4, 6) - 7) / 3
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values.reshape(-1))
+    simulator.run()
+    np.testing.assert_array_equal(simulator.read(copy.metadata["dst"]), values)
+
+
+def test_ub_to_ub_validates_template_and_extents() -> None:
+    with pytest.raises(ProgramValidationError, match="template dtypes"):
+        build_kernel_program(
+            _ub_to_ub_primfunc(template_dst_dtype="float16"), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="template length"):
+        build_kernel_program(
+            _ub_to_ub_primfunc(template_len=999), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="tile columns must not exceed"):
+        build_kernel_program(
+            _ub_to_ub_primfunc(src_stride=4, cols=6), platform="A2"
+        )
+
+
+def _ub_to_l1_primfunc(*, rows=32, cols=16, dtype="float16", template_dtype=None):
+    ub = tvm.tir.decl_buffer(
+        (rows, cols), dtype, name="ub_tile", scope="shared.ub"
+    )
+    l1 = tvm.tir.decl_buffer(
+        (rows * cols,), dtype, name="l1_tile", scope="shared.l1"
+    )
+    dtype_name = template_dtype or _TEMPLATE_DTYPE_NAMES.get(dtype, dtype)
+    copy = tvm.tir.call_extern(
+        "handle", f"tl::ascend::copy_ub_to_l1<{dtype_name}, {cols}, {rows}>",
+        ub.access_ptr("r"), l1.access_ptr("w"),
+        cols, rows, rows, cols,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(copy), alloc_buffers=[ub, l1],
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_ub_to_l1_packs_row_major_tile_into_zn(platform) -> None:
+    program = build_kernel_program(_ub_to_l1_primfunc(), platform=platform)
+    (copy,) = program.tasks
+    assert (copy.operation, copy.lane, copy.pipe) == (
+        "copy_ub_to_l1", Lane.VECTOR_0, Pipe.MTE3,
+    )
+    assert copy.metadata["copy"]["layout"] == "zN"
+
+    values = np.arange(32 * 16, dtype=np.float16).reshape(32, 16) + 1
+    simulator = FunctionalSimulator(program)
+    simulator.write(copy.metadata["src"], values)
+    simulator.run()
+    np.testing.assert_array_equal(
+        unpack_matrix(simulator.read(copy.metadata["dst"]), "zN", (32, 16)),
+        values,
+    )
+
+
+def test_ub_to_l1_validates_dtype_alignment_and_template() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="half tiles only"):
+        build_kernel_program(
+            _ub_to_l1_primfunc(dtype="float32"), platform="A2"
+        )
+    with pytest.raises(UnsupportedSimOpError, match="fractal/C0-aligned"):
+        build_kernel_program(
+            _ub_to_l1_primfunc(rows=31), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype"):
+        build_kernel_program(
+            _ub_to_l1_primfunc(template_dtype="float"), platform="A3"
+        )
+
+
 @pytest.mark.parametrize(
     ("destination_scope", "destination_layout"),
     [("wmma.matrix_a", "l0a"), ("wmma.matrix_b", "l0b")],

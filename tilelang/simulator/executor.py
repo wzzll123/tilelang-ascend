@@ -380,6 +380,17 @@ class FunctionalSimulator:
             )
             if len(destination.shape) > 1:
                 values = values.reshape(destination_shape)
+        elif copy_details.get("layout") == "ub_to_ub":
+            cast_mode = copy_details.get("cast_mode")
+            destination_dtype = _numpy_dtype(destination.dtype)
+            if cast_mode == "CAST_RINT" and np.issubdtype(
+                destination_dtype, np.integer
+            ):
+                # Rounding to nearest-even applies to integer destinations;
+                # float destinations convert with IEEE nearest-even in
+                # np.asarray below.
+                values = np.rint(values.astype(np.float64)).astype(values.dtype)
+            values = np.asarray(values, dtype=destination_dtype)
         elif copy_details.get("layout") == "zN":
             physical_shape = (
                 _resolve_int(copy_details["physical_rows"], self.bindings),
