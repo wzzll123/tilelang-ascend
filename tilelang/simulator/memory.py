@@ -19,13 +19,16 @@ from .hazard import HazardDiagnostic, HazardReporter
 from .program import AffineInt, BufferSpec, KernelProgram, MemoryScope, SymbolicInt
 
 
-# Values used by the A2/A3 host codegen and memory-planning pass.
+# Physical local-memory address-space capacities for A2/A3.  The AscendC
+# codegen initializes its UB/L1 TBuf with 256 fewer bytes, but the repository's
+# lowered address maps (including examples/elementwise/elementwise_add.py) can
+# legally cover the complete 192 KiB UB address range.
 A2_A3_LOCAL_CAPACITIES: Mapping[MemoryScope, int] = {
     MemoryScope.L1: 524032,
     MemoryScope.L0A: 65536,
     MemoryScope.L0B: 65536,
     MemoryScope.L0C: 131072,
-    MemoryScope.UB: 196352,
+    MemoryScope.UB: 192 * 1024,
     MemoryScope.BT: 1024,
 }
 _SHARED_SCOPES = frozenset({MemoryScope.GM, MemoryScope.WORKSPACE})

@@ -455,6 +455,7 @@ class _TirBridge:
         self.buffers.setdefault(
             name, self._buffer_spec(name, scope, shape, str(stmt.dtype))
         )
+        self.buffer_name_by_data_var[self._var_name(stmt.buffer_var)] = name
 
     def _collect_block_buffer(self, buffer: Any, context: _Context) -> None:
         name = str(buffer.name)
@@ -912,8 +913,6 @@ class _TirBridge:
                     or (isinstance(valid_cols, int) and valid_cols < 0)):
                 raise ProgramValidationError("copy valid rows/columns must not be negative")
             shape = (valid_rows, valid_cols)
-            source = self._access_buffer_region(arguments[0], shape, context)
-            destination = self._access_buffer_region(arguments[1], shape, context)
             details: Dict[str, Any] = {
                 "valid_rows": valid_rows,
                 "valid_cols": valid_cols,
@@ -957,6 +956,19 @@ class _TirBridge:
                     )
                 details["physical_rows"] = physical_rows
                 details["physical_cols"] = physical_cols
+            physical_cols = details.get("physical_cols")
+            source = self._access_buffer_region(
+                arguments[0],
+                shape,
+                context,
+                physical_cols=None if gm_to_ub else physical_cols,
+            )
+            destination = self._access_buffer_region(
+                arguments[1],
+                shape,
+                context,
+                physical_cols=physical_cols if gm_to_ub else None,
+            )
         else:
             length = self._runtime_int(arguments[2], context.environment)
             if length is None or (isinstance(length, int) and length < 0):
@@ -4845,6 +4857,8 @@ class _TirBridge:
         pointer: Any,
         shape: Tuple[Any, ...],
         context: _Context,
+        *,
+        physical_cols: Any | None = None,
     ) -> Optional[BufferRegion]:
         data_var = pointer
         element_offset = 0
@@ -4863,7 +4877,7 @@ class _TirBridge:
         itemsize = dtype_size_bytes(spec.dtype)
         strides = None
         if len(shape) == 2:
-            physical_cols = spec.shape[-1]
+            physical_cols = spec.shape[-1] if physical_cols is None else physical_cols
             if not isinstance(physical_cols, (int, AffineInt, SymbolicInt)):
                 return None
             row_stride = (
