@@ -170,8 +170,12 @@ fi
 
 # Step 9: Clone and build TVM
 echo "Cloning TVM repository and initializing submodules..."
-# clone and build tvm
-git submodule update --init --recursive
+# 选择性初始化：Ascend 流程只需要 tvm/catlass/pto-isa/shmem。
+# 跳过 NVIDIA cutlass、ROCm composable_kernel（顶层）以及 catlass 嵌套的
+# AscendNPU-IR（LLVM/MLIR 源码树，regbase/tla_dsl 专用）与 googletest。
+# --depth 1 浅历史；tvm 嵌套（dmlc-core/dlpack 等）为构建必需需递归。
+git submodule update --init --depth 1 3rdparty/catlass 3rdparty/pto-isa 3rdparty/shmem
+git submodule update --init --depth 1 --recursive 3rdparty/tvm
 
 # Apply local patches to the tvm submodule (kept under 3rdparty/patches/).
 # These are minimal fixes we cannot land in the pinned submodule commit, e.g.
