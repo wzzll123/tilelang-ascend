@@ -871,6 +871,12 @@ class _TirBridge:
             return self._ub_to_l1_metadata(normalized, arguments, context)
         if short == "brcb_experiment":
             return self._brcb_metadata(arguments, context)
+        if short in {
+            "row_expand_mul_experiment",
+            "row_expand_sub_experiment",
+            "row_expand_div_experiment",
+        }:
+            return self._row_expand_metadata(short, arguments, context)
         if short in {"copy_l1_to_l0a", "copy_l1_to_l0b"}:
             return self._l1_to_l0_metadata(
                 short, normalized, arguments, context
@@ -1465,6 +1471,141 @@ class _TirBridge:
                 "rep_stride": rep_stride,
             },
         }
+
+    def _row_expand_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: tag, dst, src0, src1[, tmp].  Rows fold to
+        # R = extent / (8 * elems_per_block) with 256-byte rows; row i
+        # combines src0 row i with the scalar carried by src1 block i.  With
+        # tmp the codegen expands brcb(src1 -> tmp) before the masked op; the
+        # simulator models that broadcast scratch as a written region of this
+        # task so downstream tmp readers keep their dependency edges.
+        if len(arguments) not in {4, 5}:
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires (tag, dst, src0, src1[, tmp])"
+            )
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or "<" not in tag or not tag.endswith(">"):
+            raise ProgramValidationError(
+                f"{operation} tag must be {operation}<dtype>"
+            )
+        tag_dtype = _ascend_template_dtype(tag.split("<", 1)[1][:-1].strip())
+        extents = tuple(
+            self._access_ptr_extent(arguments[index], context)
+            for index in (1, 2, 3)
+        )
+        if any(extent is None for extent in extents):
+            return {}
+        if not all(isinstance(extent, int) for extent in extents):
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires static pointer extents"
+            )
+        dst_extent, src0_extent, src1_extent = extents
+        if dst_extent != src0_extent:
+            raise ProgramValidationError(
+                f"{operation} source and destination extents must match"
+            )
+        destination_name = self._access_ptr_data_name(arguments[1])
+        if destination_name is None:
+            return {}
+        destination_buffer = self.buffer_name_by_data_var.get(destination_name)
+        if destination_buffer is None:
+            return {}
+        destination_spec = self.buffers[destination_buffer]
+        if tag_dtype is not None and tag_dtype != destination_spec.dtype:
+            raise ProgramValidationError(
+                f"{operation} tag dtype must match the operand buffers"
+            )
+        if destination_spec.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional {operation} supports float16/float32 rows only"
+            )
+        physical_cols = destination_spec.shape[-1]
+        itemsize = dtype_size_bytes(destination_spec.dtype)
+        elements_per_block = BYTE_PER_C0 // itemsize
+        if not isinstance(physical_cols, int) or physical_cols != 8 * elements_per_block:
+            raise ProgramValidationError(
+                f"{operation} requires 256-byte ({8 * elements_per_block}-element) "
+                f"rows, got {physical_cols} columns"
+            )
+        rows = dst_extent // physical_cols
+        if dst_extent % physical_cols or not 1 <= rows <= 255:
+            raise ProgramValidationError(
+                f"{operation} extent {dst_extent} must tile into 1..255 rows of "
+                f"{physical_cols} elements"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (rows, physical_cols), context
+        )
+        source = self._access_buffer_region(
+            arguments[2], (rows, physical_cols), context
+        )
+        if destination is None or source is None:
+            return {}
+        for region in (destination, source):
+            if region.scope is not MemoryScope.UB:
+                raise ProgramValidationError(
+                    f"{operation} requires UB operands"
+                )
+            if isinstance(region.byte_offset, int) and region.byte_offset % BYTE_PER_C0:
+                raise ProgramValidationError(
+                    f"{operation} requires 32-byte-aligned row windows"
+                )
+        source_spec = self.buffers[source.buffer]
+        if source_spec.shape[-1] != physical_cols:
+            raise ProgramValidationError(
+                f"{operation} source and destination physical row strides must match"
+            )
+        has_tmp = len(arguments) == 5
+        scalar_elements = rows if has_tmp else rows * elements_per_block
+        if src1_extent != scalar_elements:
+            raise ProgramValidationError(
+                f"{operation} scalar source must hold {scalar_elements} elements"
+                + ("" if has_tmp else " (one packed block per row)")
+            )
+        scalar_source = self._access_buffer_region(
+            arguments[3], (scalar_elements,), context
+        )
+        if scalar_source is None:
+            return {}
+        if scalar_source.scope is not MemoryScope.UB:
+            raise ProgramValidationError(
+                f"{operation} requires a UB scalar source"
+            )
+        scratch = None
+        if has_tmp:
+            tmp_extent = self._access_ptr_extent(arguments[4], context)
+            if tmp_extent is not None and tmp_extent != rows * elements_per_block:
+                raise ProgramValidationError(
+                    f"{operation} tmp must hold {rows * elements_per_block} elements"
+                )
+            scratch = self._access_buffer_region(
+                arguments[4], (rows * elements_per_block,), context
+            )
+            if scratch is None:
+                return {}
+            if scratch.scope is not MemoryScope.UB:
+                raise ProgramValidationError(f"{operation} requires a UB tmp")
+            if scratch.dtype != destination.dtype:
+                raise ProgramValidationError(
+                    f"{operation} requires matching tmp and operand dtypes"
+                )
+        metadata = {
+            "dst": destination,
+            "src": source,
+            "scalar_src": scalar_source,
+            "row_expand": {
+                "rows": rows,
+                "row_elements": physical_cols,
+            },
+        }
+        if scratch is not None:
+            metadata["scratch"] = scratch
+        return metadata
 
     def _l1_to_bt_metadata(
         self,

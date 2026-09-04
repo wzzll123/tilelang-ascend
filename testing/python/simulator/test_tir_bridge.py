@@ -3278,6 +3278,179 @@ def test_brcb_validates_template_scope_alignment_and_dtypes() -> None:
             _brcb_primfunc(dst_scope="global"), platform="A2"
         )
 
+_ROW_EXPAND_TAG_NAMES = {
+    "mul": "RowExpandMulExperiment",
+    "sub": "RowExpandSubExperiment",
+    "div": "RowExpandDivExperiment",
+}
+
+
+def _row_expand_primfunc(
+    *,
+    op="mul",
+    dtype="float32",
+    rows=8,
+    with_tmp=False,
+    dst_offset=0,
+    cols_override=None,
+    tag_dtype_override=None,
+    scalar_count_override=None,
+):
+    elements_per_block = 32 // (2 if dtype == "float16" else 4)
+    cols = cols_override or 8 * elements_per_block
+    extent = rows * cols
+    scalar_count = scalar_count_override or (
+        rows if with_tmp else rows * elements_per_block
+    )
+    ub_dst = tvm.tir.decl_buffer(
+        (rows, cols), dtype, name="re_dst", scope="shared.ub"
+    )
+    ub_src0 = tvm.tir.decl_buffer(
+        (rows, cols), dtype, name="re_src0", scope="shared.ub"
+    )
+    ub_src1 = tvm.tir.decl_buffer(
+        (scalar_count,), dtype, name="re_src1", scope="shared.ub"
+    )
+    buffers = [ub_dst, ub_src0, ub_src1]
+    tag_dtype = tag_dtype_override or _TEMPLATE_DTYPE_NAMES.get(dtype, dtype)
+    args = [
+        f"{_ROW_EXPAND_TAG_NAMES[op]}<{tag_dtype}>",
+        ub_dst.access_ptr("w", offset=dst_offset, extent=extent),
+        ub_src0.access_ptr("r", extent=extent),
+        ub_src1.access_ptr("r"),
+    ]
+    if with_tmp:
+        ub_tmp = tvm.tir.decl_buffer(
+            (rows, elements_per_block), dtype, name="re_tmp", scope="shared.ub"
+        )
+        buffers.append(ub_tmp)
+        args.append(ub_tmp.access_ptr("rw"))
+    body = tvm.tir.Evaluate(tvm.tir.call_extern(
+        "handle", f"tl.ascend_row_expand_{op}_experiment", *args,
+    ))
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=buffers,
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("op", ["mul", "sub", "div"])
+def test_row_expand_broadcasts_row_scalars(platform, op) -> None:
+    program = build_kernel_program(
+        _row_expand_primfunc(op=op), platform=platform
+    )
+    (task,) = program.tasks
+    assert (task.operation, task.lane, task.pipe) == (
+        f"row_expand_{op}_experiment", Lane.VECTOR_0, Pipe.VECTOR,
+    )
+    assert task.metadata["row_expand"] == {"rows": 8, "row_elements": 64}
+    assert "scratch" not in task.metadata
+
+    values = (np.arange(8 * 64, dtype=np.float32).reshape(8, 64) - 100) / 16
+    scalars = np.array([4, -2, 0.5, 8, -1, 2, 0.25, -4], dtype=np.float32)
+    broadcast = np.repeat(scalars, 8)
+    simulator = FunctionalSimulator(program)
+    simulator.write(task.metadata["src"], values)
+    simulator.write(task.metadata["scalar_src"], broadcast)
+    simulator.run()
+    expected = {
+        "mul": values * scalars[:, None],
+        "sub": values - scalars[:, None],
+        "div": values / scalars[:, None],
+    }[op]
+    np.testing.assert_allclose(
+        simulator.read(task.metadata["dst"]), expected, rtol=1e-6, atol=1e-6
+    )
+
+
+def test_row_expand_with_tmp_writes_broadcast_scratch() -> None:
+    program = build_kernel_program(
+        _row_expand_primfunc(op="mul", dtype="float16", with_tmp=True),
+        platform="A2",
+    )
+    (task,) = program.tasks
+    assert isinstance(task.metadata["scratch"], BufferRegion)
+
+    cols = 8 * (32 // 2)  # float16 rows are 128 elements wide
+    values = (np.arange(8 * cols, dtype=np.float16).reshape(8, cols) - 40) / 8
+    scalars = np.arange(8, dtype=np.float16) + 1
+    simulator = FunctionalSimulator(program)
+    simulator.write(task.metadata["src"], values)
+    simulator.write(task.metadata["scalar_src"], scalars)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(task.metadata["scratch"]).reshape(-1),
+        np.repeat(scalars, cols // 8),
+    )
+    np.testing.assert_array_equal(
+        simulator.read(task.metadata["dst"]),
+        values * scalars[:, None],
+    )
+
+
+def test_row_expand_orders_raw_against_producer() -> None:
+    extent = 8 * 64
+    ub_src0 = tvm.tir.decl_buffer(
+        (8, 64), "float32", name="re_src0", scope="shared.ub"
+    )
+    ub_src1 = tvm.tir.decl_buffer(
+        (64,), "float32", name="re_src1", scope="shared.ub"
+    )
+    ub_dst = tvm.tir.decl_buffer(
+        (8, 64), "float32", name="re_dst", scope="shared.ub"
+    )
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_fill",
+            ub_src0.access_ptr("w"), tvm.tir.FloatImm("float32", 2.0), extent,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_row_expand_mul_experiment",
+            "RowExpandMulExperiment<float>",
+            ub_dst.access_ptr("w", extent=extent),
+            ub_src0.access_ptr("r", extent=extent),
+            ub_src1.access_ptr("r"),
+        )),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_src0, ub_src1, ub_dst],
+    )
+    primfunc = tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+    program = build_kernel_program(primfunc, platform="A3")
+    fill, task = program.tasks
+    assert task.dependencies == (fill.task_id,)
+
+    scalars = np.arange(8, dtype=np.float32) + 1
+    broadcast = np.repeat(scalars, 8)
+    simulator = FunctionalSimulator(program)
+    simulator.write(task.metadata["scalar_src"], broadcast)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(task.metadata["dst"]),
+        np.full((8, 64), 2.0, dtype=np.float32) * scalars[:, None],
+    )
+
+
+def test_row_expand_validates_rows_dtype_alignment_and_tag() -> None:
+    with pytest.raises(ProgramValidationError, match="256-byte"):
+        build_kernel_program(
+            _row_expand_primfunc(dtype="float16", cols_override=32),
+            platform="A2",
+        )
+    with pytest.raises(ProgramValidationError, match="32-byte-aligned"):
+        build_kernel_program(
+            _row_expand_primfunc(dst_offset=1), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="scalar source must hold"):
+        build_kernel_program(
+            _row_expand_primfunc(scalar_count_override=7), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="tag dtype"):
+        build_kernel_program(
+            _row_expand_primfunc(tag_dtype_override="half"), platform="A2"
+        )
+
 
 @pytest.mark.parametrize(
     ("destination_scope", "destination_layout"),

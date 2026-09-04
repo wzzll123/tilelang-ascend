@@ -22,6 +22,13 @@ from .program import (
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .sync import FlagBarrierSynchronizationModel
 
+# Row-wise broadcast binary experiment ops: dst row i = src0 row i op scalar_i.
+_ROW_EXPAND_OPERATIONS = {
+    "row_expand_mul_experiment": np.multiply,
+    "row_expand_sub_experiment": np.subtract,
+    "row_expand_div_experiment": np.divide,
+}
+
 # InitSortBuf writes the fp32 -inf bit pattern into even int32 lanes and -1
 # into odd lanes of the sort workspace's reinterpreted int32 view
 # (src/tl_templates/ascend/common.h).
@@ -235,6 +242,13 @@ class FunctionalSimulator:
             return
         if operation == "brcb_experiment":
             self._brcb(task)
+            return
+        if operation in {
+            "row_expand_mul_experiment",
+            "row_expand_sub_experiment",
+            "row_expand_div_experiment",
+        }:
+            self._row_expand_binop(task)
             return
         if operation in {"arith_progression", "createvecindex"}:
             self._sequence(task)
@@ -636,6 +650,51 @@ class FunctionalSimulator:
                     ),
                     task_core_id=task.core_id,
                 )
+
+    def _row_expand_binop(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        scalar_source = _operand(task, "scalar_src")
+        details = task.metadata.get("row_expand")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"row-expand task {task.task_id!r} requires row_expand metadata"
+            )
+        rows = _resolve_int(details["rows"], self.bindings)
+        row_elements = _resolve_int(details["row_elements"], self.bindings)
+        elements_per_block = row_elements // 8
+        scalars = self.read(scalar_source, task_core_id=task.core_id).reshape(-1)
+        scratch = task.metadata.get("scratch")
+        if isinstance(scratch, BufferRegion):
+            # With tmp the codegen expands brcb(src1 -> tmp) before the masked
+            # op; reproduce that broadcast so the scratch end state matches.
+            if scalars.size != rows:
+                raise ProgramValidationError(
+                    f"row-expand scalar source provides {scalars.size} elements, "
+                    f"requires {rows}"
+                )
+            self.write(
+                scratch,
+                np.repeat(scalars, elements_per_block).astype(
+                    _numpy_dtype(scratch.dtype)
+                ),
+                task_core_id=task.core_id,
+            )
+        else:
+            if scalars.size != rows * elements_per_block:
+                raise ProgramValidationError(
+                    f"row-expand scalar source provides {scalars.size} elements, "
+                    f"requires {rows * elements_per_block} (one packed block per row)"
+                )
+            scalars = scalars[::elements_per_block]
+        values = self.read(source, task_core_id=task.core_id).reshape(
+            rows, row_elements
+        )
+        implementation = _ROW_EXPAND_OPERATIONS[task.operation]
+        result = implementation(
+            values, scalars.astype(values.dtype)[:, None]
+        )
+        self.write(destination, result, task_core_id=task.core_id)
 
     def _bitwise_binary(self, task: Task, operation: str) -> None:
         destination = _operand(task, "dst")

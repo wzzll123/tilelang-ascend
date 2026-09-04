@@ -185,6 +185,10 @@ brcb_experiment 已按 EasyASC `pipe_vec.py` 的 A2 语义实现：每个 repeat
 连续 src 元素，把元素 b 广播进 32B 单位偏移 `repeat*dst_rep_stride + b*dst_blk_stride`
 的完整 32B block；dst footprint 按 EasyASC 保守跨距建模并参与 RAW/WAR/WAW，未寻址的
 间隙保持 poison，32B 对齐、模板/src-dst dtype、静态 repeat/stride 均验证。
+row_expand_{mul,sub,div}_experiment 已支持语言层的 (tag, dst, src0, src1[, tmp])
+contract：256B 行、1..255 行、32B 对齐行窗，行 i 取 src1 第 i 块首元素做标量；
+tmp 形式按 codegen 的 brcb(src1→tmp) 端态把广播 scratch 建模为本任务写 region，
+后续 tmp 读者经 WAW/RAW 正确排序。
 topk 已支持 workspace 注入后的最终八参数 ABI、float16/float32、静态 K/max count 和
 静态或 runtime actual count；输出遵循降序交错 `(value, index)` 格式，重复值保持原始
 index 顺序，scratch 作为真实写 region 参与 dependency，并验证 repeat、extent、scope、
@@ -235,7 +239,11 @@ select 已支持 tensor-tensor、literal tensor-scalar 和 indexed BufferLoad sc
 scalar source region 都参与 bounds、poison 与 dependency，执行器按同一 packed predicate
 选择结果。
 tail reduction 已贯通仓库当前验证的 float32、axis 0、clear=true contract，支持
-sum/max/min 对二维 valid rectangle 按列归约；workspace、axis 1 和 accumulate 仍待实现。
+sum/max/min 对二维 valid rectangle 按列归约。axis 1、workspace 与 accumulate 经
+2026-09-04 复核确认为上游 contract 缺失：传播 pass 仅在 axis 0/-2、clear=true、
+float32、无 tmp、非累加时重写 tail_reduce（`ascend_tail_mask_propagation.cc`
+supported_contract），C++ helper 亦只实现该路径（`(void)dim; (void)clear;`）——这些
+variants 在上游暴露实现前继续 fail-closed。
 deprecated AscendC `block_reduce_{sum,max,min}` 已支持 float16/float32、静态 mask、多个
 repeat 及显式 source/destination stride；每个 32B block 独立归约，partial block mask、
 跨 repeat footprint 和依赖均按真实访问建模。`wholereduce{sum,max,min}` 也已支持同一
@@ -311,13 +319,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `423 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `432 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 423 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 432 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -598,7 +606,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：423 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：432 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
