@@ -493,11 +493,10 @@ def merge_sort(
     on multiple sorted blocks using AscendC::MrgSort hardware API.
     blockLen is calculated from each source buffer size.
 
-    Hardware MrgSort format: 4 floats per element
-    - Position 0: sort key (value)
-    - Position 1: data (index)
-    - Position 2-3: reserved/padding
-    - blockLen = number of elements = buffer_size / 4
+    Hardware MrgSort records are always 8 bytes:
+    - float32: two slots, ``[value, index]``
+    - float16: four slots, ``[value, reserved, index-low, index-high]``
+    - blockLen is the scalar buffer size divided by the corresponding slot count
 
     Args:
         dst: The destination buffer or buffer region where the merged result will be stored.
@@ -555,18 +554,26 @@ def merge_sort(
     if num_ways < 2 or num_ways > 4:
         raise ValueError(f"merge_sort requires 2-4 source buffers, got {num_ways}")
 
-    # Calculate blockLen for each source buffer
-    # Value-index pair format: 2 floats per element [value, index]
-    # blockLen = number of elements = buffer_size / 2
-    # Note: Hardware MrgSort has format compatibility issues with this format
+    dtype = _dtype(dst)
+    if dtype not in {"float", "half"}:
+        raise ValueError(f"merge_sort requires float16 or float32 buffers, got {dtype}")
+    source_dtypes = [_dtype(buf) for buf in src_buffers]
+    if any(source_dtype != dtype for source_dtype in source_dtypes):
+        raise ValueError(
+            "merge_sort source and destination buffers must have the same dtype"
+        )
+
+    # MrgSort records are always 8 bytes.  float32 uses [value, index], while
+    # float16 uses [value, reserved, index-low, index-high].
+    record_width = 4 if dtype == "half" else 2
     blockLens = []
     for buf in src_buffers:
         buf_size = math.prod(retrieve_shape(buf))
-        blockLens.append(buf_size // 2)  # Value-index pair format
+        blockLens.append(buf_size // record_width)
 
     args = (
         [
-            f"MergeSort<{_dtype(dst)}>",
+            f"MergeSort<{dtype}>",
             num_ways,
             retrieve_ptr(dst, "w"),
         ]

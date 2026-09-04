@@ -971,6 +971,12 @@ class FunctionalSimulator:
 
     def _merge_sort(self, task: Task) -> None:
         destination = _operand(task, "dst")
+        details = task.metadata.get("merge_sort")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"merge_sort task {task.task_id!r} requires merge_sort metadata"
+            )
+        record_width = _resolve_int(details["record_width"], self.bindings)
         sources = task.metadata.get("src_regions")
         if not isinstance(sources, (tuple, list)) or not all(
             isinstance(source, BufferRegion) for source in sources
@@ -981,22 +987,25 @@ class FunctionalSimulator:
         values = []
         indices = []
         for source_number, source in enumerate(sources):
-            pairs = self.read(
+            records = self.read(
                 source, task_core_id=task.core_id
-            ).reshape(-1, 2)
-            if np.any(pairs[:-1, 0] < pairs[1:, 0]):
+            ).reshape(-1, record_width)
+            if np.any(records[:-1, 0] < records[1:, 0]):
                 raise ProgramValidationError(
                     f"merge_sort source{source_number} is not descending"
                 )
-            values.append(pairs[:, 0])
-            indices.append(pairs[:, 1])
+            values.append(records[:, 0])
+            indices.append(records[:, 1:])
         merged_values = np.concatenate(values)
-        merged_indices = np.concatenate(indices)
+        merged_payloads = np.concatenate(indices)
         order = np.argsort(-merged_values.astype(np.float64), kind="stable")
-        result = np.empty(merged_values.size * 2, dtype=np.float32)
-        result[0::2] = merged_values[order]
-        result[1::2] = merged_indices[order]
-        self.write(destination, result, task_core_id=task.core_id)
+        result = np.empty(
+            (merged_values.size, record_width),
+            dtype=_numpy_dtype(destination.dtype),
+        )
+        result[:, 0] = merged_values[order]
+        result[:, 1:] = merged_payloads[order]
+        self.write(destination, result.reshape(-1), task_core_id=task.core_id)
 
     def _atomic_add(self, task: Task) -> None:
         source = _operand(task, "src")

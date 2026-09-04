@@ -11,7 +11,7 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 65%**。checkbox 裸计数约 73%，但未完成的完整
+- **完整 roadmap：约 66%**。checkbox 裸计数约 74%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
 - **可用功能模拟 MVP：约 98%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
@@ -201,10 +201,12 @@ sort 已支持 workspace 注入后的最终六参数 ABI、float16/float32 和�
 count；只读取有效前缀并产生全局稳定降序的数值型 `(value, index)` 交错输出，aligned
 capacity 尾部不进入排序，scratch 参与 dependency，并在运行前验证 repeat 与
 `ceil(actual_num/32)` 一致。
-merge_sort 已支持仓库验证过的 float32 数值型 value/index pair、2/3/4 路输入，以及
-AscendC 无 scratch 和 PTO 有 scratch 两种最终 ABI；各 source footprint 独立参与 RAW，
-输出保持跨 source 的稳定降序，并拒绝非降序输入、非法 block length、extent、scope、
-alignment 和 template。
+merge_sort 已支持 float32 的两槽 value/index pair 和 float16 的四槽
+value/reserved/index-low/index-high 记录（两者每条记录均为 8B）、2/3/4 路输入，以及
+AscendC 无 scratch 和 PTO 有 scratch 两种最终 ABI；float16 payload 的原始位型会被完整
+保留，语言层也会按四槽记录计算 block length。各 source footprint 独立参与 RAW，输出
+保持跨 source 的稳定降序，并拒绝非降序输入、非法 block length、extent、scope、
+alignment、dtype 和 template。
 init_sort_buf 的 ABI 已修复并实现：语言层 `init_sort_buf(buffer, num, rsv)` 的发射
 顺序已对齐硬件包装层 `InitSortBuf(src, eleNum, rsv=0)`（此前 `(ptr, rsv, num)` 会使
 codegen 把 `rsv` 当作 `eleNum` 传入并丢弃 `num`）；模拟器按
@@ -319,13 +321,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `432 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `437 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 432 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 437 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -533,8 +535,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   编码、alignment/footprint/dtype validation 和 dependency。~~
 - [x] ~~实现 sort 的最终 workspace ABI、静态/runtime actual count、float16/float32
   有效前缀稳定排序、数值型 value/index 输出和 runtime contract validation。~~
-- [x] ~~实现 merge_sort 的 float32 数值型 pair、2/3/4-way、AscendC/PTO 两种最终 ABI、
-  多源 dependency、稳定合并和输入/extent/scope/alignment validation。~~
+- [x] ~~实现 merge_sort 的 float32 两槽和 float16 四槽 8B 记录、2/3/4-way、
+  AscendC/PTO 两种最终 ABI、多源 dependency、稳定合并、float16 payload 位型保留和
+  输入/extent/scope/alignment/dtype validation；修复语言层 float16 block length 计算。~~
 - [x] ~~确认并修复 init_sort_buf ABI 后实现：语言层发射顺序对齐硬件包装层
   `InitSortBuf(src, eleNum, rsv=0)`（原 `(template, buffer, rsv, num)` 会使 codegen 将
   `rsv` 当作 `eleNum` 传入并丢弃 `num`）；模拟器按 `common.h` 语义在 float32 UB
@@ -606,7 +609,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：432 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：437 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -616,8 +619,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 补齐排序族的 float16 merge、offset、NaN 和边界语义（init_sort_buf ABI 已修复并实现，
-   float16 workspace 预填等待可靠 golden）。
+1. 补齐排序族的 offset、NaN 和边界语义（float16 merge 已落地；init_sort_buf ABI 已修复
+   并实现，float16 workspace 预填等待可靠 golden）。
 2. fixpipe quant variants 等待语言层/codegen 暴露实际 TIR contract（当前仓库仅有
    `NO_QUANT` 路径）；bf16/fp32 input MMA 等待可靠的位级精度 contract。
 3. 实现剩余 Cube copy variants（子 tile GM→L1 splice 与 UB→UB/UB→L1 已落地）；

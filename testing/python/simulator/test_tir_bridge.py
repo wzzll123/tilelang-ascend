@@ -1565,27 +1565,30 @@ def _sort_primfunc(
 
 def _merge_sort_primfunc(
     num_ways=2, *, with_scratch=False, destination_extent=None, block_length=4,
+    dtype="float32", reported_block_length=None,
 ):
-    source_extent = 2 * block_length
+    record_width = 4 if dtype == "float16" else 2
+    dtype_name = "half" if dtype == "float16" else "float"
+    source_extent = record_width * block_length
     destination_extent = destination_extent or num_ways * source_extent
     sources = [
         tvm.tir.decl_buffer(
-            (source_extent,), "float32", name=f"source{index}", scope="global"
+            (source_extent,), dtype, name=f"source{index}", scope="global"
         )
         for index in range(num_ways)
     ]
     output = tvm.tir.decl_buffer(
-        (num_ways * source_extent,), "float32", name="output", scope="global"
+        (num_ways * source_extent,), dtype, name="output", scope="global"
     )
     ub_sources = [
         tvm.tir.decl_buffer(
-            (source_extent,), "float32", name=f"ub_source{index}",
+            (source_extent,), dtype, name=f"ub_source{index}",
             scope="shared.ub",
         )
         for index in range(num_ways)
     ]
     ub_output = tvm.tir.decl_buffer(
-        (destination_extent,), "float32", name="ub_output", scope="shared.ub"
+        (destination_extent,), dtype, name="ub_output", scope="shared.ub"
     )
     scratch = tvm.tir.decl_buffer(
         (num_ways * source_extent * 4,), "uint8", name="scratch",
@@ -1599,12 +1602,14 @@ def _merge_sort_primfunc(
         ))
 
     arguments = [
-        "MergeSort<float>", num_ways, ub_output.access_ptr("w"),
+        f"MergeSort<{dtype_name}>", num_ways, ub_output.access_ptr("w"),
     ]
     if with_scratch:
         arguments.append(scratch.access_ptr("w"))
     arguments.extend(source.access_ptr("r") for source in ub_sources)
-    arguments.extend([block_length] * num_ways)
+    arguments.extend([
+        block_length if reported_block_length is None else reported_block_length
+    ] * num_ways)
     statements = [
         copy("copy_gm_to_ub", source, ub_source, source_extent)
         for source, ub_source in zip(sources, ub_sources)
@@ -5517,6 +5522,57 @@ def test_merge_sort_executes_two_to_four_way_abi(
     order = np.argsort(-concatenated[:, 0].astype(np.float64), kind="stable")
     expected = concatenated[order].reshape(-1)
     np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("num_ways", [2, 4])
+def test_merge_sort_executes_float16_eight_byte_records(
+    platform, num_ways
+) -> None:
+    program = build_kernel_program(
+        _merge_sort_primfunc(num_ways, dtype="float16"), platform=platform
+    )
+    *loads, merge, store = program.tasks
+    assert merge.metadata["merge_sort"]["record_width"] == 4
+    assert all(region.shape == (16,) for region in merge.metadata["src_regions"])
+
+    source_records = []
+    simulator = FunctionalSimulator(program)
+    for source_number, load in enumerate(loads):
+        records = np.empty((4, 4), dtype=np.float16)
+        records[:, 0] = np.array(
+            [12 - source_number, 8, 4 + source_number, -source_number],
+            dtype=np.float16,
+        )
+        records[:, 1] = np.float16(100 + source_number)
+        encoded_indices = np.arange(
+            source_number * 10, source_number * 10 + 4, dtype=np.int32
+        ).view(np.float16).reshape(4, 2)
+        records[:, 2:4] = encoded_indices
+        source_records.append(records)
+        simulator.write(load.metadata["src"], records.reshape(-1))
+    simulator.run()
+
+    concatenated = np.concatenate(source_records)
+    order = np.argsort(-concatenated[:, 0].astype(np.float64), kind="stable")
+    expected = concatenated[order]
+    actual = simulator.read(store.metadata["dst"]).reshape(-1, 4)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(
+        actual[:, 2:4].reshape(-1).view(np.int32),
+        expected[:, 2:4].reshape(-1).view(np.int32),
+    )
+
+
+def test_merge_sort_rejects_legacy_float16_pair_block_length() -> None:
+    with pytest.raises(ProgramValidationError, match="source extent"):
+        build_kernel_program(
+            _merge_sort_primfunc(
+                dtype="float16", block_length=4, reported_block_length=8,
+                destination_extent=64,
+            ),
+            platform="A2",
+        )
 
 
 def test_merge_sort_rejects_bad_extent_and_unsorted_input() -> None:

@@ -3346,6 +3346,20 @@ class _TirBridge:
         if len(arguments) < 7:
             raise UnsupportedSimOpError("functional merge_sort ABI is malformed")
         template = self._literal(arguments[0])
+        if not isinstance(template, str) or not (
+            template.startswith("MergeSort<") and template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "merge_sort template must be MergeSort<dtype>"
+            )
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional merge_sort supports float16 and float32 records"
+            )
+        record_width = 4 if template_dtype == "float16" else 2
         num_ways = self._const_int(arguments[1], context.environment)
         if num_ways not in {2, 3, 4}:
             raise ProgramValidationError(
@@ -3376,13 +3390,13 @@ class _TirBridge:
             raise UnsupportedSimOpError(
                 "functional merge_sort requires static pointer extents"
             )
-        output_elements = 2 * sum(lengths)
+        output_elements = record_width * sum(lengths)
         if destination_extent < output_elements:
             raise ProgramValidationError(
                 "merge_sort destination extent is too small for all pairs"
             )
         if any(
-            extent < 2 * length
+            extent < record_width * length
             for extent, length in zip(source_extents, lengths)
         ):
             raise ProgramValidationError(
@@ -3392,7 +3406,9 @@ class _TirBridge:
             arguments[2], (output_elements,), context
         )
         sources = tuple(
-            self._access_buffer_region(argument, (2 * length,), context)
+            self._access_buffer_region(
+                argument, (record_width * length,), context
+            )
             for argument, length in zip(
                 arguments[source_start:length_start], lengths
             )
@@ -3405,11 +3421,11 @@ class _TirBridge:
             for region in (destination,) + typed_sources
         ):
             raise ProgramValidationError("merge_sort requires UB operands")
-        if destination.dtype != "float32" or any(
-            source.dtype != "float32" for source in typed_sources
+        if destination.dtype != template_dtype or any(
+            source.dtype != template_dtype for source in typed_sources
         ):
-            raise UnsupportedSimOpError(
-                "functional merge_sort currently supports verified float32 pairs only"
+            raise ProgramValidationError(
+                "merge_sort buffer dtypes must match its template"
             )
         for label, region in (("destination", destination),) + tuple(
             (f"source{index}", source)
@@ -3419,14 +3435,14 @@ class _TirBridge:
                 raise ProgramValidationError(
                     f"merge_sort {label} pointer must be 32-byte aligned"
                 )
-        if not isinstance(template, str) or template != "MergeSort<float>":
-            raise ProgramValidationError(
-                "merge_sort template must be MergeSort<float>"
-            )
         metadata: Dict[str, Any] = {
             "dst": destination,
             "src_regions": typed_sources,
-            "merge_sort": {"num_ways": num_ways, "lengths": lengths},
+            "merge_sort": {
+                "num_ways": num_ways,
+                "lengths": lengths,
+                "record_width": record_width,
+            },
         }
         if has_scratch:
             scratch_extent = self._access_ptr_extent(arguments[3], context)
