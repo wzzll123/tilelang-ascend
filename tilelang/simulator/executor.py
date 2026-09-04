@@ -43,6 +43,7 @@ _BINARY_OPERATIONS = {
     "max": np.maximum,
     "min": np.minimum,
     "pow": np.power,
+    "sub_experiment": np.subtract,
 }
 
 _SCALAR_OPERATIONS = {
@@ -53,10 +54,12 @@ _SCALAR_OPERATIONS = {
     "maxs": np.maximum,
     "mins": np.minimum,
     "leaky_relu": lambda value, slope: np.where(value >= 0, value, value * slope),
+    "mins_experiment": np.minimum,
 }
 
 _UNARY_OPERATIONS = {
     "abs": np.abs,
+    "abs_experiment": np.abs,
     "exp": np.exp,
     "ln": np.log,
     "reciprocal": lambda value: np.divide(1, value),

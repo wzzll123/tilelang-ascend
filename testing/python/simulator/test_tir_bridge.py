@@ -1764,6 +1764,55 @@ def _scratch_unary_primfunc(
     )
 
 
+def _elementwise_experiment_primfunc(operation, *, dtype="float32", count=8):
+    source = tvm.tir.decl_buffer((8,), dtype, name="source", scope="global")
+    right = tvm.tir.decl_buffer((8,), dtype, name="right", scope="global")
+    output = tvm.tir.decl_buffer((8,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_right = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_right", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_output", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), 8,
+        ))
+
+    arguments = [ub_output.access_ptr("w"), ub_source.access_ptr("r")]
+    if operation == "sub_experiment":
+        arguments.append(ub_right.access_ptr("r"))
+    elif operation == "mins_experiment":
+        arguments.append(1.5)
+    arguments.append(count)
+    statements = [copy("copy_gm_to_ub", source, ub_source)]
+    parameters = [source.data]
+    buffer_map = {source.data: source, output.data: output}
+    if operation == "sub_experiment":
+        statements.append(copy("copy_gm_to_ub", right, ub_right))
+        parameters.append(right.data)
+        buffer_map[right.data] = right
+    statements.extend([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", f"tl.ascend_{operation}", *arguments,
+        )),
+        copy("copy_ub_to_gm", ub_output, output),
+    ])
+    parameters.append(output.data)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_source, ub_right, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        parameters, tvm.tir.BlockRealize([], True, root), buffer_map=buffer_map
+    )
+
+
 def _pow_clamp_primfunc(operation, *, with_scratch=False):
     source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
     exponent = tvm.tir.decl_buffer((5,), "float32", name="exponent", scope="global")
@@ -5685,6 +5734,49 @@ def test_real_tir_scalar_activation_builds_operands_and_executes(operation) -> N
     simulator.run()
 
     np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("sub_experiment", lambda source, right: source - right),
+        ("abs_experiment", lambda source, right: np.abs(source)),
+        ("mins_experiment", lambda source, right: np.minimum(source, 1.5)),
+    ],
+)
+def test_elementwise_experiment_intrinsics_execute(
+    platform, dtype, operation, expected
+) -> None:
+    program = build_kernel_program(
+        _elementwise_experiment_primfunc(operation, dtype=dtype),
+        platform=platform,
+    )
+    vector = next(task for task in program.tasks if task.operation == operation)
+    store = program.tasks[-1]
+    expected_dependencies = 2 if operation == "sub_experiment" else 1
+    assert len(vector.dependencies) == expected_dependencies
+    assert store.dependencies == (vector.task_id,)
+
+    source = np.array([-4, -2, -0.5, 0, 1, 2, 4, 8], dtype=dtype)
+    right = np.array([1, -1, 2, 3, -2, 0.5, 4, 9], dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(program.tasks[0].metadata["src"], source)
+    if operation == "sub_experiment":
+        simulator.write(program.tasks[1].metadata["src"], right)
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(store.metadata["dst"]), expected(source, right)
+    )
+
+
+def test_elementwise_experiment_rejects_negative_count() -> None:
+    with pytest.raises(ProgramValidationError, match="must not be negative"):
+        build_kernel_program(
+            _elementwise_experiment_primfunc("abs_experiment", count=-1),
+            platform="A2",
+        )
 
 
 @pytest.mark.parametrize(

@@ -752,7 +752,7 @@ class _TirBridge:
         """Extract executable operands for currently supported copy and vector forms."""
         normalized = operation.lower()
         short = _short_operation(normalized)
-        if short in {"add", "sub", "mul", "div", "min", "max"}:
+        if short in {"add", "sub", "mul", "div", "min", "max", "sub_experiment"}:
             return self._binary_metadata(arguments, context, tail=tail_kind is not None)
         if short in {"bitwise_and", "bitwise_or"}:
             return self._bitwise_metadata(
@@ -762,6 +762,7 @@ class _TirBridge:
             return self._bitwise_metadata(self._pow_metadata(arguments, context))
         if short in {
             "adds", "subs", "muls", "divs", "mins", "maxs", "leaky_relu",
+            "mins_experiment",
         }:
             return self._scalar_metadata(arguments, context, tail=tail_kind is not None)
         if short == "axpy":
@@ -784,7 +785,10 @@ class _TirBridge:
                 )
             metadata["accumulator"] = metadata["dst"]
             return metadata
-        if short in {"abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt"}:
+        if short in {
+            "abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt",
+            "abs_experiment",
+        }:
             return self._unary_metadata(arguments, context, tail=tail_kind is not None)
         if short == "bitwise_not":
             return self._bitwise_metadata(
