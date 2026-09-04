@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 """Functional execution of concrete simulator tasks on CPU memory."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -21,6 +21,11 @@ from .program import (
 )
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .sync import FlagBarrierSynchronizationModel
+
+# InitSortBuf writes the fp32 -inf bit pattern into even int32 lanes and -1
+# into odd lanes of the sort workspace's reinterpreted int32 view
+# (src/tl_templates/ascend/common.h).
+_INIT_SORT_BUF_VALUE_INT32 = np.int32(-8388608)  # 0xFF800000
 
 
 _BINARY_OPERATIONS = {
@@ -254,6 +259,9 @@ class FunctionalSimulator:
             return
         if operation == "sort":
             self._sort(task)
+            return
+        if operation == "init_sort_buf":
+            self._init_sort_buf(task)
             return
         if operation == "merge_sort":
             self._merge_sort(task)
@@ -793,6 +801,27 @@ class FunctionalSimulator:
         result[0::2] = values[order]
         result[1::2] = order
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _init_sort_buf(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        details = task.metadata.get("init_sort_buf")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"init_sort_buf task {task.task_id!r} requires init_sort_buf metadata"
+            )
+        covered = _resolve_int(details["covered_elements"], self.bindings)
+        if covered < 0:
+            raise ProgramValidationError(
+                "init_sort_buf covered element count must not be negative, "
+                f"got {covered}"
+            )
+        if covered == 0:
+            return
+        region = replace(destination, shape=(covered,))
+        pattern = np.empty(covered, dtype=np.int32)
+        pattern[0::2] = _INIT_SORT_BUF_VALUE_INT32
+        pattern[1::2] = -1
+        self.write(region, pattern.view(np.float32), task_core_id=task.core_id)
 
     def _merge_sort(self, task: Task) -> None:
         destination = _operand(task, "dst")

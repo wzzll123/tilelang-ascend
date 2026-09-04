@@ -890,11 +890,16 @@ def init_sort_buf(buffer: Buffer, num: PrimExpr, rsv: PrimExpr):
     buffer, which is typically required as an auxiliary or index buffer for
     hardware sorting instructions.
 
+    The hardware wrapper ABI is ``InitSortBuf<T>(src, eleNum, rsv = 0)``: ``num``
+    counts 32-bit elements of the buffer's reinterpreted int32 view, and only
+    whole 64-element (256-byte) blocks are written; ``rsv`` is a reserved
+    parameter that the hardware wrapper ignores.
+
     Args:
         buffer: The buffer to be initialized.
-        num: The number of elements to initialize in the buffer.
-        rsv: A reserved parameter or specific initialization value required by
-            the hardware API.
+        num: The number of 32-bit elements to initialize in the buffer.
+        rsv: A reserved parameter forwarded in the template ABI position; the
+            hardware wrapper ignores it.
 
     Returns:
         A TVM intrinsic call that performs the buffer initialization.
@@ -904,8 +909,8 @@ def init_sort_buf(buffer: Buffer, num: PrimExpr, rsv: PrimExpr):
         tir.op.Op.get("tl.ascend_init_sort_buf"),
         f"InitSortBuf<{_dtype(buffer)}>",
         buffer.access_ptr("w"),
-        rsv,
         num,
+        rsv,
     )
 
 

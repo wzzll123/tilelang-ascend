@@ -4555,6 +4555,185 @@ def test_sort_validates_repeat_extent_and_template() -> None:
         )
 
 
+def _init_sort_buf_primfunc(
+    *,
+    num=128,
+    capacity=None,
+    dtype="float32",
+    scope="shared.ub",
+    template_dtype=None,
+    drop_rsv=False,
+):
+    capacity = num if capacity is None else capacity
+    workspace = tvm.tir.decl_buffer(
+        (capacity,), dtype, name="workspace", scope=scope
+    )
+    dtype_name = template_dtype or {"float16": "half", "float32": "float"}[dtype]
+    call_args = [
+        f"InitSortBuf<{dtype_name}>",
+        workspace.access_ptr("w"),
+        num,
+    ]
+    if not drop_rsv:
+        call_args.append(0)
+    body = tvm.tir.Evaluate(tvm.tir.call_extern(
+        "handle", "tl.ascend_init_sort_buf", *call_args,
+    ))
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[workspace],
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
+def _init_sort_buf_pipeline_primfunc(*, num=128):
+    output = tvm.tir.decl_buffer((num,), "float32", name="output", scope="global")
+    workspace = tvm.tir.decl_buffer(
+        (num,), "float32", name="workspace", scope="shared.ub"
+    )
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_fill",
+            workspace.access_ptr("w"), tvm.tir.FloatImm("float32", 1.5), num,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_init_sort_buf", "InitSortBuf<float>",
+            workspace.access_ptr("w"), num, 0,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_ub_to_gm",
+            workspace.access_ptr("r"), output.access_ptr("w"), num,
+        )),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[workspace],
+    )
+    return tvm.tir.PrimFunc(
+        [],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={output.data: output},
+    )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_init_sort_buf_fills_alternating_value_index_lanes(platform) -> None:
+    program = build_kernel_program(_init_sort_buf_primfunc(), platform=platform)
+    (init,) = program.tasks
+    assert (init.operation, init.lane, init.pipe) == (
+        "init_sort_buf", Lane.VECTOR_0, Pipe.VECTOR,
+    )
+    assert init.metadata["init_sort_buf"]["element_count"] == 128
+    assert init.metadata["init_sort_buf"]["covered_elements"] == 128
+
+    simulator = FunctionalSimulator(program)
+    simulator.run()
+    values = simulator.read(init.metadata["dst"]).reshape(-1)
+    assert values.dtype == np.float32
+    np.testing.assert_array_equal(
+        values.view(np.int32)[0::2], np.int32(-8388608)
+    )
+    np.testing.assert_array_equal(values.view(np.int32)[1::2], np.int32(-1))
+    np.testing.assert_array_equal(values[0::2], np.float32("-inf"))
+
+
+@pytest.mark.parametrize("num", [130, 191])
+def test_init_sort_buf_leaves_non_block_tail_unwritten(num) -> None:
+    program = build_kernel_program(
+        _init_sort_buf_primfunc(num=num), platform="A2"
+    )
+    (init,) = program.tasks
+    covered = num - num % 64
+    assert init.metadata["init_sort_buf"]["covered_elements"] == covered
+
+    simulator = FunctionalSimulator(program)
+    simulator.run()
+    prefix = simulator.read(
+        BufferRegion(
+            init.metadata["dst"].buffer,
+            MemoryScope.UB,
+            (covered,),
+            "float32",
+        )
+    ).reshape(-1).view(np.int32)
+    assert prefix.size == covered
+    np.testing.assert_array_equal(prefix[0::2], np.int32(-8388608))
+    np.testing.assert_array_equal(prefix[1::2], np.int32(-1))
+    with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+        simulator.read(
+            BufferRegion(
+                init.metadata["dst"].buffer,
+                MemoryScope.UB,
+                (num - covered,),
+                "float32",
+                byte_offset=covered * 4,
+            )
+        )
+
+
+def test_init_sort_buf_skips_entirely_below_one_block() -> None:
+    program = build_kernel_program(
+        _init_sort_buf_primfunc(num=32), platform="A3"
+    )
+    (init,) = program.tasks
+    assert init.metadata["init_sort_buf"]["covered_elements"] == 0
+    simulator = FunctionalSimulator(program)
+    simulator.run()
+    with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+        simulator.read(init.metadata["dst"])
+
+
+def test_init_sort_buf_orders_waw_and_raw_in_pipeline() -> None:
+    program = build_kernel_program(
+        _init_sort_buf_pipeline_primfunc(), platform="A2"
+    )
+    fill, init, store = program.tasks
+    assert init.dependencies == (fill.task_id,)
+    assert store.dependencies == (init.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    simulator.run()
+    values = simulator.read(store.metadata["dst"]).reshape(-1)
+    np.testing.assert_array_equal(
+        values.view(np.int32)[0::2], np.int32(-8388608)
+    )
+    np.testing.assert_array_equal(values.view(np.int32)[1::2], np.int32(-1))
+
+
+def test_init_sort_buf_rejects_non_static_count_and_extent() -> None:
+    num = tvm.tir.Var("num", "int32")
+    with pytest.raises(UnsupportedSimOpError, match="static element count"):
+        build_kernel_program(_init_sort_buf_primfunc(num=num), platform="A2")
+    with pytest.raises(UnsupportedSimOpError, match="static destination extent"):
+        build_kernel_program(
+            _init_sort_buf_primfunc(capacity=tvm.tir.Var("cap", "int32")),
+            platform="A2",
+        )
+
+
+def test_init_sort_buf_rejects_legacy_three_argument_abi() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="four-argument"):
+        build_kernel_program(_init_sort_buf_primfunc(drop_rsv=True), platform="A2")
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_init_sort_buf_rejects_gm_scope_and_dtype_mismatch(platform) -> None:
+    with pytest.raises(ProgramValidationError, match="UB destination"):
+        build_kernel_program(
+            _init_sort_buf_primfunc(scope="global"), platform=platform
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype"):
+        build_kernel_program(
+            _init_sort_buf_primfunc(template_dtype="half"), platform=platform
+        )
+    with pytest.raises(UnsupportedSimOpError, match="float32 workspaces"):
+        build_kernel_program(
+            _init_sort_buf_primfunc(dtype="float16"), platform=platform
+        )
+    with pytest.raises(ProgramValidationError, match="exceeds destination extent"):
+        build_kernel_program(
+            _init_sort_buf_primfunc(num=96, capacity=64), platform=platform
+        )
+
+
 @pytest.mark.parametrize("num_ways", [2, 3, 4])
 @pytest.mark.parametrize(
     ("platform", "with_scratch"), [("A2", False), ("A3", True)]

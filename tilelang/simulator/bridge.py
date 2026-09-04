@@ -57,6 +57,10 @@ _TAIL_OPERATIONS = {
 
 _TAIL_REDUCE_OPERATIONS = frozenset({"reduce_max", "reduce_min", "reduce_sum"})
 
+# InitSortBuf fills whole 64-int32 (256-byte) vector repeats of the buffer's
+# reinterpreted int32 view; see src/tl_templates/ascend/common.h.
+_INIT_SORT_BUF_BLOCK_ELEMENTS = 64
+
 
 @dataclass(frozen=True)
 class _Context:
@@ -825,6 +829,8 @@ class _TirBridge:
             return self._sort_metadata(arguments, context)
         if short == "merge_sort":
             return self._merge_sort_metadata(arguments, context)
+        if short == "init_sort_buf":
+            return self._init_sort_buf_metadata(arguments, context)
         if short == "atomic_add_ub_to_gm":
             return self._atomic_add_ub_metadata(operation, arguments, context)
         if short == "atomic_add_l0c_to_gm":
@@ -2743,6 +2749,76 @@ class _TirBridge:
                 "actual_num": actual_num,
                 "repeat_times": repeat_times,
                 "source_capacity": source_extent,
+            },
+        }
+
+    def _init_sort_buf_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: template, dst, num, rsv.  The hardware wrapper signature is
+        # InitSortBuf(src, eleNum, rsv=0); rsv is reserved and ignored, and only
+        # whole 64-int32 blocks of the reinterpreted view are written.
+        if len(arguments) != 4:
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf requires the four-argument "
+                "(template, dst, num, rsv) ABI"
+            )
+        template = self._literal(arguments[0])
+        if (
+            not isinstance(template, str)
+            or not template.startswith("InitSortBuf<")
+            or not template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "init_sort_buf template must be InitSortBuf<dtype>"
+            )
+        element_count = self._runtime_int(arguments[2], context.environment)
+        if not isinstance(element_count, int):
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf requires a static element count"
+            )
+        if element_count <= 0:
+            raise ProgramValidationError(
+                "init_sort_buf element count must be positive"
+            )
+        capacity = self._access_ptr_extent(arguments[1], context)
+        if not isinstance(capacity, int):
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf requires a static destination extent"
+            )
+        if element_count > capacity:
+            raise ProgramValidationError(
+                f"init_sort_buf element count {element_count} exceeds destination "
+                f"extent {capacity}"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (element_count,), context
+        )
+        if destination is None:
+            return {}
+        if destination.scope is not MemoryScope.UB:
+            raise ProgramValidationError("init_sort_buf requires a UB destination")
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype is None or template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "init_sort_buf template dtype must match destination"
+            )
+        if destination.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf currently supports float32 workspaces; "
+                "the upstream int32-lane fill pattern has no confirmed "
+                "float16 contract"
+            )
+        covered = element_count - element_count % _INIT_SORT_BUF_BLOCK_ELEMENTS
+        return {
+            "dst": destination,
+            "init_sort_buf": {
+                "element_count": element_count,
+                "covered_elements": covered,
             },
         }
 
