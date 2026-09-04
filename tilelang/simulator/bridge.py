@@ -919,13 +919,26 @@ class _TirBridge:
                 "valid_cols": valid_cols,
                 "stride_n": self._literal(arguments[2]),
             }
-            if len(arguments) > 5:
+            gm_to_ub = "copy_gm_to_ub" in normalized
+            legacy_ub_to_gm = not gm_to_ub and len(arguments) >= 8
+            if (gm_to_ub or legacy_ub_to_gm) and len(arguments) > 5:
                 details["pad_value"] = self._literal(
                     self.analyzer.simplify(arguments[5])
                 )
-            if len(arguments) > 6:
-                physical_rows_arg = arguments[6] if len(arguments) > 7 else 1
-                physical_cols_arg = arguments[7] if len(arguments) > 7 else arguments[6]
+            # GM->UB carries pad_value before its optional physical shape;
+            # UB->GM has no pad argument, so its physical shape starts one
+            # position earlier.
+            physical_start = 6 if gm_to_ub or legacy_ub_to_gm else 5
+            if len(arguments) > physical_start:
+                has_physical_rows = len(arguments) > physical_start + 1
+                physical_rows_arg = (
+                    arguments[physical_start] if has_physical_rows else 1
+                )
+                physical_cols_arg = (
+                    arguments[physical_start + 1]
+                    if has_physical_rows
+                    else arguments[physical_start]
+                )
                 physical_rows = self._runtime_int(
                     physical_rows_arg, context.environment
                 )
@@ -938,7 +951,9 @@ class _TirBridge:
                     valid_rows, valid_cols, physical_rows, physical_cols
                 )) and (valid_rows > physical_rows or valid_cols > physical_cols):
                     raise ProgramValidationError(
-                        "copy valid rectangle must fit its physical destination tile"
+                        "copy valid rectangle "
+                        f"({valid_rows}, {valid_cols}) must fit its physical "
+                        f"destination tile ({physical_rows}, {physical_cols})"
                     )
                 details["physical_rows"] = physical_rows
                 details["physical_cols"] = physical_cols

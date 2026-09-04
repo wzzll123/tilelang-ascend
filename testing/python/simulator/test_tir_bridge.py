@@ -4564,6 +4564,43 @@ def test_access_ptr_offsets_and_valid_rectangle_execute(operation: str) -> None:
     np.testing.assert_array_equal(simulator.read(destination), expected)
 
 
+def test_ub_to_gm_lowered_abi_has_no_padding_argument() -> None:
+    source = tvm.tir.decl_buffer(
+        (2, 8), "float32", name="source", scope="shared.ub"
+    )
+    destination = tvm.tir.decl_buffer(
+        (4, 8), "float32", name="destination", scope="global"
+    )
+    call = tvm.tir.call_extern(
+        "handle",
+        "tl::ascend::copy_ub_to_gm<float32, 8, 2>",
+        source.access_ptr("r", extent=16),
+        destination.access_ptr("w", extent=16),
+        8,
+        2,
+        5,
+        2,
+        8,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(call), alloc_buffers=[source]
+    )
+    func = tvm.tir.PrimFunc(
+        [destination.data],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={destination.data: destination},
+    )
+
+    copy = build_kernel_program(func, platform="A2").tasks[0].metadata["copy"]
+    assert copy == {
+        "valid_rows": 2,
+        "valid_cols": 5,
+        "stride_n": 8,
+        "physical_rows": 2,
+        "physical_cols": 8,
+    }
+
+
 def test_real_tir_vector_add_builds_dependencies_and_executes_end_to_end() -> None:
     program = build_kernel_program(_vector_add_primfunc(), platform="A3")
     assert [task.operation for task in program.tasks] == [

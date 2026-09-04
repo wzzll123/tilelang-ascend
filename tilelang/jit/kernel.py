@@ -123,10 +123,6 @@ class JITKernel:
 
         # The adapter's function is assigned as the callable function for this instance.
         self.adapter = adapter
-        if simulator:
-            self.params = adapter.params
-            self.out_idx = adapter.result_idx
-            self.workspace_idx = adapter.workspace_idx
         self.torch_function = adapter.func
 
     def _create_simulator_adapter(

@@ -15,7 +15,7 @@ from tilelang.utils.tensor import (
     adapt_torch2tvm,
 )
 from tilelang.engine.param import KernelParam
-from tilelang.jit.adapter import BaseKernelAdapter
+from tilelang.jit.adapter.base import BaseKernelAdapter
 from tilelang.profiler.bench import do_bench
 
 

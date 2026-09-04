@@ -16,7 +16,8 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
   权重更高，因此采用保守工作量加权值。
 - **可用功能模拟 MVP：约 99%**。已有 TIR→NumPy、CPU Torch/NumPy tensor adapter、
   内存/hazard、调度/trace，以及核心 vector、reduction 和 half GEMM vertical slices；
-  尚需在 Linux 完整 TileLang 构建上验证实际 example lowering，并继续覆盖复杂算子指令。
+  macOS 已验证实际 example 能完成完整 lowering 并进入功能执行，尚需补齐多核索引和
+  复杂 example 指令覆盖，并在 Linux+CANN 环境交叉验证。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
 
@@ -312,14 +313,35 @@ BT bias vertical slice 已打通：float32 RowMajor L1 通过 64B 对齐的 `cop
 
 尚未支持任意 TIR Call 或未列入上述白名单的动态表达式、通用 mask、完整 software
 pipeline、其余 Cube copy/MMA/fixpipe variants，以及后续 P3–P8 operation。
-JIT adapter 的静态 schedule 可用，但普通 tensor 调用仍应 fail-closed，直到 bridge
-能为实际 kernel 生成完整可执行 operands。
+JIT adapter 已支持 CPU Torch/NumPy tensor 调用；当 bridge 无法为实际 kernel 生成完整
+可执行 operands 时继续 fail-closed。
 
 ### 开发和验证环境
 
-当前 macOS ARM 环境已在 `3rdparty/tvm/build` 构建 CPU-only TVM；构建产物不提交。
+当前 macOS ARM 环境已有 `3rdparty/tvm/build` 的 CPU-only TVM，并在仓库根目录 `build/`
+构建了 `libtilelang_module.dylib`；构建产物不提交。
 它可以验证 Memory/SimIR/scheduler/真实 TVM TIR bridge，不能验证 CANN codegen、A2/A3
 真机功能或 timing calibration。
+
+macOS Command Line Tools 26.x 需要显式使用 SDK 中的 libc++ headers。重新配置/编译时：
+
+```bash
+export CPLUS_INCLUDE_PATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
+cmake -S . -B build -G Ninja \
+  -DTVM_PREBUILD_PATH="$PWD/3rdparty/tvm/build" \
+  -DTVM_SOURCE_DIR="$PWD/3rdparty/tvm" \
+  -DUSE_ASCEND=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_LLVM=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target tilelang_module -j8
+```
+
+运行前设置本地 TVM/TileLang 路径，可避免依赖系统安装：
+
+```bash
+export PYTHONPATH="$PWD:$PWD/3rdparty/tvm/python${PYTHONPATH:+:$PYTHONPATH}"
+export TVM_LIBRARY_PATH="$PWD/3rdparty/tvm/build"
+export TILELANG_LIBRARY_PATH="$PWD/build"
+```
 
 运行 simulator 回归：
 
@@ -329,13 +351,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `462 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `463 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 462 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 463 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -624,7 +646,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：462 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：463 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -634,8 +656,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 在 Linux 完整 TileLang 构建上运行 `elementwise_add.py --simulator`，随后依次接入
-   merge_sort、gemm 和 flash_attention example，按真实 final TIR 补 fail-closed 缺口。
+1. macOS 上 `elementwise_add.py --simulator` 已完成真实 final-TIR lowering：默认
+   `block_M=128` 的三块 fp32 UB 共需 196608 B，超过后端 196352 B 上限；缩小 tile 后
+   已进入执行并暴露多 core `blockIdx.x` 地址表达式尚未解析。先补该索引 bridge，再依次
+   接入 merge_sort、gemm 和 flash_attention example，并在 Linux+CANN 环境交叉验证。
 2. 补齐排序族的 offset、NaN 和边界语义（float16 merge 已落地；init_sort_buf ABI 已修复
    并实现，float16 workspace 预填等待可靠 golden）。
 3. fixpipe quant variants 等待语言层/codegen 暴露实际 TIR contract（当前仓库仅有
