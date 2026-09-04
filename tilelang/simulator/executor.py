@@ -243,6 +243,12 @@ class FunctionalSimulator:
         if operation == "fill":
             self._fill(task)
             return
+        if operation == "reducesum_experiment":
+            self._reduce_sum_experiment(task)
+            return
+        if operation == "sum_experiment":
+            self._sum_experiment(task)
+            return
         if operation == "brcb_experiment":
             self._brcb(task)
             return
@@ -743,6 +749,51 @@ class FunctionalSimulator:
         self.write(
             destination,
             np.asarray(values, dtype=_numpy_dtype(destination.dtype)),
+            task_core_id=task.core_id,
+        )
+
+    def _reduce_sum_experiment(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        count = _resolve_int(task.metadata.get("count"), self.bindings)
+        if count < 0:
+            raise ProgramValidationError(
+                "reducesum_experiment count must not be negative"
+            )
+        values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        result = np.sum(values, dtype=values.dtype)
+        self.write(
+            destination,
+            np.asarray([result], dtype=_numpy_dtype(destination.dtype)),
+            task_core_id=task.core_id,
+        )
+
+    def _sum_experiment(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        details = task.metadata.get("sum_experiment")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"sum_experiment task {task.task_id!r} requires metadata"
+            )
+        outer = _resolve_int(details["outer"], self.bindings)
+        inner = _resolve_int(details["inner"], self.bindings)
+        valid = _resolve_int(details["valid"], self.bindings)
+        if min(outer, inner, valid) < 0:
+            raise ProgramValidationError("sum_experiment extents must not be negative")
+        if valid > inner:
+            raise ProgramValidationError(
+                "sum_experiment valid width must not exceed inner width"
+            )
+        if inner * _numpy_dtype(source.dtype).itemsize % 32:
+            raise ProgramValidationError(
+                "sum_experiment inner rows must be 32-byte aligned"
+            )
+        values = self.read(source, task_core_id=task.core_id)
+        result = np.sum(values[:, :valid], axis=1, dtype=values.dtype)
+        self.write(
+            destination,
+            np.asarray(result, dtype=_numpy_dtype(destination.dtype)),
             task_core_id=task.core_id,
         )
 

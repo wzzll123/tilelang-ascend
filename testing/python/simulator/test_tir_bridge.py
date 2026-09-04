@@ -1813,6 +1813,91 @@ def _elementwise_experiment_primfunc(operation, *, dtype="float32", count=8):
     )
 
 
+def _reduce_sum_experiment_primfunc(
+    *, dtype="float32", count=8, with_scratch=True, scratch_dtype=None
+):
+    source = tvm.tir.decl_buffer((8,), dtype, name="source", scope="global")
+    output = tvm.tir.decl_buffer((1,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (8,), dtype, name="ub_output", scope="shared.ub"
+    )
+    scratch = tvm.tir.decl_buffer(
+        (8,), scratch_dtype or dtype, name="scratch", scope="shared.ub"
+    )
+
+    def copy(name, source_buffer, destination_buffer, elements):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), elements,
+        ))
+
+    arguments = [ub_output.access_ptr("w"), ub_source.access_ptr("r")]
+    if with_scratch:
+        arguments.append(scratch.access_ptr("w"))
+    arguments.append(count)
+    statements = [
+        copy("copy_gm_to_ub", source, ub_source, 8),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_reducesum_experiment", *arguments,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, 1),
+    ]
+    alloc_buffers = [ub_source, ub_output]
+    if with_scratch:
+        alloc_buffers.append(scratch)
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=alloc_buffers,
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data], tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
+def _sum_experiment_primfunc(
+    *, dtype="float32", outer=3, inner=8, valid=5, template_dtype=None
+):
+    source = tvm.tir.decl_buffer(
+        (outer * inner,), dtype, name="source", scope="global"
+    )
+    output = tvm.tir.decl_buffer((outer,), dtype, name="output", scope="global")
+    ub_source = tvm.tir.decl_buffer(
+        (outer * inner,), dtype, name="ub_source", scope="shared.ub"
+    )
+    ub_output = tvm.tir.decl_buffer(
+        (outer,), dtype, name="ub_output", scope="shared.ub"
+    )
+    dtype_name = template_dtype or ("half" if dtype == "float16" else "float")
+
+    def copy(name, source_buffer, destination_buffer, elements):
+        return tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", name, source_buffer.access_ptr("r"),
+            destination_buffer.access_ptr("w"), elements,
+        ))
+
+    statements = [
+        copy("copy_gm_to_ub", source, ub_source, outer * inner),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_sum_experiment",
+            f"Sum_experiment<{dtype_name}>", ub_output.access_ptr("w"),
+            ub_source.access_ptr("r"), outer, inner, valid,
+        )),
+        copy("copy_ub_to_gm", ub_output, output, outer),
+    ]
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.SeqStmt(statements),
+        alloc_buffers=[ub_source, ub_output],
+    )
+    return tvm.tir.PrimFunc(
+        [source.data, output.data], tvm.tir.BlockRealize([], True, root),
+        buffer_map={source.data: source, output.data: output},
+    )
+
+
 def _pow_clamp_primfunc(operation, *, with_scratch=False):
     source = tvm.tir.decl_buffer((5,), "float32", name="source", scope="global")
     exponent = tvm.tir.decl_buffer((5,), "float32", name="exponent", scope="global")
@@ -5775,6 +5860,94 @@ def test_elementwise_experiment_rejects_negative_count() -> None:
     with pytest.raises(ProgramValidationError, match="must not be negative"):
         build_kernel_program(
             _elementwise_experiment_primfunc("abs_experiment", count=-1),
+            platform="A2",
+        )
+
+
+@pytest.mark.parametrize(
+    ("platform", "dtype", "with_scratch"),
+    [
+        ("A2", "float16", False),
+        ("A2", "float32", True),
+        ("A3", "float16", True),
+        ("A3", "float32", False),
+    ],
+)
+def test_reduce_sum_experiment_executes_final_abi(
+    platform, dtype, with_scratch
+) -> None:
+    program = build_kernel_program(
+        _reduce_sum_experiment_primfunc(
+            dtype=dtype, with_scratch=with_scratch
+        ),
+        platform=platform,
+    )
+    reduction = next(
+        task for task in program.tasks
+        if task.operation == "reducesum_experiment"
+    )
+    load, store = program.tasks[0], program.tasks[-1]
+    assert reduction.metadata["dst"].shape == (1,)
+    assert reduction.metadata["src"].shape == (8,)
+    assert reduction.dependencies == (load.task_id,)
+    assert store.dependencies == (reduction.task_id,)
+    assert ("scratch" in reduction.metadata) is with_scratch
+
+    values = np.array([-4, -2, -0.5, 0, 1, 2, 4, 8], dtype=dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values)
+    simulator.run()
+    expected = np.asarray([np.sum(values, dtype=values.dtype)], dtype=dtype)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_reduce_sum_experiment_validates_count_and_scratch_dtype() -> None:
+    with pytest.raises(ProgramValidationError, match="count must not be negative"):
+        build_kernel_program(
+            _reduce_sum_experiment_primfunc(count=-1), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="scratch must match"):
+        build_kernel_program(
+            _reduce_sum_experiment_primfunc(scratch_dtype="float16"),
+            platform="A3",
+        )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_sum_experiment_ignores_padded_row_tail(platform, dtype) -> None:
+    inner = 16 if dtype == "float16" else 8
+    program = build_kernel_program(
+        _sum_experiment_primfunc(dtype=dtype, inner=inner), platform=platform
+    )
+    load, row_sum, store = program.tasks
+    assert row_sum.operation == "sum_experiment"
+    assert row_sum.metadata["src"].shape == (3, inner)
+    assert row_sum.metadata["dst"].shape == (3,)
+    assert row_sum.dependencies == (load.task_id,)
+    assert store.dependencies == (row_sum.task_id,)
+
+    values = np.arange(3 * inner, dtype=np.dtype(dtype)).reshape(3, inner)
+    values[:, 5:] = 1000
+    simulator = FunctionalSimulator(program)
+    simulator.write(load.metadata["src"], values.reshape(-1))
+    simulator.run()
+    expected = np.sum(values[:, :5], axis=1, dtype=values.dtype)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+def test_sum_experiment_validates_width_and_template() -> None:
+    with pytest.raises(ProgramValidationError, match="must not exceed"):
+        build_kernel_program(
+            _sum_experiment_primfunc(valid=9), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="template dtype"):
+        build_kernel_program(
+            _sum_experiment_primfunc(template_dtype="half"), platform="A3"
+        )
+    with pytest.raises(ProgramValidationError, match="32-byte aligned"):
+        build_kernel_program(
+            _sum_experiment_primfunc(dtype="float16", inner=8, valid=5),
             platform="A2",
         )
 

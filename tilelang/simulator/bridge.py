@@ -833,6 +833,10 @@ class _TirBridge:
             return self._cast_metadata(arguments, context)
         if short == "fill":
             return self._fill_metadata(arguments, context)
+        if short == "reducesum_experiment":
+            return self._reduce_sum_experiment_metadata(arguments, context)
+        if short == "sum_experiment":
+            return self._sum_experiment_metadata(arguments, context)
         if short in {"arith_progression", "createvecindex"}:
             return self._sequence_metadata(short, arguments, context)
         if short == "gather":
@@ -2993,7 +2997,10 @@ class _TirBridge:
         source = self._access_buffer_region(arguments[1], (source_extent,), context)
         if destination is None or source is None:
             return {}
-        if destination.scope is not MemoryScope.UB or source.scope is not MemoryScope.UB:
+        if (
+            destination.scope is not MemoryScope.UB
+            or source.scope is not MemoryScope.UB
+        ):
             raise ProgramValidationError("reinterpretcast requires UB operands")
         if destination.byte_offset != 0 or source.byte_offset != 0:
             raise UnsupportedSimOpError(
@@ -4388,6 +4395,122 @@ class _TirBridge:
         if destination is None:
             return {}
         return {"dst": destination, "scalar": scalar}
+
+    def _reduce_sum_experiment_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {3, 4}:
+            return {}
+        count = self._runtime_int(arguments[-1], context.environment)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError(
+                "reducesum_experiment count must not be negative"
+            )
+        destination = self._access_buffer_region(arguments[0], (1,), context)
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or source is None:
+            return {}
+        if destination.scope is not MemoryScope.UB or source.scope is not MemoryScope.UB:
+            raise ProgramValidationError(
+                "reducesum_experiment operands must use UB scope"
+            )
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError(
+                "reducesum_experiment source/destination dtypes must match"
+            )
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional reducesum_experiment supports float16 and float32"
+            )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "count": count,
+        }
+        if len(arguments) == 4:
+            scratch = self._access_buffer_region(arguments[2], (count,), context)
+            if scratch is None:
+                return {}
+            if (
+                scratch.scope is not MemoryScope.UB
+                or scratch.dtype != source.dtype
+            ):
+                raise ProgramValidationError(
+                    "reducesum_experiment scratch must match the UB source dtype"
+                )
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _sum_experiment_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 6:
+            return {}
+        template = self._literal(arguments[0])
+        if not isinstance(template, str) or not (
+            template.startswith("Sum_experiment<") and template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "sum_experiment template must be Sum_experiment<dtype>"
+            )
+        outer = self._runtime_int(arguments[3], context.environment)
+        inner = self._runtime_int(arguments[4], context.environment)
+        valid = self._runtime_int(arguments[5], context.environment)
+        if any(value is None for value in (outer, inner, valid)):
+            return {}
+        if all(isinstance(value, int) for value in (outer, inner, valid)):
+            if outer < 0 or inner < 0 or valid < 0:
+                raise ProgramValidationError(
+                    "sum_experiment extents must not be negative"
+                )
+            if valid > inner:
+                raise ProgramValidationError(
+                    "sum_experiment valid width must not exceed inner width"
+                )
+        destination = self._access_buffer_region(arguments[1], (outer,), context)
+        source = self._access_buffer_region(arguments[2], (outer, inner), context)
+        if destination is None or source is None:
+            return {}
+        itemsize = dtype_size_bytes(source.dtype)
+        source = replace(
+            source,
+            strides_bytes=(_scale_runtime_int(inner, itemsize), itemsize),
+        )
+        if (
+            destination.scope is not MemoryScope.UB
+            or source.scope is not MemoryScope.UB
+        ):
+            raise ProgramValidationError("sum_experiment operands must use UB scope")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError(
+                "sum_experiment source/destination dtypes must match"
+            )
+        template_dtype = _ascend_template_dtype(
+            template[len("Sum_experiment<"):-1]
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "sum_experiment template dtype must match destination dtype"
+            )
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional sum_experiment supports float16 and float32"
+            )
+        if isinstance(inner, int) and inner * itemsize % 32:
+            raise ProgramValidationError(
+                "sum_experiment inner rows must be 32-byte aligned"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "sum_experiment": {"outer": outer, "inner": inner, "valid": valid},
+        }
 
     def _sequence_metadata(
         self,

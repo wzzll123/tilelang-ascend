@@ -11,7 +11,7 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 67%**。checkbox 裸计数约 74%，但未完成的完整
+- **完整 roadmap：约 68%**。checkbox 裸计数约 75%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
 - **可用功能模拟 MVP：约 98%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
@@ -192,6 +192,10 @@ tmp 形式按 codegen 的 brcb(src1→tmp) 端态把广播 scratch 建模为本�
 sub/abs/mins_experiment 已按 codegen 发出的显式 count ABI 贯通真实 TIR bridge 和 NumPy
 执行，复用普通 tensor-tensor、unary、tensor-scalar vector 语义，覆盖 A2/A3、
 float16/float32、依赖和负 count 拒绝路径。
+reducesum_experiment 已支持带可选/注入 scratch 的最终 ABI，只写 `dst[0]` 并对 count
+范围做静态/运行时验证；sum_experiment 已支持 `outter × inner` 行布局和每行前 `n`
+元素求和，显式使用 inner row stride，padding 不参与计算。两者覆盖 A2/A3 和
+float16/float32。
 topk 已支持 workspace 注入后的最终八参数 ABI、float16/float32、静态 K/max count 和
 静态或 runtime actual count；输出遵循降序交错 `(value, index)` 格式，重复值保持原始
 index 顺序，scratch 作为真实写 region 参与 dependency，并验证 repeat、extent、scope、
@@ -324,13 +328,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `450 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `460 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 450 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 460 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -408,6 +412,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   ties-away-from-zero 语义。~~
 - [x] ~~实现 sub/abs/mins_experiment 的显式 count ABI、A2/A3 float16/float32 NumPy
   语义、memory dependency 和负 count validation。~~
+- [x] ~~实现 reducesum_experiment 的可选 scratch/count/单结果 ABI，以及 sum_experiment
+  的 outter/inner/n 行归约、padding 排除、template/dtype/extent validation。~~
 - [x] ~~实现 gather 的 flat-source 字节 offset、base address、scratch、alignment、dtype、
   source-bounds、poison 和 dependency 语义。~~
 - [x] ~~实现 gatherb 的八个 32B block/repeat、目标 block/repeat stride、连续 offset、
@@ -614,7 +620,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：450 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：460 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
