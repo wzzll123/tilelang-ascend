@@ -11,11 +11,12 @@ shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
 
 ## 进度口径
 
-- **完整 roadmap：约 68%**。checkbox 裸计数约 75%，但未完成的完整
+- **完整 roadmap：约 70%**。checkbox 裸计数约 76%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
-- **可用功能模拟 MVP：约 98%**。已有 TIR→NumPy、内存/hazard、调度/trace，以及核心
-  vector、reduction 和 half GEMM vertical slices；尚不能覆盖复杂算子的全部指令。
+- **可用功能模拟 MVP：约 99%**。已有 TIR→NumPy、CPU Torch/NumPy tensor adapter、
+  内存/hazard、调度/trace，以及核心 vector、reduction 和 half GEMM vertical slices；
+  尚需在 Linux 完整 TileLang 构建上验证实际 example lowering，并继续覆盖复杂算子指令。
 
 进度只在功能、错误路径和回归测试同时落地后上调；未校准 timing 不计入功能完成度。
 
@@ -328,13 +329,13 @@ PYTHONPATH=3rdparty/tvm/python \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `460 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `462 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。完整 lowering/JIT 测试需要 Linux、CANN、构建后的
 `libtilelang`，最终 timing 还需要分别在 A2/A3 真机校准。
 
 ### 接手顺序建议
 
-接手者先运行上述 460 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
+接手者先运行上述 462 个测试并阅读最近提交，再按本文件“下一批工作”推进。优先维持
 端到端 vertical slice：每增加一种 TIR form，都要让它贯穿 bridge、memory、executor、
 scheduler 和测试，而不是先铺大量不可执行的 operation 名称。推荐顺序是：
 
@@ -350,6 +351,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   序列。~~
 - [x] ~~接入 `tilelang.compile(..., simulator=True, sim_config=...)` 和
   `@tilelang.jit(..., simulator=True)`。~~
+- [x] ~~接通公开 CPU Torch/NumPy tensor adapter：按最终 PrimFunc 参数映射 GM 输入，
+  自动读取 out_idx、绑定输入动态 shape、返回同类 CPU tensor，并在功能执行后写 trace；
+  `examples/elementwise/elementwise_add.py` 已增加 `--simulator`/A2/A3/trace 入口。~~
 - [x] ~~定义 A2/A3 配置、拓扑、lane、pipe、task、core program 和 kernel program。~~
 - [x] ~~实现 SimIR DAG 校验、未知依赖检查和确定性任务顺序。~~
 - [x] ~~实现常量 `For`、`IfThenElse`、`LetStmt`、`blockIdx.x/y`、AIC/AIV resource
@@ -620,7 +624,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前测试基线：460 passed，覆盖 memory、scheduler、sync、trace、functional
+- [x] ~~当前测试基线：462 passed，覆盖 memory、scheduler、sync、trace、functional
   executor、真实 TIR bridge 和 shmem rejection。~~
 - [ ] 每个 operation 必须有正向、错误路径、dtype、shape/tail、scope 和 trace 测试。
 - [ ] PTO 是第一验证目标；随后补齐 AscendC intrinsic parity。
@@ -630,10 +634,12 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## 下一批工作
 
-1. 补齐排序族的 offset、NaN 和边界语义（float16 merge 已落地；init_sort_buf ABI 已修复
+1. 在 Linux 完整 TileLang 构建上运行 `elementwise_add.py --simulator`，随后依次接入
+   merge_sort、gemm 和 flash_attention example，按真实 final TIR 补 fail-closed 缺口。
+2. 补齐排序族的 offset、NaN 和边界语义（float16 merge 已落地；init_sort_buf ABI 已修复
    并实现，float16 workspace 预填等待可靠 golden）。
-2. fixpipe quant variants 等待语言层/codegen 暴露实际 TIR contract（当前仓库仅有
+3. fixpipe quant variants 等待语言层/codegen 暴露实际 TIR contract（当前仓库仅有
    `NO_QUANT` 路径）；bf16/fp32 input MMA 等待可靠的位级精度 contract。
-3. 实现剩余 Cube copy variants（子 tile GM→L1 splice 与 UB→UB/UB→L1 已落地）；
+4. 实现剩余 Cube copy variants（子 tile GM→L1 splice 与 UB→UB/UB→L1 已落地）；
    确认 `copy_l0c_to_ub` 的实际 contract 后实现 CV handoff。
-4. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。
+5. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。

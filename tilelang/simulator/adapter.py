@@ -1,26 +1,26 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""JIT adapter for A2/A3 static scheduling and future functional simulation."""
+"""JIT adapter for A2/A3 static scheduling and functional simulation."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+import numpy as np
+
 from .bridge import build_kernel_program
 from .config import SimulatorConfig
-from .errors import SimulatorConfigError, UnsupportedSimOpError
+from .errors import ProgramValidationError, SimulatorConfigError, UnsupportedSimOpError
+from .executor import FunctionalExecutionResult, FunctionalSimulator
+from .program import BufferRegion, BufferSpec, MemoryScope
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .sync import FlagBarrierSynchronizationModel
 from .trace import ChromeTraceExporter
 
 
 class SimulatorKernelAdapter:
-    """Expose lowered TIR, SimIR, schedule statistics, and trace.
-
-    Functional tensor execution is deliberately fail-closed until operation executors are
-    implemented. Static scheduling is available through :meth:`schedule` immediately.
-    """
+    """Expose CPU tensor execution, lowered TIR, SimIR, scheduling, and trace."""
 
     def __init__(
         self,
@@ -43,7 +43,10 @@ class SimulatorKernelAdapter:
         self.last_schedule: Optional[ScheduleResult] = None
         self.last_stats = None
         self.last_trace: Optional[Path] = None
-        self.func = self._functional_execution_unavailable
+        self.last_execution: Optional[FunctionalExecutionResult] = None
+        self._parameter_names = self._extract_parameter_names()
+        self._buffer_specs = {buffer.name: buffer for buffer in self.program.buffers}
+        self.func = self._functional_execute
 
     def _normalize_indices(
         self, indices: list[int] | int | None, name: str
@@ -86,6 +89,10 @@ class SimulatorKernelAdapter:
             synchronization=FlagBarrierSynchronizationModel(),
         )
         result = scheduler.run(self.program)
+        self._record_schedule(result)
+        return result
+
+    def _record_schedule(self, result: ScheduleResult) -> None:
         self.last_schedule = result
         self.last_stats = result.stats
         if self.config.trace_path is not None:
@@ -94,7 +101,6 @@ class SimulatorKernelAdapter:
                 self.config.timing_profile.calibration,
             )
             self.last_trace = exporter.write(self.config.trace_path, result.records)
-        return result
 
     def get_kernel_source(self) -> str:
         """Return the authoritative final pre-codegen TIR script."""
@@ -105,11 +111,140 @@ class SimulatorKernelAdapter:
         """Return the validated backend-neutral simulator program."""
         return self.program
 
-    def _functional_execution_unavailable(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise UnsupportedSimOpError(
-            "TileLang Ascend functional tensor execution is not implemented yet; "
-            "use kernel.adapter.schedule() for static A2/A3 trace generation."
+    def _extract_parameter_names(self) -> list[Optional[str]]:
+        try:
+            import tvm
+        except (ImportError, OSError):
+            return []
+        value = self.optimized_mod
+        if isinstance(value, tvm.IRModule):
+            functions = [
+                function for _, function in value.functions_items()
+                if isinstance(function, tvm.tir.PrimFunc)
+            ]
+            if len(functions) != 1:
+                return []
+            value = functions[0]
+        if not isinstance(value, tvm.tir.PrimFunc):
+            return []
+        names: list[Optional[str]] = []
+        for parameter in value.params:
+            if parameter in value.buffer_map:
+                names.append(str(value.buffer_map[parameter].name))
+            else:
+                names.append(str(getattr(parameter, "name", parameter)))
+        return names
+
+    def _functional_execute(self, *arguments: Any) -> Any:
+        if len(self._parameter_names) != len(self.params):
+            raise UnsupportedSimOpError(
+                "functional simulator requires final PrimFunc parameter metadata"
+            )
+        supplied_indices = [
+            index for index in range(len(self.params))
+            if index not in self.result_idx and index not in self.workspace_idx
+        ]
+        dynamic_count = len(self.dynamic_symbolic_map)
+        if len(arguments) not in {
+            len(supplied_indices), len(supplied_indices) + dynamic_count,
+        }:
+            raise ValueError(
+                f"expected {len(supplied_indices)} simulator inputs, got "
+                f"{len(arguments)}"
+            )
+        parameter_values: list[Any] = [None] * len(self.params)
+        for index, value in zip(supplied_indices, arguments):
+            parameter_values[index] = value
+
+        bindings: dict[str, int] = {}
+        for variable, (parameter_index, shape_index) in self.dynamic_symbolic_map.items():
+            value = parameter_values[parameter_index]
+            if value is None or not hasattr(value, "shape"):
+                raise ProgramValidationError(
+                    f"cannot bind dynamic extent {variable} from parameter "
+                    f"{parameter_index}"
+                )
+            bindings[str(getattr(variable, "name", variable))] = int(
+                value.shape[shape_index]
+            )
+        for index, name in enumerate(self._parameter_names):
+            if name in self._buffer_specs or parameter_values[index] is None:
+                continue
+            try:
+                bindings[name or ""] = int(parameter_values[index])
+            except (TypeError, ValueError) as error:
+                raise ProgramValidationError(
+                    f"simulator scalar parameter {name!r} must be an integer"
+                ) from error
+
+        simulator = FunctionalSimulator(self.program, self.config, bindings=bindings)
+        framework = "numpy"
+        for index in supplied_indices:
+            name = self._parameter_names[index]
+            if name not in self._buffer_specs:
+                continue
+            value = parameter_values[index]
+            array, value_framework = self._as_numpy(value, name)
+            if value_framework == "torch":
+                framework = "torch"
+            simulator.write(self._full_region(self._buffer_specs[name]), array)
+
+        execution = simulator.run()
+        self.last_execution = execution
+        self._record_schedule(execution.schedule)
+        outputs = [
+            simulator.read(self._full_region(self._result_buffer(index)))
+            for index in self.result_idx
+        ]
+        converted = [self._from_numpy(output, framework) for output in outputs]
+        return converted[0] if len(converted) == 1 else converted
+
+    def _result_buffer(self, parameter_index: int) -> BufferSpec:
+        name = self._parameter_names[parameter_index]
+        if name not in self._buffer_specs:
+            raise ProgramValidationError(
+                f"simulator result parameter {parameter_index} is not a buffer"
+            )
+        return self._buffer_specs[name]
+
+    @staticmethod
+    def _full_region(spec: BufferSpec) -> BufferRegion:
+        if spec.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                f"simulator parameter buffer {spec.name!r} must use GM scope"
+            )
+        return BufferRegion(spec.name, spec.scope, spec.shape, spec.dtype)
+
+    @staticmethod
+    def _as_numpy(value: Any, name: Optional[str]) -> tuple[np.ndarray, str]:
+        if isinstance(value, np.ndarray):
+            return np.ascontiguousarray(value), "numpy"
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise ProgramValidationError(
+                    f"simulator input {name!r} must be a CPU tensor, got {value.device}"
+                )
+            try:
+                return np.ascontiguousarray(value.detach().numpy()), "torch"
+            except TypeError as error:
+                raise UnsupportedSimOpError(
+                    f"simulator cannot convert tensor dtype {value.dtype} to NumPy"
+                ) from error
+        raise TypeError(
+            f"simulator input {name!r} must be a NumPy array or CPU torch.Tensor"
         )
+
+    @staticmethod
+    def _from_numpy(value: np.ndarray, framework: str) -> Any:
+        if framework == "numpy":
+            return value
+        import torch
+
+        return torch.from_numpy(np.ascontiguousarray(value))
 
 
 def create_simulator_adapter(

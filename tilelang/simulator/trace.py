@@ -3,13 +3,37 @@
 """Chrome/Perfetto trace records and exporter."""
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 from .errors import ProgramValidationError
 from .program import Lane, Pipe, Task
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _json_safe(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -114,7 +138,7 @@ class ChromeTraceExporter:
                 "args": {"name": resource},
             })
         for record in record_list:
-            args = dict(record.metadata)
+            args = _json_safe(record.metadata)
             args["task_id"] = record.task_id
             args["cycle_begin"] = record.start_cycle
             args["cycle_end"] = record.end_cycle
