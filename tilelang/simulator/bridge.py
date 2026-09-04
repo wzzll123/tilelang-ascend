@@ -869,6 +869,8 @@ class _TirBridge:
             return self._ub_to_ub_metadata(normalized, arguments, context)
         if short == "copy_ub_to_l1":
             return self._ub_to_l1_metadata(normalized, arguments, context)
+        if short == "brcb_experiment":
+            return self._brcb_metadata(arguments, context)
         if short in {"copy_l1_to_l0a", "copy_l1_to_l0b"}:
             return self._l1_to_l0_metadata(
                 short, normalized, arguments, context
@@ -1380,6 +1382,87 @@ class _TirBridge:
                 "physical_rows": src_rows,
                 "physical_cols": src_cols,
                 "need_clear": False,
+            },
+        }
+
+    def _brcb_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: template, dst(UB), src(UB), repeat_times, dst_blk_stride,
+        # dst_rep_stride.  Each repeat consumes 8 consecutive source elements
+        # and broadcasts element b into a full 32-byte destination block at
+        # 32-byte-unit offset repeat*dst_rep_stride + b*dst_blk_stride
+        # (EasyASC pipe_vec.py brcb semantics).
+        if len(arguments) != 6:
+            raise UnsupportedSimOpError(
+                "functional brcb requires the six-argument "
+                "(template, dst, src, repeat, blk_stride, rep_stride) ABI"
+            )
+        template = self._literal(arguments[0])
+        if (
+            not isinstance(template, str)
+            or not template.startswith("brcb<")
+            or not template.endswith(">")
+        ):
+            raise ProgramValidationError("brcb template must be brcb<dtype>")
+        repeat = self._runtime_int(arguments[3], context.environment)
+        blk_stride = self._runtime_int(arguments[4], context.environment)
+        rep_stride = self._runtime_int(arguments[5], context.environment)
+        if repeat is None or blk_stride is None or rep_stride is None:
+            return {}
+        if not all(
+            isinstance(value, int) for value in (repeat, blk_stride, rep_stride)
+        ):
+            raise UnsupportedSimOpError(
+                "functional brcb requires a static repeat and strides"
+            )
+        if repeat < 0 or blk_stride < 0 or rep_stride < 0:
+            raise ProgramValidationError(
+                "brcb repeat and strides must not be negative"
+            )
+        source = self._access_buffer_region(
+            arguments[2], (repeat * 8,), context
+        )
+        if source is None:
+            return {}
+        if source.scope is not MemoryScope.UB:
+            raise ProgramValidationError("brcb requires a UB source")
+        template_dtype = _ascend_template_dtype(template[5:-1].strip())
+        if template_dtype is not None and template_dtype != source.dtype:
+            raise ProgramValidationError(
+                "brcb template dtype must match the source buffer"
+            )
+        elements_per_block = BYTE_PER_C0 // dtype_size_bytes(source.dtype)
+        footprint = (
+            (repeat - 1) * rep_stride * elements_per_block
+            + 7 * blk_stride * elements_per_block
+            + elements_per_block
+            if repeat > 0
+            else 0
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (footprint,), context
+        )
+        if destination is None:
+            return {}
+        if destination.scope is not MemoryScope.UB:
+            raise ProgramValidationError("brcb requires a UB destination")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("brcb source/destination dtypes must match")
+        for label, region in (("destination", destination), ("source", source)):
+            if isinstance(region.byte_offset, int) and region.byte_offset % BYTE_PER_C0:
+                raise ProgramValidationError(
+                    f"brcb requires a 32-byte-aligned {label}"
+                )
+        return {
+            "dst": destination,
+            "src": source,
+            "brcb": {
+                "repeat": repeat,
+                "blk_stride": blk_stride,
+                "rep_stride": rep_stride,
             },
         }
 

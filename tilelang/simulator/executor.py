@@ -233,6 +233,9 @@ class FunctionalSimulator:
         if operation == "fill":
             self._fill(task)
             return
+        if operation == "brcb_experiment":
+            self._brcb(task)
+            return
         if operation in {"arith_progression", "createvecindex"}:
             self._sequence(task)
             return
@@ -588,6 +591,51 @@ class FunctionalSimulator:
         shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
         self.write(destination, result, task_core_id=task.core_id)
+
+    def _brcb(self, task: Task) -> None:
+        destination = _operand(task, "dst")
+        source = _operand(task, "src")
+        details = task.metadata.get("brcb")
+        if not isinstance(details, Mapping):
+            raise ProgramValidationError(
+                f"brcb task {task.task_id!r} requires brcb metadata"
+            )
+        repeat = _resolve_int(details["repeat"], self.bindings)
+        blk_stride = _resolve_int(details["blk_stride"], self.bindings)
+        rep_stride = _resolve_int(details["rep_stride"], self.bindings)
+        if repeat < 0 or blk_stride < 0 or rep_stride < 0:
+            raise ProgramValidationError(
+                "brcb repeat and strides must not be negative"
+            )
+        if repeat == 0:
+            return
+        values = self.read(source, task_core_id=task.core_id).reshape(-1)
+        if values.size < repeat * 8:
+            raise ProgramValidationError(
+                f"brcb source provides {values.size} elements, requires "
+                f"{repeat * 8}"
+            )
+        itemsize = _numpy_dtype(destination.dtype).itemsize
+        block_elements = 32 // itemsize
+        block_bytes = block_elements * itemsize
+        base_offset = destination.byte_offset
+        for r in range(repeat):
+            for b in range(8):
+                scalar = values[r * 8 + b]
+                offset = base_offset + (r * rep_stride + b * blk_stride) * block_bytes
+                self.write(
+                    replace(
+                        destination,
+                        shape=(block_elements,),
+                        byte_offset=offset,
+                    ),
+                    np.full(
+                        block_elements,
+                        scalar,
+                        dtype=_numpy_dtype(destination.dtype),
+                    ),
+                    task_core_id=task.core_id,
+                )
 
     def _bitwise_binary(self, task: Task, operation: str) -> None:
         destination = _operand(task, "dst")

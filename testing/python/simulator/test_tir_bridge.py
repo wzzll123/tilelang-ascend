@@ -3119,6 +3119,165 @@ def test_ub_to_l1_validates_dtype_alignment_and_template() -> None:
             _ub_to_l1_primfunc(template_dtype="float"), platform="A3"
         )
 
+def _brcb_primfunc(
+    *,
+    dtype="float16",
+    repeat=2,
+    blk_stride=1,
+    rep_stride=8,
+    src_offset=0,
+    dst_offset=0,
+    template_dtype=None,
+    src_dtype=None,
+    dst_scope="shared.ub",
+):
+    src_dtype = src_dtype or dtype
+    itemsize = {"float16": 2, "float32": 4, "int32": 4}[dtype]
+    elements_per_block = 32 // itemsize
+    footprint = (
+        ((repeat - 1) * rep_stride + 7 * blk_stride + 1) * elements_per_block
+        if repeat > 0
+        else 0
+    )
+    src = tvm.tir.decl_buffer(
+        (src_offset + repeat * 8,), src_dtype, name="brcb_src", scope="shared.ub"
+    )
+    dst = tvm.tir.decl_buffer(
+        (dst_offset + footprint,), dtype, name="brcb_dst", scope=dst_scope
+    )
+    dtype_name = template_dtype or _TEMPLATE_DTYPE_NAMES.get(dtype, dtype)
+    body = tvm.tir.Evaluate(tvm.tir.call_extern(
+        "handle", "tl.ascend_brcb_experiment", f"brcb<{dtype_name}>",
+        dst.access_ptr("w", offset=dst_offset),
+        src.access_ptr("r", offset=src_offset),
+        repeat, blk_stride, rep_stride,
+    ))
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[src, dst],
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_brcb_broadcasts_elements_into_consecutive_blocks(platform) -> None:
+    program = build_kernel_program(_brcb_primfunc(), platform=platform)
+    (brcb,) = program.tasks
+    assert (brcb.operation, brcb.lane, brcb.pipe) == (
+        "brcb_experiment", Lane.VECTOR_0, Pipe.VECTOR,
+    )
+    assert brcb.metadata["brcb"] == {
+        "repeat": 2, "blk_stride": 1, "rep_stride": 8,
+    }
+
+    scalars = (np.arange(16, dtype=np.float16) + 1) / 4
+    simulator = FunctionalSimulator(program)
+    simulator.write(brcb.metadata["src"], scalars)
+    simulator.run()
+    expected = np.repeat(scalars, 16)
+    np.testing.assert_array_equal(simulator.read(brcb.metadata["dst"]), expected)
+
+
+def test_brcb_strided_blocks_leave_gaps_poisoned() -> None:
+    program = build_kernel_program(
+        _brcb_primfunc(dtype="float32", repeat=2, blk_stride=2, rep_stride=16),
+        platform="A2",
+    )
+    (brcb,) = program.tasks
+    scalars = np.arange(16, dtype=np.float32) - 8
+    simulator = FunctionalSimulator(program)
+    simulator.write(brcb.metadata["src"], scalars)
+    simulator.run()
+    for repeat in range(2):
+        for block in range(8):
+            offset = (repeat * 16 + block * 2) * 32
+            np.testing.assert_array_equal(
+                simulator.read(
+                    BufferRegion(
+                        brcb.metadata["dst"].buffer,
+                        MemoryScope.UB,
+                        (8,),
+                        "float32",
+                        byte_offset=offset,
+                    )
+                ),
+                np.full(8, scalars[repeat * 8 + block], dtype=np.float32),
+            )
+    with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+        simulator.read(
+            BufferRegion(
+                brcb.metadata["dst"].buffer,
+                MemoryScope.UB,
+                (8,),
+                "float32",
+                byte_offset=32,
+            )
+        )
+
+
+def test_brcb_orders_waw_and_raw_in_pipeline() -> None:
+    gm_output = tvm.tir.decl_buffer(
+        (16 * 8,), "int32", name="gm_output", scope="global"
+    )
+    ub_src = tvm.tir.decl_buffer(
+        (16,), "int32", name="brcb_src", scope="shared.ub"
+    )
+    ub_dst = tvm.tir.decl_buffer(
+        (16 * 8,), "int32", name="brcb_dst", scope="shared.ub"
+    )
+    body = tvm.tir.SeqStmt([
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_fill",
+            ub_src.access_ptr("w"), tvm.tir.FloatImm("float32", 5.0), 16,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "tl.ascend_brcb_experiment", "brcb<int32>",
+            ub_dst.access_ptr("w"), ub_src.access_ptr("r"), 2, 1, 8,
+        )),
+        tvm.tir.Evaluate(tvm.tir.call_extern(
+            "handle", "copy_ub_to_gm",
+            ub_dst.access_ptr("r"), gm_output.access_ptr("w"), 16 * 8,
+        )),
+    ])
+    root = tvm.tir.Block(
+        [], [], [], "root", body, alloc_buffers=[ub_src, ub_dst],
+    )
+    primfunc = tvm.tir.PrimFunc(
+        [],
+        tvm.tir.BlockRealize([], True, root),
+        buffer_map={gm_output.data: gm_output},
+    )
+    program = build_kernel_program(primfunc, platform="A3")
+    fill, brcb, store = program.tasks
+    assert brcb.dependencies == (fill.task_id,)
+    assert store.dependencies == (brcb.task_id,)
+
+    simulator = FunctionalSimulator(program)
+    simulator.run()
+    values = simulator.read(store.metadata["dst"]).reshape(-1)
+    np.testing.assert_array_equal(values, np.full(values.size, 5, np.int32))
+
+
+def test_brcb_validates_template_scope_alignment_and_dtypes() -> None:
+    with pytest.raises(ProgramValidationError, match="template dtype"):
+        build_kernel_program(
+            _brcb_primfunc(template_dtype="float"), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="source/destination dtypes"):
+        build_kernel_program(
+            _brcb_primfunc(
+                dtype="float32", src_dtype="float16", template_dtype="half",
+            ),
+            platform="A2",
+        )
+    with pytest.raises(ProgramValidationError, match="32-byte-aligned source"):
+        build_kernel_program(
+            _brcb_primfunc(src_offset=1), platform="A2"
+        )
+    with pytest.raises(ProgramValidationError, match="UB destination"):
+        build_kernel_program(
+            _brcb_primfunc(dst_scope="global"), platform="A2"
+        )
+
 
 @pytest.mark.parametrize(
     ("destination_scope", "destination_layout"),
