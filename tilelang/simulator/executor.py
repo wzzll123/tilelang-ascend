@@ -207,7 +207,7 @@ class FunctionalSimulator:
         if operation == "mul_add_dst":
             self._mul_add_dst(task)
             return
-        if operation == "mma":
+        if operation in {"mma", "mma_bias"}:
             self._mma(task)
             return
         if operation == "gemm_v0":
@@ -455,7 +455,11 @@ class FunctionalSimulator:
         result = np.matmul(
             a_values.astype(compute_dtype), b_values.astype(compute_dtype)
         )
-        if not details["init"]:
+        bias = task.metadata.get("bias")
+        if isinstance(bias, BufferRegion):
+            bias_values = self.read(bias, task_core_id=task.core_id)
+            result = result + bias_values.reshape(1, actual_cols)
+        elif not details["init"]:
             accumulator = _operand(task, "accumulator")
             previous = unpack_matrix(
                 self.read(accumulator, task_core_id=task.core_id), "l0c", shape_c

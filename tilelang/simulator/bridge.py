@@ -88,10 +88,10 @@ def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
         return lane, Pipe.SCALAR, short
     if "im2col" in short:
         return Lane.CUBE, Pipe.MTE1, short
-    if "gemm" in short or short == "mma":
+    if "gemm" in short or short in {"mma", "mma_bias"}:
         return Lane.CUBE, Pipe.MATRIX, short
     if "copy" in short or "data_copy" in short or "datacopy" in short:
-        if "l1_to_l0" in short:
+        if "l1_to_l0" in short or short == "copy_l1_to_bt":
             return Lane.CUBE, Pipe.MTE1, short
         if "l0c_to_gm" in short or "copy_cv" in short:
             return Lane.CUBE, Pipe.FIX, short
@@ -476,6 +476,10 @@ class _TirBridge:
                     f"unsupported tail_reduce kind {operation_tag!r}"
                 )
             arguments = arguments[1:]
+        elif tail_kind == "mma" and arguments:
+            operation_tag = self._literal(arguments[0])
+            if isinstance(operation_tag, str) and operation_tag.startswith("mma_bias<"):
+                operation = "mma_bias"
         metadata = {
             "arguments": tuple(self._literal(arg) for arg in arguments),
             "tir": str(call),
@@ -839,10 +843,12 @@ class _TirBridge:
             return self._l1_to_l0_metadata(
                 short, normalized, arguments, context
             )
+        if short == "copy_l1_to_bt":
+            return self._l1_to_bt_metadata(normalized, arguments, context)
         if short == "copy_l0c_to_gm":
             return self._l0c_to_gm_metadata(normalized, arguments, context)
-        if short == "mma":
-            return self._mma_metadata(arguments, context)
+        if short in {"mma", "mma_bias"}:
+            return self._mma_metadata(arguments, context, biased=short == "mma_bias")
         if short == "gemm_v0":
             return self._gemm_v0_metadata(arguments, context)
         if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
@@ -1079,6 +1085,68 @@ class _TirBridge:
                     valid_rows != physical_rows or valid_cols != physical_cols
                 ),
             },
+        }
+
+    def _l1_to_bt_metadata(
+        self,
+        operation_tag: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src(L1), dst(BT), logical element count.
+        if len(arguments) != 3:
+            return {}
+        marker = "copy_l1_to_bt<"
+        marker_start = operation_tag.find(marker)
+        if marker_start < 0 or not operation_tag.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"malformed copy_l1_to_bt template {operation_tag!r}"
+            )
+        parameters = [
+            part.strip()
+            for part in operation_tag[marker_start + len(marker):-1].split(",")
+        ]
+        if len(parameters) != 2:
+            raise UnsupportedSimOpError(
+                f"malformed copy_l1_to_bt template {operation_tag!r}"
+            )
+        length = self._runtime_int(arguments[2], context.environment)
+        if not isinstance(length, int):
+            raise UnsupportedSimOpError(
+                "functional copy_l1_to_bt requires a static element count"
+            )
+        if length <= 0:
+            raise ProgramValidationError("copy_l1_to_bt length must be positive")
+        source = self._access_buffer_region(arguments[0], (length,), context)
+        destination = self._access_buffer_region(arguments[1], (length,), context)
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.L1 or destination.scope is not MemoryScope.BT:
+            raise ProgramValidationError("copy_l1_to_bt requires L1 source and BT destination")
+        destination_template_dtype = _ascend_template_dtype(parameters[0])
+        source_template_dtype = _ascend_template_dtype(parameters[1])
+        if (
+            source.dtype != source_template_dtype
+            or destination.dtype != destination_template_dtype
+            or source.dtype != destination.dtype
+        ):
+            raise ProgramValidationError(
+                "copy_l1_to_bt requires matching buffer and template dtypes"
+            )
+        if source.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional copy_l1_to_bt currently supports float32 bias"
+            )
+        transfer_bytes = length * dtype_size_bytes(source.dtype)
+        if transfer_bytes % 64:
+            raise UnsupportedSimOpError(
+                "functional copy_l1_to_bt requires a 64-byte-aligned transfer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {"valid_elements": length, "layout": "linear"},
+            "transfer_bytes": transfer_bytes,
         }
 
     def _l1_to_l0_metadata(
@@ -1444,40 +1512,50 @@ class _TirBridge:
         self,
         arguments: Tuple[Any, ...],
         context: _Context,
+        *,
+        biased: bool = False,
     ) -> Dict[str, Any]:
-        # Final intrinsic ABI: tag, A, B, C, init, K[, n_actual, unitFlag].
-        if len(arguments) not in {6, 8}:
+        # ABI: tag, A, B, C[, BiasBT], init, K[, n_actual, unitFlag].
+        base_count = 7 if biased else 6
+        if len(arguments) not in {base_count, base_count + 2}:
             return {}
         tag = self._literal(arguments[0])
-        if not isinstance(tag, str) or not tag.startswith("mma<") or not tag.endswith(">"):
+        marker = "mma_bias<" if biased else "mma<"
+        if not isinstance(tag, str) or not tag.startswith(marker) or not tag.endswith(">"):
             raise UnsupportedSimOpError(
-                f"functional mma supports the non-bias mma template, got {tag!r}"
+                f"functional {'mma_bias' if biased else 'mma'} got malformed template {tag!r}"
             )
-        parameters = [part.strip() for part in tag[4:-1].split(",")]
+        parameters = [part.strip() for part in tag[len(marker):-1].split(",")]
         if len(parameters) != 4:
-            raise UnsupportedSimOpError(f"malformed mma template {tag!r}")
+            raise UnsupportedSimOpError(f"malformed {marker[:-1]} template {tag!r}")
         try:
             rows, cols = (int(parameters[index]) for index in (2, 3))
         except ValueError as error:
             raise UnsupportedSimOpError(
                 "functional mma requires static M/N template extents"
             ) from error
-        inner = self._runtime_int(arguments[5], context.environment)
+        init_index = 5 if biased else 4
+        inner_index = init_index + 1
+        inner = self._runtime_int(arguments[inner_index], context.environment)
         if inner is None:
             return {}
         if not isinstance(inner, int):
             raise UnsupportedSimOpError("functional mma requires a static K extent")
         if min(rows, cols, inner) <= 0:
             raise ProgramValidationError("mma M/N/K extents must be positive")
-        init_value = self._literal(self.analyzer.simplify(arguments[4]))
+        init_value = self._literal(self.analyzer.simplify(arguments[init_index]))
         if not isinstance(init_value, (bool, int)):
             raise UnsupportedSimOpError("functional mma requires a literal init flag")
         initialize = bool(init_value)
         actual_cols = cols
         unit_flag = 0
-        if len(arguments) == 8:
-            actual_cols = self._runtime_int(arguments[6], context.environment)
-            unit_flag = self._runtime_int(arguments[7], context.environment)
+        if len(arguments) == base_count + 2:
+            actual_cols = self._runtime_int(
+                arguments[inner_index + 1], context.environment
+            )
+            unit_flag = self._runtime_int(
+                arguments[inner_index + 2], context.environment
+            )
             if not isinstance(actual_cols, (int, AffineInt, SymbolicInt)):
                 raise UnsupportedSimOpError(
                     "functional mma requires an executable n_actual"
@@ -1504,6 +1582,10 @@ class _TirBridge:
         }:
             raise UnsupportedSimOpError(
                 "functional mma supports half-to-float and int8-to-int32"
+            )
+        if biased and (input_dtype, accumulator_dtype) != ("float16", "float32"):
+            raise UnsupportedSimOpError(
+                "functional mma_bias currently supports half-to-float"
             )
         a_elements = storage_elements(
             "l0a", (rows, inner), dtype_size_bytes(input_dtype)
@@ -1535,6 +1617,13 @@ class _TirBridge:
         )
         if left is None or right is None or destination is None:
             return {}
+        bias = None
+        if biased:
+            bias = self._access_buffer_region(
+                arguments[4], (actual_cols,), context
+            )
+            if bias is None:
+                return {}
         if (
             left.scope is not MemoryScope.L0A
             or right.scope is not MemoryScope.L0B
@@ -1547,6 +1636,12 @@ class _TirBridge:
             or destination.dtype != accumulator_dtype
         ):
             raise ProgramValidationError("mma buffer dtypes disagree with its template")
+        if biased and (
+            bias.scope is not MemoryScope.BT or bias.dtype != accumulator_dtype
+        ):
+            raise ProgramValidationError(
+                "mma_bias requires a BT bias matching the accumulator dtype"
+            )
         for label, region, capacity_elements in (
             ("L0A", left, a_elements),
             ("L0B", right, b_capacity_elements),
@@ -1580,7 +1675,10 @@ class _TirBridge:
         }
         if unit_flag == 2:
             metadata["unit_flag_role"] = "hold"
-        if not initialize:
+        if biased:
+            metadata["bias"] = bias
+            metadata["mma"]["bias"] = True
+        elif not initialize:
             metadata["accumulator"] = destination
         return metadata
 
@@ -4093,7 +4191,7 @@ class _TirBridge:
             metadata,
             (
                 "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
-                "scalar_src", "offsets",
+                "scalar_src", "offsets", "bias",
             ),
         )
         writes = self._operand_regions(
@@ -4118,7 +4216,7 @@ class _TirBridge:
             task.metadata,
             (
                 "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
-                "scalar_src", "offsets",
+                "scalar_src", "offsets", "bias",
             ),
         )
         writes = self._operand_regions(

@@ -318,6 +318,44 @@ def _mma_primfunc(
     return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
 
 
+def _mma_bias_primfunc(*, bias_scope="shared.bt", bias_length=16, init=True):
+    rows, cols, inner = 16, 16, 13
+    l0a = tvm.tir.decl_buffer(
+        (storage_elements("l0a", (rows, inner), 2),),
+        "float16", name="l0a", scope="wmma.matrix_a",
+    )
+    l0b = tvm.tir.decl_buffer(
+        (storage_elements("l0b", (inner, cols), 2),),
+        "float16", name="l0b", scope="wmma.matrix_b",
+    )
+    l0c = tvm.tir.decl_buffer(
+        (storage_elements("l0c", (rows, cols), 4),),
+        "float32", name="l0c", scope="wmma.accumulator",
+    )
+    bias_l1 = tvm.tir.decl_buffer(
+        (bias_length,), "float32", name="bias_l1", scope="shared.l1"
+    )
+    bias_bt = tvm.tir.decl_buffer(
+        (bias_length,), "float32", name="bias_bt", scope=bias_scope
+    )
+    copy_bias = tvm.tir.call_extern(
+        "handle", "tl::ascend::copy_l1_to_bt<float, float>",
+        bias_l1.access_ptr("r"), bias_bt.access_ptr("w"), bias_length,
+    )
+    mma = tvm.tir.call_extern(
+        "handle", "tl.ascend_mma", "mma_bias<half, float, 16, 16>",
+        l0a.access_ptr("r"), l0b.access_ptr("r"),
+        l0c.access_ptr("w" if init else "rw"),
+        bias_bt.access_ptr("r"), init, inner,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root",
+        tvm.tir.SeqStmt([tvm.tir.Evaluate(copy_bias), tvm.tir.Evaluate(mma)]),
+        alloc_buffers=[l0a, l0b, l0c, bias_l1, bias_bt],
+    )
+    return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+
+
 def _mma_runtime_n_primfunc(nact_index=0):
     nact = tvm.tir.decl_buffer((1,), "int32", name="nact", scope="global")
     l0a = tvm.tir.decl_buffer(
@@ -3068,6 +3106,55 @@ def test_mma_rejects_unsupported_int8_accumulator_dtype() -> None:
         build_kernel_program(
             _mma_primfunc(input_dtype="int8", accumulator_dtype="float32"),
             platform="A2",
+        )
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("initialize", [True, False])
+def test_mma_bias_copies_bt_and_broadcasts_across_rows(
+    platform, initialize
+) -> None:
+    program = build_kernel_program(
+        _mma_bias_primfunc(init=initialize), platform=platform
+    )
+    copy_bias, mma = program.tasks
+    assert (copy_bias.operation, copy_bias.lane, copy_bias.pipe) == (
+        "copy_l1_to_bt", Lane.CUBE, Pipe.MTE1,
+    )
+    assert (mma.operation, mma.lane, mma.pipe) == (
+        "mma_bias", Lane.CUBE, Pipe.MATRIX,
+    )
+    assert mma.dependencies == (copy_bias.task_id,)
+    assert mma.metadata["mma"]["bias"] is True
+    assert "accumulator" not in mma.metadata
+
+    left = (np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 50) / 32
+    right = (np.arange(13 * 16, dtype=np.float16).reshape(13, 16) - 70) / 64
+    bias = np.linspace(-2, 2, 16, dtype=np.float32)
+    simulator = FunctionalSimulator(program)
+    simulator.write(mma.metadata["lhs"], pack_matrix(left, "l0a"))
+    simulator.write(mma.metadata["rhs"], pack_matrix(right, "l0b"))
+    simulator.write(copy_bias.metadata["src"], bias)
+    simulator.run()
+
+    expected = left.astype(np.float32) @ right.astype(np.float32) + bias
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(mma.metadata["dst"]), "l0c", (16, 16)),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_copy_l1_to_bt_rejects_non_64_byte_transfer() -> None:
+    with pytest.raises(UnsupportedSimOpError, match="64-byte"):
+        build_kernel_program(_mma_bias_primfunc(bias_length=15), platform="A2")
+
+
+def test_bias_pipeline_rejects_non_bt_destination() -> None:
+    with pytest.raises(ProgramValidationError, match="BT destination"):
+        build_kernel_program(
+            _mma_bias_primfunc(bias_scope="shared.ub"), platform="A3"
         )
 
 
