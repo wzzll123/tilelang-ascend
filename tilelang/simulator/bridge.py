@@ -2009,7 +2009,20 @@ class _TirBridge:
             raise UnsupportedSimOpError(
                 f"functional {operation} requires a 32-byte-aligned source"
             )
-        source_element_offset = source.byte_offset // itemsize
+        # Multi-slot L1 buffers (e.g. [S1, R, C] double-buffered tiles) stack one
+        # padded zN/nZ tile per slot.  The slice byte_offset therefore carries the
+        # slot base (s * per-slot capacity); reduce it modulo the per-slot padded
+        # capacity so the origin search below operates on the intra-tile offset,
+        # then re-add the slot base to the emitted source regions.
+        per_slot_elements = storage_elements(source_layout, source_shape, itemsize)
+        absolute_element_offset = source.byte_offset // itemsize
+        slot_base_elements = 0
+        source_element_offset = absolute_element_offset
+        if per_slot_elements > 0:
+            slot_base_elements = (
+                absolute_element_offset // per_slot_elements
+            ) * per_slot_elements
+            source_element_offset = absolute_element_offset - slot_base_elements
         source_origin = next(
             (
                 (row, col)
@@ -2045,7 +2058,7 @@ class _TirBridge:
                 source_regions.append(replace(
                     source,
                     shape=(destination_rows, width),
-                    byte_offset=offset * itemsize,
+                    byte_offset=(slot_base_elements + offset) * itemsize,
                     strides_bytes=(elements_per_c0 * itemsize, itemsize),
                 ))
                 cursor += width
@@ -2061,7 +2074,7 @@ class _TirBridge:
                 source_regions.append(replace(
                     source,
                     shape=(height, destination_cols),
-                    byte_offset=offset * itemsize,
+                    byte_offset=(slot_base_elements + offset) * itemsize,
                     strides_bytes=(itemsize, elements_per_c0 * itemsize),
                 ))
                 cursor += height
