@@ -5498,7 +5498,21 @@ class _TirBridge:
         right_start, right_end = (
             right_base + right_bounds[0], right_base + right_bounds[1]
         )
-        return left_start < right_end and right_start < left_end
+        if not (left_start < right_end and right_start < left_end):
+            return False
+        # The bounding-box test above over-approximates strided regions: two
+        # per-core column shards of one row-major GM matrix have overlapping
+        # bounding boxes yet share no byte.  On real hardware cross-core
+        # ordering is carried only by flags/barriers, never by task order, so a
+        # spurious overlap here emits a cross-core dependency that can deadlock
+        # against a collective barrier.  Refine with an exact per-dimension
+        # intersection whenever both regions are regular affine views; only
+        # rule out overlap when a whole dimension is provably disjoint, which
+        # is always sound.
+        refined = _strided_regions_disjoint(left, right, left_base, right_base)
+        if refined is not None:
+            return not refined
+        return True
 
     def _resolve_active_alias(self, region: BufferRegion, owner: int) -> str:
         current = region.buffer
@@ -5750,6 +5764,95 @@ def _region_bounds(region: BufferRegion) -> Optional[Tuple[int, int]]:
         (extent - 1) * stride for extent, stride in zip(region.shape, strides)
     )
     return region.byte_offset, region.byte_offset + last_offset + itemsize
+
+
+# Cap on the number of outer index combinations expanded when computing exact
+# byte intervals.  Regions larger than this fall back to the bounding-box
+# answer (which may over-report overlap but never misses a real one).
+_MAX_INTERVAL_EXPANSION = 4096
+
+
+def _region_byte_intervals(
+    region: BufferRegion,
+) -> Optional[Tuple[Tuple[int, int], ...]]:
+    """Expand an affine region into sorted, disjoint byte intervals.
+
+    The innermost dimension is coalesced into one contiguous interval per
+    outer index combination.  Returns ``None`` for symbolic regions or regions
+    too large to expand exactly; callers must then keep the conservative
+    bounding-box answer.
+    """
+    values = (region.byte_offset,) + region.shape + (region.strides_bytes or ())
+    if any(isinstance(value, (AffineInt, SymbolicInt)) for value in values):
+        return None
+    if any(extent == 0 for extent in region.shape):
+        return ()
+    itemsize = dtype_size_bytes(region.dtype)
+    strides = region.strides_bytes or contiguous_strides_bytes(region.shape, itemsize)
+    if any(stride <= 0 for stride in strides):
+        return None
+    outer = 1
+    for extent in region.shape[:-1]:
+        outer *= extent
+    if outer > _MAX_INTERVAL_EXPANSION:
+        return None
+    inner_span = (region.shape[-1] - 1) * strides[-1] + itemsize
+    intervals = []
+    # Enumerate every outer index combination; strides are positive so the
+    # resulting intervals are emitted in ascending order.
+    for linear in range(outer):
+        remainder = linear
+        base = region.byte_offset
+        for dim in range(len(region.shape) - 2, -1, -1):
+            extent = region.shape[dim]
+            index = remainder % extent
+            remainder //= extent
+            base += index * strides[dim]
+        intervals.append((base, base + inner_span))
+    intervals.sort()
+    # Merge overlapping or adjacent intervals to keep the list canonical.
+    merged: list[Tuple[int, int]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            last_start, last_end = merged[-1]
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _strided_regions_disjoint(
+    left: BufferRegion, right: BufferRegion, left_base: int, right_base: int
+) -> Optional[bool]:
+    """Return whether two regions provably share no byte, else ``None``.
+
+    ``left_base``/``right_base`` are the owning buffers' absolute addresses
+    (both zero when the regions share one buffer).  ``True``/``False`` are
+    exact answers from interval intersection; ``None`` means the regions could
+    not be expanded exactly and the caller must keep its conservative verdict.
+    """
+    left_intervals = _region_byte_intervals(left)
+    right_intervals = _region_byte_intervals(right)
+    if left_intervals is None or right_intervals is None:
+        return None
+    if not left_intervals or not right_intervals:
+        return True
+    if left_base != right_base:
+        delta = right_base - left_base
+        right_intervals = tuple(
+            (start + delta, end + delta) for start, end in right_intervals
+        )
+    index_left = index_right = 0
+    while index_left < len(left_intervals) and index_right < len(right_intervals):
+        left_start, left_end = left_intervals[index_left]
+        right_start, right_end = right_intervals[index_right]
+        if left_start < right_end and right_start < left_end:
+            return False
+        if left_end <= right_start:
+            index_left += 1
+        else:
+            index_right += 1
+    return True
 
 
 def _buffer_size_bytes(spec: BufferSpec) -> Optional[int]:
