@@ -241,6 +241,15 @@ class SimulatorKernelAdapter:
                 raise ProgramValidationError(
                     f"simulator input {name!r} must be a CPU tensor, got {value.device}"
                 )
+            if value.dtype == torch.bfloat16:
+                # NumPy cannot view torch.bfloat16; round-trip the raw bits
+                # through uint16 into ml_dtypes.bfloat16 (no value change).
+                import ml_dtypes
+
+                bits = value.detach().contiguous().view(torch.uint16).numpy()
+                return np.ascontiguousarray(
+                    bits.view(ml_dtypes.bfloat16)
+                ), "torch"
             try:
                 return np.ascontiguousarray(value.detach().numpy()), "torch"
             except TypeError as error:
@@ -257,7 +266,13 @@ class SimulatorKernelAdapter:
             return value
         import torch
 
-        return torch.from_numpy(np.ascontiguousarray(value))
+        array = np.ascontiguousarray(value)
+        if array.dtype == np.dtype("bfloat16") or array.dtype.name == "bfloat16":
+            # torch.from_numpy has no bfloat16; rebuild from the raw bits.
+            return torch.from_numpy(
+                np.ascontiguousarray(array.view(np.uint16))
+            ).view(torch.bfloat16).reshape(array.shape)
+        return torch.from_numpy(array)
 
 
 def create_simulator_adapter(

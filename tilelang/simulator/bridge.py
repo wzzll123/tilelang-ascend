@@ -1370,10 +1370,6 @@ class _TirBridge:
                 raise ProgramValidationError(
                     "copy_ub_to_ub cast tiles must have identical extents"
                 )
-            if source.dtype == "bfloat16" or destination.dtype == "bfloat16":
-                raise UnsupportedSimOpError(
-                    "functional copy_ub_to_ub does not support bfloat16 casts"
-                )
             if (destination.dtype, source.dtype) in _UB_TO_UB_CAST_NONE:
                 cast_mode = "CAST_NONE"
             else:
@@ -2464,11 +2460,13 @@ class _TirBridge:
         accumulator_dtype = _ascend_template_dtype(parameters[1])
         if (input_dtype, accumulator_dtype) not in {
             ("float16", "float32"),
+            ("bfloat16", "float32"),
             ("float32", "float32"),
             ("int8", "int32"),
         }:
             raise UnsupportedSimOpError(
-                "functional mma supports half-to-float, float-to-float, and int8-to-int32"
+                "functional mma supports half-to-float, bfloat16-to-float, "
+                "float-to-float, and int8-to-int32"
             )
         if biased and (input_dtype, accumulator_dtype) != ("float16", "float32"):
             raise UnsupportedSimOpError(

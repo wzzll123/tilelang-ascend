@@ -650,10 +650,16 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         values = self.read(source, task_core_id=task.core_id)
         round_mode = task.metadata.get("round_mode")
+        destination_dtype = _numpy_dtype(destination.dtype)
+        destination_is_integer = np.issubdtype(destination_dtype, np.integer)
         if round_mode == "CAST_NONE":
             result = values
         elif round_mode == "CAST_RINT":
-            result = np.rint(values)
+            # Hardware CAST_RINT rounds float->float conversions to the
+            # destination precision with round-to-nearest-even (performed by
+            # the dtype conversion in write()); the explicit rint below only
+            # applies when the destination is an integer dtype.
+            result = np.rint(values) if destination_is_integer else values
         elif round_mode == "CAST_FLOOR":
             result = np.floor(values)
         elif round_mode == "CAST_CEIL":
@@ -1492,6 +1498,18 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
     normalized = dtype.strip().lower()
     if "x" in normalized:
         raise UnsupportedSimOpError(f"vector-packed dtype is not executable yet: {dtype!r}")
+    if normalized == "bfloat16":
+        # NumPy has no native bfloat16.  ml_dtypes.bfloat16 is a true NumPy
+        # dtype whose float32->bfloat16 cast rounds to nearest-even; verified
+        # bit-exact against torch.bfloat16 (which the hardware CAST_RINT
+        # semantics match) over random, tie-bit, and special-value inputs.
+        try:
+            import ml_dtypes
+        except ImportError as error:
+            raise UnsupportedSimOpError(
+                "bfloat16 simulation requires the ml_dtypes package"
+            ) from error
+        return np.dtype(ml_dtypes.bfloat16)
     try:
         return np.dtype(normalized)
     except TypeError as error:

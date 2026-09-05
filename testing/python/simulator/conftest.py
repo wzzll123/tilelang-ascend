@@ -16,9 +16,16 @@ os.environ.setdefault(
 
 
 if "tilelang" not in sys.modules:
-    # Importing tilelang normally loads TVM and libtilelang.  The simulator core is
-    # intentionally backend-neutral, so expose only the package path for these tests.
-    package = types.ModuleType("tilelang")
-    package.__path__ = [str(repository_root / "tilelang")]
-    package.__package__ = "tilelang"
-    sys.modules["tilelang"] = package
+    try:
+        # Prefer the real package when the native build exists: it puts
+        # 3rdparty/tvm/python on sys.path, enabling end-to-end simulator tests
+        # that compile T.prim_func kernels with simulator=True.
+        import tilelang  # noqa: F401
+    except Exception:
+        # Importing tilelang normally loads TVM and libtilelang.  The simulator
+        # core is intentionally backend-neutral, so expose only the package
+        # path for these tests when the native build is unavailable.
+        package = types.ModuleType("tilelang")
+        package.__path__ = [str(repository_root / "tilelang")]
+        package.__package__ = "tilelang"
+        sys.modules["tilelang"] = package
