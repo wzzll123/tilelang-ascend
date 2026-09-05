@@ -566,7 +566,7 @@ class _TirBridge:
         metadata.update(
             self._functional_metadata(operation, arguments, context, tail_kind=tail_kind)
         )
-        metadata.update(self._sync_metadata(operation, arguments))
+        metadata.update(self._sync_metadata(operation, arguments, context))
         span = getattr(call, "span", None)
         if span is not None:
             metadata["span"] = str(span)
@@ -5542,15 +5542,28 @@ class _TirBridge:
             return operation, arguments[1:]
         return name, arguments
 
-    def _sync_metadata(self, operation: str, arguments: Tuple[Any, ...]) -> Dict[str, Any]:
+    def _sync_metadata(
+        self, operation: str, arguments: Tuple[Any, ...], context: Any = None
+    ) -> Dict[str, Any]:
         short = _short_operation(operation)
+        environment = getattr(context, "environment", None) if context is not None else None
+
+        def flag_int(value: Any) -> Any:
+            # Resolve symbolic ids (``k % 2`` from an unrolled loop) through the
+            # per-iteration environment; fall back to the literal form.
+            if environment:
+                resolved = self._const_int(value, environment)
+                if resolved is not None:
+                    return resolved
+            return self._literal(value)
+
         metadata: Dict[str, Any] = {}
         if short in {"set_flag", "wait_flag"}:
             if len(arguments) >= 3:
                 metadata.update({
                     "src_pipe": _normalize_pipe_name(self._literal(arguments[0])),
                     "dst_pipe": _normalize_pipe_name(self._literal(arguments[1])),
-                    "flag_id": self._literal(arguments[2]),
+                    "flag_id": flag_int(arguments[2]),
                 })
         elif short in {"auto_set_flag", "auto_wait_flag"} and len(arguments) >= 2:
             event_type = str(self._literal(arguments[0]))
@@ -5559,22 +5572,22 @@ class _TirBridge:
                 metadata.update({
                     "src_pipe": _normalize_pipe_name(pair[0]),
                     "dst_pipe": _normalize_pipe_name(pair[1]),
-                    "flag_id": self._literal(arguments[1]),
+                    "flag_id": flag_int(arguments[1]),
                 })
         elif short == "set_cross_flag" and len(arguments) >= 3:
             metadata.update({
                 "src_pipe": _normalize_pipe_name(self._literal(arguments[0])),
-                "flag_id": self._literal(arguments[1]),
-                "mode": self._literal(arguments[2]),
+                "flag_id": flag_int(arguments[1]),
+                "mode": flag_int(arguments[2]),
             })
         elif short == "auto_set_cross_flag" and len(arguments) >= 3:
             metadata.update({
-                "mode": self._literal(arguments[0]),
+                "mode": flag_int(arguments[0]),
                 "src_pipe": _normalize_pipe_name(self._literal(arguments[1])),
-                "flag_id": self._literal(arguments[2]),
+                "flag_id": flag_int(arguments[2]),
             })
         elif short in {"wait_cross_flag", "auto_wait_cross_flag"} and arguments:
-            metadata["flag_id"] = self._literal(arguments[0])
+            metadata["flag_id"] = flag_int(arguments[0])
             if len(arguments) >= 2:
                 metadata["wait_pipe"] = _normalize_pipe_name(
                     self._literal(arguments[1])
