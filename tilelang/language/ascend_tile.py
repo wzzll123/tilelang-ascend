@@ -493,11 +493,10 @@ def merge_sort(
     on multiple sorted blocks using AscendC::MrgSort hardware API.
     blockLen is calculated from each source buffer size.
 
-    Hardware MrgSort format: 4 floats per element
-    - Position 0: sort key (value)
-    - Position 1: data (index)
-    - Position 2-3: reserved/padding
-    - blockLen = number of elements = buffer_size / 4
+    Hardware MrgSort records are always 8 bytes:
+    - float32: two slots, ``[value, index]``
+    - float16: four slots, ``[value, reserved, index-low, index-high]``
+    - blockLen is the scalar buffer size divided by the corresponding slot count
 
     Args:
         dst: The destination buffer or buffer region where the merged result will be stored.
@@ -555,18 +554,26 @@ def merge_sort(
     if num_ways < 2 or num_ways > 4:
         raise ValueError(f"merge_sort requires 2-4 source buffers, got {num_ways}")
 
-    # Calculate blockLen for each source buffer
-    # Value-index pair format: 2 floats per element [value, index]
-    # blockLen = number of elements = buffer_size / 2
-    # Note: Hardware MrgSort has format compatibility issues with this format
+    dtype = _dtype(dst)
+    if dtype not in {"float", "half"}:
+        raise ValueError(f"merge_sort requires float16 or float32 buffers, got {dtype}")
+    source_dtypes = [_dtype(buf) for buf in src_buffers]
+    if any(source_dtype != dtype for source_dtype in source_dtypes):
+        raise ValueError(
+            "merge_sort source and destination buffers must have the same dtype"
+        )
+
+    # MrgSort records are always 8 bytes.  float32 uses [value, index], while
+    # float16 uses [value, reserved, index-low, index-high].
+    record_width = 4 if dtype == "half" else 2
     blockLens = []
     for buf in src_buffers:
         buf_size = math.prod(retrieve_shape(buf))
-        blockLens.append(buf_size // 2)  # Value-index pair format
+        blockLens.append(buf_size // record_width)
 
     args = (
         [
-            f"MergeSort<{_dtype(dst)}>",
+            f"MergeSort<{dtype}>",
             num_ways,
             retrieve_ptr(dst, "w"),
         ]
@@ -890,11 +897,16 @@ def init_sort_buf(buffer: Buffer, num: PrimExpr, rsv: PrimExpr):
     buffer, which is typically required as an auxiliary or index buffer for
     hardware sorting instructions.
 
+    The hardware wrapper ABI is ``InitSortBuf<T>(src, eleNum, rsv = 0)``: ``num``
+    counts 32-bit elements of the buffer's reinterpreted int32 view, and only
+    whole 64-element (256-byte) blocks are written; ``rsv`` is a reserved
+    parameter that the hardware wrapper ignores.
+
     Args:
         buffer: The buffer to be initialized.
-        num: The number of elements to initialize in the buffer.
-        rsv: A reserved parameter or specific initialization value required by
-            the hardware API.
+        num: The number of 32-bit elements to initialize in the buffer.
+        rsv: A reserved parameter forwarded in the template ABI position; the
+            hardware wrapper ignores it.
 
     Returns:
         A TVM intrinsic call that performs the buffer initialization.
@@ -904,8 +916,8 @@ def init_sort_buf(buffer: Buffer, num: PrimExpr, rsv: PrimExpr):
         tir.op.Op.get("tl.ascend_init_sort_buf"),
         f"InitSortBuf<{_dtype(buffer)}>",
         buffer.access_ptr("w"),
-        rsv,
         num,
+        rsv,
     )
 
 

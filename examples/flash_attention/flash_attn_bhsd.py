@@ -216,15 +216,37 @@ if __name__ == "__main__":
     parser.add_argument("--S", type=int, default=128, help="seq len")
     parser.add_argument("--H", type=int, default=1, help="attention head size")
     parser.add_argument("--D", type=int, default=512, help="hidden dim")
+    parser.add_argument(
+        "--simulator", action="store_true", help="Run the CPU A2/A3 simulator"
+    )
+    parser.add_argument(
+        "--platform", choices=["A2", "A3"], default="A2",
+        help="Simulator platform (used with --simulator)",
+    )
+    parser.add_argument(
+        "--trace", type=str, default=None,
+        help="Optional Chrome/Perfetto trace path in simulator mode",
+    )
     args = parser.parse_args()
     B, S, H, D = args.B, args.S, args.H, args.D
 
-    torch.set_default_device('npu')
+    if not args.simulator:
+        torch.set_default_device('npu')
     torch.manual_seed(0)
 
     tilelang.disable_cache()
 
-    func = flash_attention_fwd(
+    kernel_factory = flash_attention_fwd
+    if args.simulator:
+        kernel_factory = tilelang.jit(
+            out_idx=[3],
+            workspace_idx=[4, 5, 6],
+            simulator=True,
+            platform=args.platform,
+            sim_config={"trace_path": args.trace} if args.trace else None,
+        )(flash_attention_fwd.__wrapped__)
+
+    func = kernel_factory(
         batch=B,
         seq_len=S,
         heads=H,
@@ -248,13 +270,15 @@ if __name__ == "__main__":
     v = torch.randn((B, H, S, D), dtype=torch.float16)
 
 
-    torch.npu.synchronize()
+    if not args.simulator:
+        torch.npu.synchronize()
     print("init successful!")
 
     output = func(q, k, v)
     ref_output = ref_flash_attn(q, k, v)
-    torch.npu.synchronize()
+    if not args.simulator:
+        torch.npu.synchronize()
 
     torch.testing.assert_close(ref_output, output, rtol=1e-2, atol=1e-2)
 
-    print("Test Passed!")
+    print(f"Test Passed! mode={'simulator' if args.simulator else 'npu'}")

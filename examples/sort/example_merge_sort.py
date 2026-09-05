@@ -1,8 +1,10 @@
+import argparse
+
 import tilelang as tl
 import tilelang.language as T
 import torch
 
-tl.cache.clear_cache()
+tl.disable_cache()
 
 ELEMENT_SIZE = 2
 VALUE_POSITION = 0
@@ -144,63 +146,104 @@ def format_block(block):
     return elements
 
 
-def test_merge(merge_num):
+def test_merge(
+    merge_num, *, simulator=False, platform="A2", trace=None, verbose=False
+):
     print(f"\n{'=' * 60}")
     print(f"Testing {merge_num}-way merge sort (value-index pair format):")
     print(f"N = {N} elements per block, each element = {ELEMENT_SIZE} floats")
     print("=" * 60)
 
     blocks = [create_sorted_block(N) for _ in range(merge_num)]
-    print("blocks", blocks)
+    if verbose:
+        print("blocks", blocks)
+        print("\nInput blocks (value, index pairs, all elements):")
+        for i in range(merge_num):
+            formatted = format_block(blocks[i])
+            print(f"  Block {i}: {formatted}")
 
-    print("\nInput blocks (value, index pairs, all elements):")
-    for i in range(merge_num):
-        formatted = format_block(blocks[i])
-        print(f"  Block {i}: {formatted}")
-
-    blocks_npu = [b.npu() for b in blocks]
+    device_blocks = blocks if simulator else [b.npu() for b in blocks]
 
     if merge_num == 2:
-        kernel = generate_merge_sort_2way()
+        kernel_factory = generate_merge_sort_2way
     elif merge_num == 3:
-        kernel = generate_merge_sort_3way()
+        kernel_factory = generate_merge_sort_3way
     elif merge_num == 4:
-        kernel = generate_merge_sort_4way()
+        kernel_factory = generate_merge_sort_4way
+    else:
+        raise ValueError(f"unsupported merge count: {merge_num}")
+
+    if simulator:
+        kernel_factory = tl.jit(
+            out_idx=[-1],
+            simulator=True,
+            platform=platform,
+            sim_config={"trace_path": trace} if trace else None,
+            pass_configs=pass_configs,
+        )(kernel_factory.__wrapped__)
+    kernel = kernel_factory()
 
     print("\nGenerated kernel source:")
 
-    torch.npu.synchronize()
+    if not simulator:
+        torch.npu.synchronize()
     print("init successful!")
 
-    result = kernel(*blocks_npu)
-    torch.npu.synchronize()
+    result = kernel(*device_blocks)
+    if not simulator:
+        torch.npu.synchronize()
 
     ref_result = ref_program(blocks)
 
     result_cpu = result.cpu()
-    print(f"\nOutput (all elements): {format_block(result_cpu)}")
-    print(f"\nref_result output (all elements): {format_block(ref_result)}")
+    if verbose:
+        print(f"\nOutput (all elements): {format_block(result_cpu)}")
+        print(f"\nref_result output (all elements): {format_block(ref_result)}")
 
     output_values = [result_cpu[i * ELEMENT_SIZE + VALUE_POSITION].item() for i in range(N * merge_num)]
     is_sorted = all(output_values[i] >= output_values[i + 1] for i in range(len(output_values) - 1))
     print(f"\nIs output sorted (descending): {is_sorted}")
 
-    ref_values = [ref_result[i * ELEMENT_SIZE + VALUE_POSITION].item() for i in range(N * merge_num)]
-    print(f"Match: {output_values == ref_values}")
+    records_match = torch.equal(result_cpu, ref_result)
+    print(f"Full value/index records match: {records_match}")
 
-    if output_values != ref_values:
-        correct = sum(1 for i, v in enumerate(output_values) if abs(v - ref_values[i]) < 1e-5)
-        print(f"Correct: {correct}/{len(ref_values)}")
+    if not records_match:
+        matching = int((result_cpu == ref_result).sum().item())
+        print(f"Matching scalar slots: {matching}/{ref_result.numel()}")
 
-    return is_sorted and output_values == ref_values
+    return is_sorted and records_match
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Merge-sort example")
+    parser.add_argument(
+        "--simulator", action="store_true", help="Run the CPU A2/A3 simulator"
+    )
+    parser.add_argument(
+        "--platform", choices=["A2", "A3"], default="A2",
+        help="Simulator platform (used with --simulator)",
+    )
+    parser.add_argument(
+        "--trace", type=str, default=None,
+        help="Optional Chrome/Perfetto trace path in simulator mode",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Print every input/output record"
+    )
+    args = parser.parse_args()
+
     torch.manual_seed(42)
+    tl.disable_cache()
 
     results = []
     for merge_num in [2, 3, 4]:
-        success = test_merge(merge_num)
+        success = test_merge(
+            merge_num,
+            simulator=args.simulator,
+            platform=args.platform,
+            trace=args.trace,
+            verbose=args.verbose,
+        )
         results.append((merge_num, success))
 
     print(f"\n{'=' * 60}")
@@ -208,6 +251,9 @@ def main():
     for merge_num, success in results:
         status = "Kernel Output Match!" if success else "FAIL"
         print(f"  {merge_num}-way merge: {status}")
+    if not all(success for _, success in results):
+        raise AssertionError("one or more merge-sort variants failed")
+    print(f"mode={'simulator' if args.simulator else 'npu'}")
 
 
 if __name__ == "__main__":

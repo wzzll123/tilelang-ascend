@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 from pathlib import Path
 from tvm.target import Target
 from tvm.tir import PrimFunc
@@ -28,6 +28,8 @@ def cached(
     verbose: bool | None = False,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,
+    simulator: bool = False,
+    sim_config: Any | None = None,
 ) -> JITKernel:
     """
     Caches and reuses compiled kerne(ls (using KernelCache class).
@@ -45,6 +47,8 @@ def cached(
         verbose=verbose,
         pass_configs=pass_configs,
         compile_flags=compile_flags,
+        simulator=simulator,
+        sim_config=sim_config,
     )
 
 

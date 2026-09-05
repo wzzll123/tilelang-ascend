@@ -4,20 +4,38 @@ import tilelang
 import tilelang.language as T
 import torch
 
-tilelang.cache.clear_cache()
+tilelang.disable_cache()
 
 parser = argparse.ArgumentParser(description="NPU Kernel Compilation")
 parser.add_argument("--m", type=int, default=1024, help="Matrix M dimension")
 parser.add_argument("--n", type=int, default=1024, help="Matrix N dimension")
 parser.add_argument("--k", type=int, default=1024, help="Matrix K dimension")
+parser.add_argument(
+    "--simulator", action="store_true", help="Run the CPU A2/A3 simulator"
+)
+parser.add_argument(
+    "--platform", choices=["A2", "A3"], default="A2",
+    help="Simulator platform (used with --simulator)",
+)
+parser.add_argument(
+    "--trace", type=str, default=None,
+    help="Optional Chrome/Perfetto trace path in simulator mode",
+)
 args = parser.parse_args()
 
 M = args.m
 N = args.n
 K = args.k
+jit_options = {}
+if args.simulator:
+    jit_options = {
+        "simulator": True,
+        "platform": args.platform,
+        "sim_config": {"trace_path": args.trace} if args.trace else None,
+    }
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(out_idx=[-1], **jit_options)
 def matmul(M, N, K, block_M, block_N, K_L1, dtype="float16", accum_dtype="float"):
     m_num = M // block_M
     n_num = N // block_N
@@ -53,18 +71,24 @@ def matmul(M, N, K, block_M, block_N, K_L1, dtype="float16", accum_dtype="float"
     return main
 
 
+if M % 128 or N % 256 or K % 64:
+    raise ValueError("this example requires M % 128 == N % 256 == K % 64 == 0")
+
 func = matmul(M, N, K, 128, 256, 64)
 
 torch.manual_seed(0)
 
-a = torch.randn(M, K).half().npu()
-b = torch.randn(K, N).half().npu()
-c = torch.empty(M, N).half().npu()
+a = torch.randn(M, K).half()
+b = torch.randn(K, N).half()
+if not args.simulator:
+    a = a.npu()
+    b = b.npu()
 print("init successful!")
 
 c = func(a, b)
 
-ref_c = a @ b
+ref_c = a.cpu() @ b.cpu()
 
-torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
+torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-2, atol=1e-2)
 print("Kernel Output Match!")
+print(f"mode={'simulator' if args.simulator else 'npu'}")

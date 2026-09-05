@@ -1,0 +1,5781 @@
+# Copyright (c) Tile-AI Corporation.
+# Licensed under the MIT License.
+"""Lower final A2/A3 TIR into the simulator's backend-neutral program model."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+from .errors import ProgramValidationError, UnsupportedSimOpError
+from .layout import (
+    BYTE_PER_C0,
+    BYTE_PER_FRACTAL,
+    C0_NUM_PER_FRACTAL,
+    physical_index,
+    storage_elements,
+)
+from .memory import contiguous_strides_bytes, dtype_size_bytes
+from .profile import TimingProfile, default_timing_profile, normalize_platform
+from .program import (
+    AffineInt,
+    BufferRegion,
+    BufferSpec,
+    CoreProgram,
+    KernelProgram,
+    Lane,
+    MemoryScope,
+    Pipe,
+    SymbolicInt,
+    Task,
+)
+
+
+_VECTOR_OPS = frozenset({
+    "abs", "add", "adds", "arith_progression", "axpy", "bilinear_interpolation",
+    "bitwise_and", "bitwise_lshift", "bitwise_not", "bitwise_or", "bitwise_rshift",
+    "bitwise_xor", "block_reduce_max", "block_reduce_min", "block_reduce_sum",
+    "broadcast", "brcb_experiment", "cast", "clamp", "clamp_max", "clamp_min",
+    "compare", "compare_scalar", "cos", "createvecindex", "div", "divs", "duplicate",
+    "exp", "fill", "gather", "gather_mask", "gather_mask_experiment", "gatherb",
+    "init_sort_buf", "leaky_relu", "ln", "max", "maxs", "merge_sort", "min", "mins",
+    "mul", "mul_add_dst", "muls", "pow", "reciprocal", "reduce", "reduce_max", "reduce_min",
+    "reduce_sum", "relu", "round", "rsqrt", "select",
+    "sigmoid", "silu", "sin", "sort", "sort32", "sqrt", "sub", "subs", "tail_binary",
+    "tail_broadcast", "tail_compare", "tail_compare_scalar", "tail_reduce", "tail_scalar",
+    "tail_select", "tail_unary", "topk", "transpose", "wholereducemax",
+    "wholereducemin", "wholereducesum", "abs_experiment", "brcb_experiment",
+    "datacachecleanandinvalid_experiment", "exp_experiment", "fill_experiment",
+    "gather_mask_experiment", "mins_experiment", "reducesum_experiment",
+    "reducesum_mask_experiment", "row_expand_div_experiment",
+    "row_expand_mul_experiment", "row_expand_sub_experiment", "sub_experiment",
+    "sum_experiment",
+})
+
+_TAIL_OPERATIONS = {
+    "tail_binary": frozenset({"add", "div", "max", "min", "mul", "sub"}),
+    "tail_scalar": frozenset({"adds", "maxs", "mins", "muls"}),
+    "tail_unary": frozenset({
+        "abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt",
+    }),
+}
+
+_TAIL_REDUCE_OPERATIONS = frozenset({"reduce_max", "reduce_min", "reduce_sum"})
+
+# InitSortBuf fills whole 64-int32 (256-byte) vector repeats of the buffer's
+# reinterpreted int32 view; see src/tl_templates/ascend/common.h.
+_INIT_SORT_BUF_BLOCK_ELEMENTS = 64
+
+# copy_ub_to_ub widens these (destination, source) dtype pairs without
+# rounding (CAST_NONE); every other mixed-dtype pair uses CAST_RINT.
+_UB_TO_UB_CAST_NONE = frozenset({
+    ("float32", "float16"),
+    ("float32", "bfloat16"),
+    ("float32", "int16"),
+    ("float16", "int8"),
+    ("int16", "int32"),
+})
+
+
+@dataclass(frozen=True)
+class _Context:
+    core_id: int = 0
+    lane: Lane = Lane.CONTROL
+    vector_index: Optional[int] = None
+    environment: Mapping[Any, int] = None
+
+    def __post_init__(self) -> None:
+        if self.environment is None:
+            object.__setattr__(self, "environment", {})
+
+
+def classify_operation(operation: str, lane: Lane) -> Tuple[Lane, Pipe, str]:
+    """Map one lowered operation name to the A2/A3 execution resource."""
+    normalized = operation.strip().lower()
+    short = _short_operation(normalized)
+
+    if "shmem" in short:
+        raise UnsupportedSimOpError(
+            f"Ascend shmem operation {operation!r} is intentionally unsupported"
+        )
+    if short in {
+        "set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
+        "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
+        "auto_wait_cross_flag", "barrier_all", "pipe_barrier", "auto_barrier",
+        "reinterpretcast",
+    }:
+        return lane, Pipe.SCALAR, short
+    if "im2col" in short:
+        return Lane.CUBE, Pipe.MTE1, short
+    if "gemm" in short or short in {"mma", "mma_bias"}:
+        return Lane.CUBE, Pipe.MATRIX, short
+    if "copy" in short or "data_copy" in short or "datacopy" in short:
+        if "l1_to_l0" in short or short == "copy_l1_to_bt":
+            return Lane.CUBE, Pipe.MTE1, short
+        if "l0c_to_gm" in short or "copy_cv" in short:
+            return Lane.CUBE, Pipe.FIX, short
+        if short == "copy_ub_to_l1":
+            return _vector_lane(lane), Pipe.MTE3, short
+        if "ub_to_gm" in short:
+            return _vector_lane(lane), Pipe.MTE3, short
+        if "copy_vc" in short:
+            return _vector_lane(lane), Pipe.VECTOR, short
+        if short == "copy_ub_to_ub":
+            return _vector_lane(lane), Pipe.VECTOR, short
+        return lane if lane is not Lane.CONTROL else Lane.CUBE, Pipe.MTE2, short
+    if "atomic" in short:
+        if "l0c" in short or lane is Lane.CUBE:
+            return Lane.CUBE, Pipe.FIX, short
+        return _vector_lane(lane), Pipe.MTE3, short
+    if short in _VECTOR_OPS:
+        return _vector_lane(lane), Pipe.VECTOR, short
+    if short in {"scalar", "printf", "dump_tensor", "free_pipe"}:
+        return lane, Pipe.SCALAR, short
+    if normalized == "buffer_store":
+        return _vector_lane(lane), Pipe.VECTOR, normalized
+    raise UnsupportedSimOpError(f"unsupported lowered simulator operation: {operation!r}")
+
+
+def _short_operation(operation: str) -> str:
+    short = operation.strip().lower()
+    for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+        if short.startswith(prefix):
+            short = short[len(prefix):]
+            break
+    if "<" in short:
+        short = short.split("<", 1)[0]
+    if short == "tl.arith_progression":
+        short = "arith_progression"
+    return short
+
+
+def _normalize_pipe_name(value: Any) -> str:
+    """Normalize TIR spellings such as ``PIPE_MTE2`` to simulator pipe names."""
+    normalized = str(value).strip().lower()
+    return normalized[5:] if normalized.startswith("pipe_") else normalized
+
+
+def _vector_lane(lane: Lane) -> Lane:
+    return lane if lane in {Lane.VECTOR_0, Lane.VECTOR_1} else Lane.VECTOR_0
+
+
+def _scale_runtime_int(value: Any, coefficient: int) -> Any:
+    if isinstance(value, int):
+        return value * coefficient
+    if isinstance(value, (AffineInt, SymbolicInt)):
+        return value.scaled(coefficient)
+    raise ProgramValidationError(f"cannot scale runtime integer {value!r}")
+
+
+def _add_runtime_int(left: Any, right: Any) -> Any:
+    if isinstance(left, int) and isinstance(right, int):
+        return left + right
+    if isinstance(left, (int, AffineInt, SymbolicInt)) and isinstance(
+        right, (int, AffineInt, SymbolicInt)
+    ):
+        return SymbolicInt("add", (left, right))
+    raise ProgramValidationError(
+        f"cannot add runtime integers {left!r} and {right!r}"
+    )
+
+
+def build_kernel_program(
+    func_or_mod: Any,
+    *,
+    platform: str,
+    timing_profile: Optional[TimingProfile] = None,
+    max_unrolled_iterations: int = 65536,
+) -> KernelProgram:
+    """Build a simulator program from final optimized TIR.
+
+    TVM is imported lazily so the simulator's program, memory, scheduler, and trace
+    foundations remain importable in CPU-only environments that do not have TileLang built.
+    """
+    try:
+        import tvm
+        from tvm import arith, tir
+    except (ImportError, OSError) as error:
+        raise UnsupportedSimOpError(
+            "building a simulator program requires the TileLang TVM runtime"
+        ) from error
+
+    normalized_platform = normalize_platform(platform)
+    profile = timing_profile or default_timing_profile(normalized_platform)
+    bridge = _TirBridge(
+        tvm=tvm,
+        tir=tir,
+        analyzer=arith.Analyzer(),
+        platform=normalized_platform,
+        timing_profile=profile,
+        max_unrolled_iterations=max_unrolled_iterations,
+    )
+    return bridge.build(func_or_mod)
+
+
+class _TirBridge:
+    def __init__(
+        self,
+        *,
+        tvm: Any,
+        tir: Any,
+        analyzer: Any,
+        platform: str,
+        timing_profile: TimingProfile,
+        max_unrolled_iterations: int,
+    ) -> None:
+        self.tvm = tvm
+        self.tir = tir
+        self.analyzer = analyzer
+        self.platform = platform
+        self.timing_profile = timing_profile
+        self.max_unrolled_iterations = max_unrolled_iterations
+        self.tasks: Dict[int, list[Task]] = defaultdict(list)
+        self.buffers: Dict[str, BufferSpec] = {}
+        self.buffer_name_by_data_var: Dict[str, str] = {}
+        self.storage_scope_by_var: Dict[str, MemoryScope] = {}
+        self.address_by_var: Dict[str, int] = {}
+        self.size_by_var: Dict[str, int] = {}
+        self.initial_shape_by_var: Dict[str, Tuple[int, ...]] = {}
+        # Final C220 TIR serializes the Cube and Vector resource scopes in the
+        # syntax tree even though the resources execute concurrently.  Memory
+        # hazards are therefore only source-order dependencies within one
+        # execution lane; cross-lane visibility is established by C/V flags.
+        self.last_writes: list[Tuple[BufferRegion, str, Lane]] = []
+        self.last_reads: list[Tuple[BufferRegion, str, Lane]] = []
+        self.active_aliases: Dict[Tuple[MemoryScope, Optional[int], str], str] = {}
+        self.task_counter = 0
+        self.kernel_name = "main"
+
+    def build(self, func_or_mod: Any) -> KernelProgram:
+        func = self._select_prim_func(func_or_mod)
+        if func.attrs is not None and "global_symbol" in func.attrs:
+            self.kernel_name = str(func.attrs["global_symbol"])
+        self._collect_memory_plan(func)
+        self._collect_parameter_buffers(func)
+        self._visit(func.body, _Context())
+        self._validate_unit_flag_pairs()
+        cores = tuple(
+            CoreProgram(core_id, tuple(self.tasks[core_id])) for core_id in sorted(self.tasks)
+        )
+        if not cores:
+            cores = (CoreProgram(0),)
+        return KernelProgram(
+            self.kernel_name,
+            self.platform,
+            cores,
+            tuple(self.buffers.values()),
+            metadata={
+                "timing_calibration": self.timing_profile.calibration,
+                "source": "final-optimized-tir",
+            },
+        )
+
+    def _select_prim_func(self, value: Any) -> Any:
+        if isinstance(value, self.tir.PrimFunc):
+            return value
+        if isinstance(value, self.tvm.IRModule):
+            functions = [func for _, func in value.functions_items()
+                         if isinstance(func, self.tir.PrimFunc)]
+            if len(functions) != 1:
+                raise ProgramValidationError(
+                    "simulator bridge requires an IRModule containing exactly one PrimFunc"
+                )
+            return functions[0]
+        raise TypeError("simulator bridge input must be a PrimFunc or IRModule")
+
+    def _collect_memory_plan(self, func: Any) -> None:
+        if func.attrs is None:
+            return
+        for attribute, destination in (
+            ("address_map", self.address_by_var),
+            ("size_map", self.size_by_var),
+        ):
+            if attribute not in func.attrs:
+                continue
+            for variable, value in func.attrs[attribute].items():
+                number = self._const_int(value, {})
+                if number is None or number < 0:
+                    raise ProgramValidationError(
+                        f"PrimFunc {attribute} must contain non-negative integers"
+                    )
+                destination[self._var_name(variable)] = number
+        if "initial_buffer_shapes" in func.attrs:
+            for variable, shape in func.attrs["initial_buffer_shapes"].items():
+                extents = tuple(self._const_int(value, {}) for value in shape)
+                if all(extent is not None and extent >= 0 for extent in extents):
+                    self.initial_shape_by_var[self._var_name(variable)] = tuple(
+                        int(extent) for extent in extents if extent is not None
+                    )
+
+    def _buffer_spec(
+        self,
+        name: str,
+        scope: MemoryScope,
+        shape: Tuple[Any, ...],
+        dtype: str,
+    ) -> BufferSpec:
+        address = self.address_by_var.get(name)
+        size_bytes = self.size_by_var.get(name)
+        metadata = {"planned_address": True} if address is not None else {}
+        return BufferSpec(
+            name,
+            scope,
+            shape,
+            dtype,
+            size_bytes=size_bytes,
+            address=address,
+            metadata=metadata,
+        )
+
+    def _reserve_layout_capacity(
+        self, name: str, required_bytes: int, *, layout: str
+    ) -> None:
+        """Reserve the physical footprint required by a lowered matrix layout.
+
+        Lowered Ascend TIR keeps the logical ``Allocate`` extent while the
+        Catlass zN/nZ helpers address padded fractal storage.  ``size_map`` is
+        normally sufficient, but a non-fractal K tail (for example fp32
+        ``K=72``) can require the last padded band too.  Model the footprint
+        used by the helper, rather than rejecting a kernel that is accepted by
+        the backend.
+        """
+        spec = self.buffers[name]
+        current = _buffer_size_bytes(spec)
+        if current is None or required_bytes <= current:
+            return
+        # Hand-authored bridge tests and generic TIR without a memory plan use
+        # their Allocate extent as the complete contract.  Only final planned
+        # TIR carries the backend's shared-L1 placement information that makes
+        # a Catlass layout tail physically meaningful.
+        if not spec.metadata.get("planned_address"):
+            return
+        metadata = dict(spec.metadata)
+        metadata["layout_capacity"] = max(
+            int(metadata.get("layout_capacity", 0)), required_bytes
+        )
+        metadata["layout_capacity_layout"] = layout
+        self.buffers[name] = replace(spec, size_bytes=required_bytes, metadata=metadata)
+
+    def _collect_parameter_buffers(self, func: Any) -> None:
+        for _, buffer in func.buffer_map.items():
+            name = str(buffer.name)
+            shape = tuple(self._extent_or_symbol(extent, {}) for extent in buffer.shape)
+            self.buffers.setdefault(
+                name,
+                self._buffer_spec(name, MemoryScope.GM, shape, str(buffer.dtype)),
+            )
+            self.buffer_name_by_data_var[self._var_name(buffer.data)] = name
+
+    def _visit(self, stmt: Any, context: _Context) -> None:
+        tir = self.tir
+        if stmt is None:
+            return
+        if isinstance(stmt, tir.SeqStmt):
+            for child in stmt.seq:
+                self._visit(child, context)
+            return
+        if isinstance(stmt, tir.AttrStmt):
+            self._visit_attr(stmt, context)
+            return
+        if isinstance(stmt, tir.For):
+            minimum = self._require_int(stmt.min, context.environment, "loop minimum")
+            extent = self._require_int(stmt.extent, context.environment, "loop extent")
+            if extent < 0 or extent > self.max_unrolled_iterations:
+                raise UnsupportedSimOpError(
+                    f"loop extent {extent} exceeds simulator bridge limit "
+                    f"{self.max_unrolled_iterations}"
+                )
+            for value in range(minimum, minimum + extent):
+                environment = dict(context.environment)
+                environment[stmt.loop_var] = value
+                self._visit(stmt.body, replace(context, environment=environment))
+            return
+        if isinstance(stmt, tir.IfThenElse):
+            condition = self._require_int(stmt.condition, context.environment, "if condition")
+            self._visit(stmt.then_case if condition else stmt.else_case, context)
+            return
+        if isinstance(stmt, tir.LetStmt):
+            value = self._require_int(stmt.value, context.environment, "let binding")
+            environment = dict(context.environment)
+            environment[stmt.var] = value
+            self._visit(stmt.body, replace(context, environment=environment))
+            return
+        if isinstance(stmt, tir.Allocate):
+            self._collect_allocate(stmt, context)
+            self._visit(stmt.body, context)
+            return
+        if hasattr(tir, "DeclBuffer") and isinstance(stmt, tir.DeclBuffer):
+            self._visit(stmt.body, context)
+            return
+        if hasattr(tir, "BufferRealize") and isinstance(stmt, tir.BufferRealize):
+            self._visit(stmt.body, context)
+            return
+        if isinstance(stmt, tir.BlockRealize):
+            self._visit(stmt.block, context)
+            return
+        if isinstance(stmt, tir.Block):
+            for buffer in stmt.alloc_buffers:
+                self._collect_block_buffer(buffer, context)
+            self._visit(stmt.init, context)
+            self._visit(stmt.body, context)
+            return
+        if isinstance(stmt, tir.AssertStmt):
+            condition = self._require_int(stmt.condition, context.environment, "assertion")
+            if not condition:
+                raise ProgramValidationError(f"TIR assertion failed: {stmt.message}")
+            self._visit(stmt.body, context)
+            return
+        if isinstance(stmt, tir.Evaluate):
+            if self._is_zero(stmt.value, context.environment):
+                return
+            if isinstance(stmt.value, tir.Call):
+                self._emit_call(stmt.value, context)
+                return
+        if isinstance(stmt, tir.BufferStore):
+            self._emit_task(
+                "buffer_store",
+                context,
+                metadata={"buffer": str(stmt.buffer.name), "tir": str(stmt)},
+            )
+            return
+        raise UnsupportedSimOpError(
+            f"unsupported final TIR statement {type(stmt).__name__} in {self.kernel_name}"
+        )
+
+    def _visit_attr(self, stmt: Any, context: _Context) -> None:
+        key = str(stmt.attr_key)
+        if key in {"thread_extent", "virtual_thread"}:
+            tag = str(getattr(stmt.node, "thread_tag", ""))
+            variable = getattr(stmt.node, "var", stmt.node)
+            extent = self._require_int(stmt.value, context.environment, f"{tag} extent")
+            if tag == "blockIdx.x":
+                for core_id in range(extent):
+                    environment = dict(context.environment)
+                    environment[variable] = core_id
+                    self._visit(
+                        stmt.body,
+                        replace(context, core_id=core_id, environment=environment),
+                    )
+                return
+            if tag in {"blockIdx.y", "threadIdx.x"}:
+                for vector_index in range(extent):
+                    environment = dict(context.environment)
+                    environment[variable] = vector_index
+                    self._visit(
+                        stmt.body,
+                        replace(
+                            context,
+                            vector_index=vector_index,
+                            environment=environment,
+                        ),
+                    )
+                return
+        if key == "resource_scope":
+            scope_value = self._require_int(stmt.value, context.environment, key)
+            if scope_value == 0:
+                if context.vector_index not in {None, 0}:
+                    return
+                self._visit(stmt.body, replace(context, lane=Lane.CUBE))
+                return
+            if scope_value == 1:
+                vector_index = context.vector_index or 0
+                lane = Lane.VECTOR_0 if vector_index == 0 else Lane.VECTOR_1
+                self._visit(stmt.body, replace(context, lane=lane))
+                return
+            raise UnsupportedSimOpError(f"unsupported resource_scope value: {scope_value}")
+        if key == "storage_scope":
+            name = self._var_name(stmt.node)
+            self.storage_scope_by_var[name] = MemoryScope.parse(self._literal(stmt.value))
+        self._visit(stmt.body, context)
+
+    def _collect_allocate(self, stmt: Any, context: _Context) -> None:
+        name = self._var_name(stmt.buffer_var)
+        scope = self.storage_scope_by_var.get(name)
+        if scope is None:
+            annotation = getattr(stmt.buffer_var, "type_annotation", None)
+            storage_scope = getattr(annotation, "storage_scope", "")
+            scope = MemoryScope.parse(str(storage_scope or "local.var"))
+        shape = tuple(
+            self._extent_or_symbol(extent, context.environment) for extent in stmt.extents
+        )
+        self.buffers.setdefault(
+            name, self._buffer_spec(name, scope, shape, str(stmt.dtype))
+        )
+        self.buffer_name_by_data_var[self._var_name(stmt.buffer_var)] = name
+
+    def _collect_block_buffer(self, buffer: Any, context: _Context) -> None:
+        name = str(buffer.name)
+        shape = tuple(
+            self._extent_or_symbol(extent, context.environment) for extent in buffer.shape
+        )
+        self.buffers.setdefault(
+            name,
+            self._buffer_spec(
+                name,
+                MemoryScope.parse(str(buffer.scope())),
+                shape,
+                str(buffer.dtype),
+            ),
+        )
+        self.buffer_name_by_data_var[self._var_name(buffer.data)] = name
+
+    def _emit_call(self, call: Any, context: _Context) -> None:
+        operation, arguments = self._call_operation(call)
+        lowered_operation = operation
+        tail_kind = _short_operation(operation)
+        if tail_kind in _TAIL_OPERATIONS:
+            if not arguments:
+                raise ProgramValidationError(f"{tail_kind} requires an operation tag")
+            operation_tag = self._literal(arguments[0])
+            if not isinstance(operation_tag, str):
+                raise ProgramValidationError(
+                    f"{tail_kind} operation tag must be a string, got {operation_tag!r}"
+                )
+            operation = _short_operation(operation_tag)
+            if operation not in _TAIL_OPERATIONS[tail_kind]:
+                raise UnsupportedSimOpError(
+                    f"operation tag {operation_tag!r} is not valid for {tail_kind}"
+                )
+            arguments = arguments[1:]
+        elif tail_kind == "tail_reduce":
+            if not arguments:
+                raise ProgramValidationError("tail_reduce requires a reduction kind")
+            operation_tag = self._literal(arguments[0])
+            operation = _short_operation(str(operation_tag))
+            if operation not in _TAIL_REDUCE_OPERATIONS:
+                raise UnsupportedSimOpError(
+                    f"unsupported tail_reduce kind {operation_tag!r}"
+                )
+            arguments = arguments[1:]
+        elif tail_kind == "mma" and arguments:
+            operation_tag = self._literal(arguments[0])
+            if isinstance(operation_tag, str) and operation_tag.startswith("mma_bias<"):
+                operation = "mma_bias"
+        metadata = {
+            "arguments": tuple(self._literal(arg) for arg in arguments),
+            "tir": str(call),
+        }
+        if tail_kind in _TAIL_OPERATIONS or tail_kind == "tail_reduce":
+            metadata.update({
+                "lowered_operation": lowered_operation,
+                "tail_kind": tail_kind,
+            })
+        else:
+            tail_kind = None
+        metadata.update(
+            self._functional_metadata(operation, arguments, context, tail_kind=tail_kind)
+        )
+        metadata.update(self._sync_metadata(operation, arguments))
+        span = getattr(call, "span", None)
+        if span is not None:
+            metadata["span"] = str(span)
+        if (
+            _short_operation(operation) == "gemm_v0"
+            and (
+                metadata.get("gemm", {}).get("step_count", 1) > 1
+                or metadata.get("gemm", {}).get("n_actual")
+                != metadata.get("gemm", {}).get("cols")
+            )
+        ):
+            self._emit_gemm_v0_trace_tasks(operation, context, metadata)
+            return
+        self._emit_task(operation, context, metadata=metadata)
+        if _short_operation(operation) == "reinterpretcast":
+            destination = metadata.get("dst")
+            source = metadata.get("src")
+            if isinstance(destination, BufferRegion) and isinstance(source, BufferRegion):
+                owner = destination.core_id
+                self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
+
+    def _emit_gemm_v0_trace_tasks(
+        self, _operation: str, context: _Context, metadata: Mapping[str, Any]
+    ) -> None:
+        details = metadata["gemm"]
+        step_count = details["step_count"]
+        k_split = (details["inner"] + details["k_l0_size"] - 1) // details["k_l0_size"]
+        input_dtype = metadata["lhs"].dtype
+        accumulator_dtype = metadata["dst"].dtype
+        input_bytes = dtype_size_bytes(input_dtype)
+        accumulator_bytes = dtype_size_bytes(accumulator_dtype)
+        max_k = min(details["inner"], details["k_l0_size"])
+        prefix = f"__sim_gemm_{context.core_id}_{self.task_counter}"
+        l0a_names = [f"{prefix}_l0a_{slot}" for slot in range(2)]
+        l0b_names = [f"{prefix}_l0b_{slot}" for slot in range(2)]
+        # The lowered helper reuses the same two hardware ping-pong slots on
+        # every invocation.  Giving each unrolled gemm call fresh sequential
+        # allocations would falsely exhaust L0A/L0B for multi-tile kernels.
+        l0_slot_bytes = 65536 // 2
+        for slot, name in enumerate(l0a_names):
+            self.buffers[name] = BufferSpec(
+                name, MemoryScope.L0A,
+                (storage_elements("l0a", (details["rows"], max_k), input_bytes),),
+                input_dtype,
+                address=slot * l0_slot_bytes,
+                metadata={"planned_address": True},
+            )
+        for slot, name in enumerate(l0b_names):
+            self.buffers[name] = BufferSpec(
+                name, MemoryScope.L0B,
+                (storage_elements("l0b", (max_k, details["n_tile"]), input_bytes),),
+                input_dtype,
+                address=slot * l0_slot_bytes,
+                metadata={"planned_address": True},
+            )
+
+        def source_window_regions(source, shape, origin, window_shape):
+            regions = []
+            cursor = origin[1]
+            limit = cursor + window_shape[1]
+            elements_per_c0 = BYTE_PER_C0 // input_bytes
+            while cursor < limit:
+                width = min(elements_per_c0 - cursor % elements_per_c0, limit - cursor)
+                offset = physical_index("zn", origin[0], cursor, shape, input_bytes)
+                regions.append(replace(
+                    source,
+                    shape=(window_shape[0], width),
+                    byte_offset=source.byte_offset + offset * input_bytes,
+                    strides_bytes=(elements_per_c0 * input_bytes, input_bytes),
+                ))
+                cursor += width
+            return tuple(regions)
+
+        for step in range(step_count):
+            n_index, k_index = divmod(step, k_split)
+            slot = step % 2
+            k_start = k_index * details["k_l0_size"]
+            n_start = n_index * details["n_tile"]
+            k_size = min(details["k_l0_size"], details["inner"] - k_start)
+            n_size = (
+                details["n_actual"]
+                if details["transpose_b"]
+                else details["n_tile"]
+            )
+            stage = {"gemm_stage": {
+                "step": step,
+                "n_index": n_index,
+                "k_index": k_index,
+                "ping_pong_slot": slot,
+            }}
+            shape_a_source = (k_size, details["rows"]) if details["transpose_a"] else (
+                details["rows"], k_size
+            )
+            origin_a = (k_start, 0) if details["transpose_a"] else (0, k_start)
+            shape_b_source = (n_size, k_size) if details["transpose_b"] else (
+                k_size, n_size
+            )
+            origin_b = (n_start, k_start) if details["transpose_b"] else (
+                k_start, n_start
+            )
+            l0a = BufferRegion(
+                l0a_names[slot], MemoryScope.L0A,
+                (storage_elements("l0a", (details["rows"], k_size), input_bytes),),
+                input_dtype, core_id=context.core_id,
+            )
+            l0b = BufferRegion(
+                l0b_names[slot], MemoryScope.L0B,
+                (
+                    storage_elements("l0b", (k_size, n_size), input_bytes)
+                    if isinstance(n_size, int)
+                    else _scale_runtime_int(
+                        n_size,
+                        ((k_size + 15) // 16) * 16,
+                    ),
+                ),
+                input_dtype, core_id=context.core_id,
+            )
+            a_regions = source_window_regions(
+                metadata["lhs"], details["shape_a"], origin_a, shape_a_source
+            )
+            b_regions = source_window_regions(
+                metadata["rhs"], details["shape_b"], origin_b, shape_b_source
+            )
+            a_source_metadata = {
+                "src": a_regions[0] if len(a_regions) == 1 else metadata["lhs"]
+            }
+            b_source_metadata = {
+                "src": b_regions[0] if len(b_regions) == 1 else metadata["rhs"]
+            }
+            if len(a_regions) > 1:
+                a_source_metadata["src_regions"] = a_regions
+            if len(b_regions) > 1:
+                b_source_metadata["src_regions"] = b_regions
+            reuse_event = {"wait_event": "M_MTE1"} if step >= 2 else {}
+            load_a = self._emit_task(
+                "copy_l1_to_l0a", context,
+                metadata={
+                    **stage,
+                    "timing_key": "gemm_v0.load_a",
+                    "transfer_bytes": details["rows"] * k_size * input_bytes,
+                    **reuse_event,
+                    **a_source_metadata,
+                    "dst": l0a,
+                    "copy": {
+                        "layout_transform": True,
+                        "source_layout": "zn",
+                        "destination_layout": "l0a",
+                        "source_shape": details["shape_a"],
+                        "source_origin": origin_a,
+                        "source_window_shape": shape_a_source,
+                        "source_window_direct": len(a_regions) == 1,
+                        "source_region_axis": 1,
+                        "destination_shape": (details["rows"], k_size),
+                        "transpose_after_slice": details["transpose_a"],
+                    },
+                },
+            )
+            load_b = self._emit_task(
+                "copy_l1_to_l0b", context,
+                metadata={
+                    **stage,
+                    "timing_key": "gemm_v0.load_b",
+                    "transfer_bytes": _scale_runtime_int(
+                        n_size, k_size * input_bytes
+                    ),
+                    **reuse_event,
+                    **b_source_metadata,
+                    "dst": l0b,
+                    "copy": {
+                        "layout_transform": True,
+                        "source_layout": "zn",
+                        "destination_layout": "l0b",
+                        "source_shape": details["shape_b"],
+                        "source_origin": origin_b,
+                        "source_window_shape": shape_b_source,
+                        "source_window_direct": len(b_regions) == 1,
+                        "source_region_axis": 1,
+                        "destination_shape": (k_size, n_size),
+                        "transpose_after_slice": details["transpose_b"],
+                    },
+                },
+            )
+            c_offset = metadata["dst"].byte_offset + (
+                n_start * ((details["rows"] + 15) // 16 * 16) * accumulator_bytes
+            )
+            l0c = replace(
+                metadata["dst"],
+                shape=(
+                    storage_elements(
+                        "l0c", (details["rows"], n_size), accumulator_bytes
+                    )
+                    if isinstance(n_size, int)
+                    else _scale_runtime_int(
+                        n_size,
+                        ((details["rows"] + 15) // 16) * 16,
+                    ),
+                ),
+                byte_offset=c_offset,
+                strides_bytes=None,
+            )
+            initialize = details["init"] and k_index == 0
+            mma_metadata = {
+                **stage,
+                "timing_key": "gemm_v0.mma",
+                "math_ops": _scale_runtime_int(
+                    n_size, 2 * details["rows"] * k_size
+                ),
+                "wait_event": "MTE1_M",
+                "set_event": "M_MTE1",
+                "lhs": l0a,
+                "rhs": l0b,
+                "dst": l0c,
+                "mma": {
+                    "rows": details["rows"],
+                    "cols": n_size,
+                    "inner": k_size,
+                    "init": initialize,
+                    "n_actual": n_size,
+                    "unit_flag": 0,
+                },
+            }
+            if not initialize:
+                mma_metadata["accumulator"] = l0c
+            self._emit_task(
+                "mma",
+                context,
+                metadata=mma_metadata,
+                extra_dependencies=(load_a.task_id, load_b.task_id),
+            )
+
+    def _functional_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail_kind: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract executable operands for currently supported copy and vector forms."""
+        normalized = operation.lower()
+        short = _short_operation(normalized)
+        if short in {"add", "sub", "mul", "div", "min", "max", "sub_experiment"}:
+            return self._binary_metadata(arguments, context, tail=tail_kind is not None)
+        if short in {"bitwise_and", "bitwise_or"}:
+            return self._bitwise_metadata(
+                self._binary_metadata(arguments, context, tail=False)
+            )
+        if short == "bitwise_xor":
+            return self._bitwise_metadata(self._pow_metadata(arguments, context))
+        if short in {
+            "adds", "subs", "muls", "divs", "mins", "maxs", "leaky_relu",
+            "mins_experiment",
+        }:
+            return self._scalar_metadata(arguments, context, tail=tail_kind is not None)
+        if short == "axpy":
+            metadata = self._scalar_metadata(arguments, context, tail=False)
+            if isinstance(metadata.get("dst"), BufferRegion):
+                metadata["accumulator"] = metadata["dst"]
+            return metadata
+        if short == "mul_add_dst":
+            metadata = self._binary_metadata(arguments, context, tail=False)
+            operands = [metadata.get(name) for name in ("dst", "lhs", "rhs")]
+            if not all(isinstance(operand, BufferRegion) for operand in operands):
+                return {}
+            dtypes = {operand.dtype for operand in operands}
+            if len(dtypes) != 1:
+                raise ProgramValidationError("mul_add_dst operand dtypes must match")
+            dtype = next(iter(dtypes))
+            if dtype not in {"float16", "float32"}:
+                raise UnsupportedSimOpError(
+                    f"functional mul_add_dst does not support dtype {dtype!r}"
+                )
+            metadata["accumulator"] = metadata["dst"]
+            return metadata
+        if short in {
+            "abs", "exp", "ln", "reciprocal", "relu", "rsqrt", "sqrt",
+            "abs_experiment",
+        }:
+            return self._unary_metadata(arguments, context, tail=tail_kind is not None)
+        if short == "bitwise_not":
+            return self._bitwise_metadata(
+                self._unary_metadata(arguments, context, tail=False)
+            )
+        if short in {"bitwise_lshift", "bitwise_rshift"}:
+            return self._shift_metadata(arguments, context)
+        if short in {"sigmoid", "silu", "sin", "cos"}:
+            return self._scratch_unary_metadata(arguments, context)
+        if short == "round":
+            metadata = self._scratch_unary_metadata(arguments, context)
+            source = metadata.get("src")
+            destination = metadata.get("dst")
+            if not isinstance(source, BufferRegion) or not isinstance(
+                destination, BufferRegion
+            ):
+                return {}
+            if source.dtype != destination.dtype:
+                raise ProgramValidationError("round operand dtypes must match")
+            if source.dtype not in {"float16", "float32"}:
+                raise UnsupportedSimOpError(
+                    f"functional round does not support dtype {source.dtype!r}"
+                )
+            return metadata
+        if short == "pow":
+            return self._pow_metadata(arguments, context)
+        if short in {"clamp", "clamp_max", "clamp_min"}:
+            return self._clamp_metadata(short, arguments, context)
+        if short == "broadcast":
+            return self._broadcast_metadata(arguments, context)
+        if short == "tail_broadcast":
+            return self._tail_broadcast_metadata(arguments, context)
+        if short in {"compare", "compare_scalar"}:
+            return self._compare_metadata(short, arguments, context)
+        if short in {"tail_compare", "tail_compare_scalar"}:
+            return self._tail_compare_metadata(short, arguments, context)
+        if short == "tail_select":
+            return self._tail_select_metadata(arguments, context)
+        if short == "select":
+            return self._select_metadata(arguments, context)
+        if short == "cast":
+            return self._cast_metadata(arguments, context)
+        if short == "fill":
+            return self._fill_metadata(arguments, context)
+        if short == "exp_experiment":
+            return self._exp_experiment_metadata(arguments, context)
+        if short == "reducesum_experiment":
+            return self._reduce_sum_experiment_metadata(arguments, context)
+        if short == "sum_experiment":
+            return self._sum_experiment_metadata(arguments, context)
+        if short in {"arith_progression", "createvecindex"}:
+            return self._sequence_metadata(short, arguments, context)
+        if short == "gather":
+            return self._gather_metadata(arguments, context)
+        if short == "gatherb":
+            return self._gatherb_metadata(arguments, context)
+        if short == "gather_mask":
+            return self._gather_mask_metadata(arguments, context)
+        if short == "transpose":
+            return self._transpose_metadata(arguments, context)
+        if short == "reinterpretcast":
+            return self._reinterpretcast_metadata(arguments, context)
+        if short == "topk":
+            return self._topk_metadata(arguments, context)
+        if short == "sort32":
+            return self._sort32_metadata(arguments, context)
+        if short == "sort":
+            return self._sort_metadata(arguments, context)
+        if short == "merge_sort":
+            return self._merge_sort_metadata(arguments, context)
+        if short == "init_sort_buf":
+            return self._init_sort_buf_metadata(arguments, context)
+        if short == "atomic_add_ub_to_gm":
+            return self._atomic_add_ub_metadata(operation, arguments, context)
+        if short == "atomic_add_l0c_to_gm":
+            return self._atomic_add_l0c_metadata(operation, arguments, context)
+        if short == "reduce":
+            return self._reduce_metadata(arguments, context)
+        if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
+            return self._block_reduce_metadata(short, arguments, context)
+        if short in {"wholereducemax", "wholereducemin", "wholereducesum"}:
+            return self._whole_reduce_metadata(short, arguments, context)
+        if short == "copy_gm_to_l1_linear":
+            return self._gm_to_l1_linear_metadata(arguments, context)
+        if short == "copy_gm_to_l1":
+            return self._gm_to_l1_zn_metadata(arguments, context)
+        if short == "copy_ub_to_ub":
+            return self._ub_to_ub_metadata(normalized, arguments, context)
+        if short == "copy_ub_to_l1":
+            return self._ub_to_l1_metadata(normalized, arguments, context)
+        if short == "brcb_experiment":
+            return self._brcb_metadata(arguments, context)
+        if short in {
+            "row_expand_mul_experiment",
+            "row_expand_sub_experiment",
+            "row_expand_div_experiment",
+        }:
+            return self._row_expand_metadata(short, arguments, context)
+        if short in {"copy_l1_to_l0a", "copy_l1_to_l0b"}:
+            return self._l1_to_l0_metadata(
+                short, normalized, arguments, context
+            )
+        if short == "copy_l1_to_bt":
+            return self._l1_to_bt_metadata(normalized, arguments, context)
+        if short == "copy_l0c_to_gm":
+            return self._l0c_to_gm_metadata(normalized, arguments, context)
+        if short == "im2col":
+            return self._im2col_metadata(arguments, context)
+        if short in {"mma", "mma_bias"}:
+            return self._mma_metadata(arguments, context, biased=short == "mma_bias")
+        if short == "gemm_v0":
+            return self._gemm_v0_metadata(arguments, context)
+        if short in _TAIL_REDUCE_OPERATIONS and tail_kind == "tail_reduce":
+            return self._tail_reduce_metadata(arguments, context)
+        if not any(name in normalized for name in ("copy_gm_to_ub", "copy_ub_to_gm")):
+            return {}
+        if len(arguments) < 3:
+            return {}
+        if len(arguments) >= 5:
+            valid_rows = self._runtime_int(arguments[3], context.environment)
+            valid_cols = self._runtime_int(arguments[4], context.environment)
+            if valid_rows is None or valid_cols is None:
+                return {}
+            if ((isinstance(valid_rows, int) and valid_rows < 0)
+                    or (isinstance(valid_cols, int) and valid_cols < 0)):
+                raise ProgramValidationError("copy valid rows/columns must not be negative")
+            shape = (valid_rows, valid_cols)
+            details: Dict[str, Any] = {
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "stride_n": self._literal(arguments[2]),
+            }
+            gm_to_ub = "copy_gm_to_ub" in normalized
+            legacy_ub_to_gm = not gm_to_ub and len(arguments) >= 8
+            if (gm_to_ub or legacy_ub_to_gm) and len(arguments) > 5:
+                details["pad_value"] = self._literal(
+                    self.analyzer.simplify(arguments[5])
+                )
+            # GM->UB carries pad_value before its optional physical shape;
+            # UB->GM has no pad argument, so its physical shape starts one
+            # position earlier.
+            physical_start = 6 if gm_to_ub or legacy_ub_to_gm else 5
+            if len(arguments) > physical_start:
+                has_physical_rows = len(arguments) > physical_start + 1
+                physical_rows_arg = (
+                    arguments[physical_start] if has_physical_rows else 1
+                )
+                physical_cols_arg = (
+                    arguments[physical_start + 1]
+                    if has_physical_rows
+                    else arguments[physical_start]
+                )
+                physical_rows = self._runtime_int(
+                    physical_rows_arg, context.environment
+                )
+                physical_cols = self._runtime_int(
+                    physical_cols_arg, context.environment
+                )
+                if physical_rows is None or physical_cols is None:
+                    return {}
+                if all(isinstance(value, int) for value in (
+                    valid_rows, valid_cols, physical_rows, physical_cols
+                )) and (valid_rows > physical_rows or valid_cols > physical_cols):
+                    raise ProgramValidationError(
+                        "copy valid rectangle "
+                        f"({valid_rows}, {valid_cols}) must fit its physical "
+                        f"destination tile ({physical_rows}, {physical_cols})"
+                    )
+                details["physical_rows"] = physical_rows
+                details["physical_cols"] = physical_cols
+            physical_cols = details.get("physical_cols")
+            source = self._access_buffer_region(
+                arguments[0],
+                shape,
+                context,
+                physical_cols=None if gm_to_ub else physical_cols,
+            )
+            destination = self._access_buffer_region(
+                arguments[1],
+                shape,
+                context,
+                physical_cols=physical_cols if gm_to_ub else None,
+            )
+        else:
+            length = self._runtime_int(arguments[2], context.environment)
+            if length is None or (isinstance(length, int) and length < 0):
+                return {}
+            source = self._access_buffer_region(arguments[0], (length,), context)
+            destination = self._access_buffer_region(arguments[1], (length,), context)
+            details = {"valid_elements": length}
+        if source is None or destination is None:
+            return {}
+        metadata = {"src": source, "dst": destination, "copy": details}
+        if (
+            "copy_gm_to_ub" in normalized
+            and "pad_value" in details
+            and "physical_rows" in details
+        ):
+            pad_destination = self._access_buffer_region(
+                arguments[1],
+                (details["physical_rows"], details["physical_cols"]),
+                context,
+            )
+            if pad_destination is not None and self._region_fits_buffer(pad_destination):
+                metadata["pad_dst"] = pad_destination
+            else:
+                metadata["pad_disabled_reason"] = "physical tile exceeds buffer view"
+        return metadata
+
+    def _gm_to_l1_linear_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, realSrcN, validM, validN, dstM, dstN.
+        if len(arguments) != 7:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        source_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
+        if any(isinstance(value, int) and value < 0 for value in dimensions):
+            raise ProgramValidationError("GM-to-L1 linear extents must not be negative")
+        if all(isinstance(value, int) for value in dimensions):
+            if valid_rows > physical_rows or valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "GM-to-L1 valid rectangle must fit its physical L1 tile"
+                )
+            if valid_cols > source_cols:
+                raise ProgramValidationError(
+                    "GM-to-L1 valid columns exceed the GM row stride"
+                )
+        source = self._access_buffer_region(
+            arguments[0], (valid_rows, valid_cols), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.GM or destination.scope is not MemoryScope.L1:
+            raise ProgramValidationError(
+                "copy_gm_to_l1_linear requires GM source and L1 destination"
+            )
+        if source.dtype != destination.dtype:
+            raise ProgramValidationError(
+                "copy_gm_to_l1_linear requires matching source/destination dtype"
+            )
+        itemsize = dtype_size_bytes(source.dtype)
+        if isinstance(valid_cols, int) and (valid_cols * itemsize) % 32:
+            raise ProgramValidationError(
+                "copy_gm_to_l1_linear row width must be 32-byte aligned"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "row_major",
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "source_cols": source_cols,
+                "physical_rows": physical_rows,
+                "physical_cols": physical_cols,
+            },
+        }
+
+    def _gm_to_l1_zn_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, realSrcN, validM, validN, dstM, dstN.
+        if len(arguments) != 7:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires static source and tile extents"
+            )
+        source_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
+        if any(value < 0 for value in dimensions):
+            raise ProgramValidationError("GM-to-L1 zN extents must not be negative")
+        if physical_rows == 0 or physical_cols == 0:
+            raise ProgramValidationError(
+                "GM-to-L1 zN physical tile extents must be positive"
+            )
+        if valid_rows > physical_rows or valid_cols > physical_cols:
+            raise ProgramValidationError(
+                "GM-to-L1 valid rectangle must fit its physical L1 tile"
+            )
+        if valid_cols > source_cols:
+            raise ProgramValidationError(
+                "GM-to-L1 valid columns exceed the GM row stride"
+            )
+
+        source = self._access_buffer_region(
+            arguments[0], (valid_rows, valid_cols), context
+        )
+        destination_name = self._access_ptr_data_name(arguments[1])
+        if source is None or destination_name is None:
+            return {}
+        destination_buffer = self.buffer_name_by_data_var.get(destination_name)
+        if destination_buffer is None:
+            return {}
+        destination_spec = self.buffers[destination_buffer]
+        if (
+            source.scope is not MemoryScope.GM
+            or destination_spec.scope is not MemoryScope.L1
+        ):
+            raise ProgramValidationError(
+                "copy_gm_to_l1 requires GM source and L1 destination"
+            )
+        if source.dtype != destination_spec.dtype:
+            raise ProgramValidationError(
+                "copy_gm_to_l1 requires matching source/destination dtype"
+            )
+
+        itemsize = dtype_size_bytes(source.dtype)
+        elements_per_c0 = BYTE_PER_C0 // itemsize
+        if physical_rows % C0_NUM_PER_FRACTAL and source.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a fractal/C0-aligned "
+                "physical tile except for the validated fp32 zN K-tail path"
+            )
+        if physical_cols % elements_per_c0:
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a C0-aligned physical tile"
+            )
+        physical_elements = storage_elements(
+            "zN", (physical_rows, physical_cols), itemsize
+        )
+        self._reserve_layout_capacity(
+            destination_buffer, physical_elements * itemsize, layout="zN"
+        )
+        destination_spec = self.buffers[destination_buffer]
+        destination = self._access_buffer_region(
+            arguments[1], (physical_elements,), context
+        )
+        if destination is None:
+            return {}
+        tile_bytes = physical_elements * itemsize
+        destination_size = _buffer_size_bytes(destination_spec)
+        if not isinstance(destination.byte_offset, int):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a static destination offset"
+            )
+        # The codegen treats a destination offset that is a whole-tile multiple
+        # as the primary copy owner (tile base or ring-slot base): it may
+        # zero-fill the full physical tile before the valid rectangle lands.
+        # Any other offset is the second DMA of a splice / vertical-merge
+        # pattern: it must anchor at a fractal-row boundary of the same
+        # (dstM, dstN) zN view and writes only the fractal rows its valid
+        # rectangle touches, so previously written bands stay intact.
+        if destination.byte_offset % tile_bytes == 0:
+            if destination_size is not None and (
+                destination.byte_offset + tile_bytes > destination_size
+            ):
+                raise ProgramValidationError(
+                    "GM-to-L1 zN physical tile exceeds the destination buffer"
+                )
+            return {
+                "src": source,
+                "dst": destination,
+                "copy": {
+                    "layout": "zN",
+                    "valid_rows": valid_rows,
+                    "valid_cols": valid_cols,
+                    "source_cols": source_cols,
+                    "physical_rows": physical_rows,
+                    "physical_cols": physical_cols,
+                    "need_clear": (
+                        valid_rows != physical_rows or valid_cols != physical_cols
+                    ),
+                },
+            }
+        elements_per_fractal = BYTE_PER_FRACTAL // itemsize
+        if physical_rows % C0_NUM_PER_FRACTAL:
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 sub-tile copies require a "
+                "fractal-row-aligned physical tile"
+            )
+        if destination.byte_offset % (elements_per_fractal * itemsize):
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 sub-tile copies require a "
+                "fractal-row-aligned destination offset inside the "
+                f"{physical_rows}x{physical_cols} zN tile"
+            )
+        written_rows = (
+            -(-valid_rows // C0_NUM_PER_FRACTAL) * C0_NUM_PER_FRACTAL
+        )
+        band_stride_elements = physical_rows * elements_per_c0
+        base_elements = destination.byte_offset // itemsize
+        written_elements_per_band = written_rows * elements_per_c0
+        if destination_size is not None and (
+            base_elements
+            + (physical_cols // elements_per_c0 - 1) * band_stride_elements
+            + written_elements_per_band
+        ) * itemsize > destination_size:
+            raise ProgramValidationError(
+                "GM-to-L1 zN sub-tile bands exceed the destination buffer"
+            )
+        written_regions = tuple(
+            replace(
+                destination,
+                shape=(written_elements_per_band,),
+                byte_offset=(base_elements + band * band_stride_elements) * itemsize,
+            )
+            for band in range(physical_cols // elements_per_c0)
+        )
+        return {
+            "src": source,
+            "dst_regions": written_regions,
+            "copy": {
+                "layout": "zN",
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "source_cols": source_cols,
+                "physical_rows": physical_rows,
+                "physical_cols": physical_cols,
+                "written_rows": written_rows,
+                "need_clear": False,
+            },
+        }
+
+    def _ub_to_ub_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, src_rows, src_cols, src_stride,
+        # dst_rows, dst_cols, dst_stride.  The operation name carries the
+        # (dst dtype, src dtype, len) template.
+        if len(arguments) != 8:
+            return {}
+        template = operation
+        for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+            if template.lower().startswith(prefix):
+                template = template[len(prefix):]
+                break
+        if (
+            not isinstance(template, str)
+            or not template.startswith("copy_ub_to_ub<")
+            or not template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "copy_ub_to_ub template must be copy_ub_to_ub<dtype, dtype, len>"
+            )
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:8]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_ub requires static tile extents"
+            )
+        (
+            src_rows, src_cols, src_stride, dst_rows, dst_cols, dst_stride,
+        ) = dimensions
+        if any(value < 0 for value in dimensions):
+            raise ProgramValidationError(
+                "copy_ub_to_ub extents must not be negative"
+            )
+        if src_cols > src_stride or dst_cols > dst_stride:
+            raise ProgramValidationError(
+                "copy_ub_to_ub tile columns must not exceed the row stride"
+            )
+        source = self._access_buffer_region(
+            arguments[0],
+            (src_rows, src_cols),
+            context,
+            physical_cols=src_stride,
+        )
+        destination = self._access_buffer_region(
+            arguments[1],
+            (dst_rows, dst_cols),
+            context,
+            physical_cols=dst_stride,
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.UB or destination.scope is not MemoryScope.UB:
+            raise ProgramValidationError(
+                "copy_ub_to_ub requires UB source and UB destination"
+            )
+        for label, stride, region in (
+            ("source", src_stride, source),
+            ("destination", dst_stride, destination),
+        ):
+            itemsize = dtype_size_bytes(region.dtype)
+            physical_stride = (
+                region.strides_bytes[0] // itemsize
+                if region.strides_bytes is not None
+                else region.shape[-1]
+            )
+            if (
+                isinstance(physical_stride, int)
+                and stride != physical_stride
+            ):
+                raise ProgramValidationError(
+                    f"copy_ub_to_ub {label} row stride {stride} disagrees with "
+                    f"the buffer's physical row width {physical_stride}"
+                )
+        cast_mode: Optional[str]
+        if source.dtype == destination.dtype:
+            cast_mode = None
+            if (src_rows, src_cols) != (dst_rows, dst_cols):
+                raise ProgramValidationError(
+                    "copy_ub_to_ub matching-dtype tiles must have identical extents"
+                )
+        else:
+            if (src_rows, src_cols) != (dst_rows, dst_cols):
+                raise ProgramValidationError(
+                    "copy_ub_to_ub cast tiles must have identical extents"
+                )
+            if source.dtype == "bfloat16" or destination.dtype == "bfloat16":
+                raise UnsupportedSimOpError(
+                    "functional copy_ub_to_ub does not support bfloat16 casts"
+                )
+            if (destination.dtype, source.dtype) in _UB_TO_UB_CAST_NONE:
+                cast_mode = "CAST_NONE"
+            else:
+                cast_mode = "CAST_RINT"
+        template_tokens = template[template.index("<") + 1:-1].split(",")
+        if len(template_tokens) != 3:
+            raise ProgramValidationError(
+                "copy_ub_to_ub template must be copy_ub_to_ub<dtype, dtype, len>"
+            )
+        template_dst = _ascend_template_dtype(template_tokens[0])
+        template_src = _ascend_template_dtype(template_tokens[1])
+        if template_dst != destination.dtype or template_src != source.dtype:
+            raise ProgramValidationError(
+                "copy_ub_to_ub template dtypes must match the source/destination "
+                "buffers (destination first)"
+            )
+        try:
+            template_len = int(template_tokens[2])
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_ub requires a static template length"
+            ) from error
+        if template_len != src_rows * src_cols:
+            raise ProgramValidationError(
+                f"copy_ub_to_ub template length {template_len} must equal the "
+                f"tile size {src_rows * src_cols}"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "ub_to_ub",
+                "valid_rows": src_rows,
+                "valid_cols": src_cols,
+                "cast_mode": cast_mode,
+            },
+        }
+
+    def _ub_to_l1_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src(UB), dst(L1), src_N, src_M, dst_M, dst_N.  The
+        # operation name carries the (dtype, N, M) template; the wrapper
+        # lowers to one Nd2Nz of a fully aligned (M, N) half tile.
+        if len(arguments) != 6:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:6]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_l1 requires static tile extents"
+            )
+        src_cols, src_rows, dst_rows, dst_cols = dimensions
+        if src_rows != dst_rows or src_cols != dst_cols:
+            raise ProgramValidationError(
+                "copy_ub_to_l1 requires identical source and destination tile extents"
+            )
+        if src_rows <= 0 or src_cols <= 0:
+            raise ProgramValidationError(
+                "copy_ub_to_l1 tile extents must be positive"
+            )
+        source = self._access_buffer_region(
+            arguments[0], (src_rows, src_cols), context
+        )
+        if source is None:
+            return {}
+        if source.scope is not MemoryScope.UB:
+            raise ProgramValidationError("copy_ub_to_l1 requires a UB source")
+        template = operation
+        for prefix in ("tl.ascend_", "tl::ascend::", "ascendc::"):
+            if template.lower().startswith(prefix):
+                template = template[len(prefix):]
+                break
+        if (
+            isinstance(template, str)
+            and template.startswith("copy_ub_to_l1<")
+            and template.endswith(">")
+        ):
+            template_dtype = _ascend_template_dtype(
+                template[template.index("<") + 1:-1].split(",")[0]
+            )
+            if template_dtype is not None and template_dtype != source.dtype:
+                raise ProgramValidationError(
+                    "copy_ub_to_l1 template dtype must match the source buffer"
+                )
+        if source.dtype != "float16":
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_l1 supports half tiles only"
+            )
+        if src_rows % C0_NUM_PER_FRACTAL or src_cols % (
+            BYTE_PER_C0 // dtype_size_bytes(source.dtype)
+        ):
+            raise UnsupportedSimOpError(
+                "functional copy_ub_to_l1 requires a fractal/C0-aligned tile"
+            )
+        destination_elements = storage_elements(
+            "zN", (src_rows, src_cols), dtype_size_bytes(source.dtype)
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (destination_elements,), context
+        )
+        if destination is None:
+            return {}
+        if destination.scope is not MemoryScope.L1:
+            raise ProgramValidationError(
+                "copy_ub_to_l1 requires an L1 destination"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout": "zN",
+                "valid_rows": src_rows,
+                "valid_cols": src_cols,
+                "source_cols": src_cols,
+                "physical_rows": src_rows,
+                "physical_cols": src_cols,
+                "need_clear": False,
+            },
+        }
+
+    def _brcb_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: template, dst(UB), src(UB), repeat_times, dst_blk_stride,
+        # dst_rep_stride.  Each repeat consumes 8 consecutive source elements
+        # and broadcasts element b into a full 32-byte destination block at
+        # 32-byte-unit offset repeat*dst_rep_stride + b*dst_blk_stride
+        # (EasyASC pipe_vec.py brcb semantics).
+        if len(arguments) != 6:
+            raise UnsupportedSimOpError(
+                "functional brcb requires the six-argument "
+                "(template, dst, src, repeat, blk_stride, rep_stride) ABI"
+            )
+        template = self._literal(arguments[0])
+        if (
+            not isinstance(template, str)
+            or not template.startswith("brcb<")
+            or not template.endswith(">")
+        ):
+            raise ProgramValidationError("brcb template must be brcb<dtype>")
+        repeat = self._runtime_int(arguments[3], context.environment)
+        blk_stride = self._runtime_int(arguments[4], context.environment)
+        rep_stride = self._runtime_int(arguments[5], context.environment)
+        if repeat is None or blk_stride is None or rep_stride is None:
+            return {}
+        if not all(
+            isinstance(value, int) for value in (repeat, blk_stride, rep_stride)
+        ):
+            raise UnsupportedSimOpError(
+                "functional brcb requires a static repeat and strides"
+            )
+        if repeat < 0 or blk_stride < 0 or rep_stride < 0:
+            raise ProgramValidationError(
+                "brcb repeat and strides must not be negative"
+            )
+        source = self._access_buffer_region(
+            arguments[2], (repeat * 8,), context
+        )
+        if source is None:
+            return {}
+        if source.scope is not MemoryScope.UB:
+            raise ProgramValidationError("brcb requires a UB source")
+        template_dtype = _ascend_template_dtype(template[5:-1].strip())
+        if template_dtype is not None and template_dtype != source.dtype:
+            raise ProgramValidationError(
+                "brcb template dtype must match the source buffer"
+            )
+        elements_per_block = BYTE_PER_C0 // dtype_size_bytes(source.dtype)
+        footprint = (
+            (repeat - 1) * rep_stride * elements_per_block
+            + 7 * blk_stride * elements_per_block
+            + elements_per_block
+            if repeat > 0
+            else 0
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (footprint,), context
+        )
+        if destination is None:
+            return {}
+        if destination.scope is not MemoryScope.UB:
+            raise ProgramValidationError("brcb requires a UB destination")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("brcb source/destination dtypes must match")
+        for label, region in (("destination", destination), ("source", source)):
+            if isinstance(region.byte_offset, int) and region.byte_offset % BYTE_PER_C0:
+                raise ProgramValidationError(
+                    f"brcb requires a 32-byte-aligned {label}"
+                )
+        return {
+            "dst": destination,
+            "src": source,
+            "brcb": {
+                "repeat": repeat,
+                "blk_stride": blk_stride,
+                "rep_stride": rep_stride,
+            },
+        }
+
+    def _row_expand_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: tag, dst, src0, src1[, tmp].  Rows fold to
+        # R = extent / (8 * elems_per_block) with 256-byte rows; row i
+        # combines src0 row i with the scalar carried by src1 block i.  With
+        # tmp the codegen expands brcb(src1 -> tmp) before the masked op; the
+        # simulator models that broadcast scratch as a written region of this
+        # task so downstream tmp readers keep their dependency edges.
+        if len(arguments) not in {4, 5}:
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires (tag, dst, src0, src1[, tmp])"
+            )
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or "<" not in tag or not tag.endswith(">"):
+            raise ProgramValidationError(
+                f"{operation} tag must be {operation}<dtype>"
+            )
+        tag_dtype = _ascend_template_dtype(tag.split("<", 1)[1][:-1].strip())
+        extents = tuple(
+            self._access_ptr_extent(arguments[index], context)
+            for index in (1, 2, 3)
+        )
+        if any(extent is None for extent in extents):
+            return {}
+        if not all(isinstance(extent, int) for extent in extents):
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires static pointer extents"
+            )
+        dst_extent, src0_extent, src1_extent = extents
+        if dst_extent != src0_extent:
+            raise ProgramValidationError(
+                f"{operation} source and destination extents must match"
+            )
+        destination_name = self._access_ptr_data_name(arguments[1])
+        if destination_name is None:
+            return {}
+        destination_buffer = self.buffer_name_by_data_var.get(destination_name)
+        if destination_buffer is None:
+            return {}
+        destination_spec = self.buffers[destination_buffer]
+        if tag_dtype is not None and tag_dtype != destination_spec.dtype:
+            raise ProgramValidationError(
+                f"{operation} tag dtype must match the operand buffers"
+            )
+        if destination_spec.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional {operation} supports float16/float32 rows only"
+            )
+        physical_cols = destination_spec.shape[-1]
+        itemsize = dtype_size_bytes(destination_spec.dtype)
+        elements_per_block = BYTE_PER_C0 // itemsize
+        if not isinstance(physical_cols, int) or physical_cols != 8 * elements_per_block:
+            raise ProgramValidationError(
+                f"{operation} requires 256-byte ({8 * elements_per_block}-element) "
+                f"rows, got {physical_cols} columns"
+            )
+        rows = dst_extent // physical_cols
+        if dst_extent % physical_cols or not 1 <= rows <= 255:
+            raise ProgramValidationError(
+                f"{operation} extent {dst_extent} must tile into 1..255 rows of "
+                f"{physical_cols} elements"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (rows, physical_cols), context
+        )
+        source = self._access_buffer_region(
+            arguments[2], (rows, physical_cols), context
+        )
+        if destination is None or source is None:
+            return {}
+        for region in (destination, source):
+            if region.scope is not MemoryScope.UB:
+                raise ProgramValidationError(
+                    f"{operation} requires UB operands"
+                )
+            if isinstance(region.byte_offset, int) and region.byte_offset % BYTE_PER_C0:
+                raise ProgramValidationError(
+                    f"{operation} requires 32-byte-aligned row windows"
+                )
+        source_spec = self.buffers[source.buffer]
+        if source_spec.shape[-1] != physical_cols:
+            raise ProgramValidationError(
+                f"{operation} source and destination physical row strides must match"
+            )
+        has_tmp = len(arguments) == 5
+        scalar_elements = rows if has_tmp else rows * elements_per_block
+        if src1_extent != scalar_elements:
+            raise ProgramValidationError(
+                f"{operation} scalar source must hold {scalar_elements} elements"
+                + ("" if has_tmp else " (one packed block per row)")
+            )
+        scalar_source = self._access_buffer_region(
+            arguments[3], (scalar_elements,), context
+        )
+        if scalar_source is None:
+            return {}
+        if scalar_source.scope is not MemoryScope.UB:
+            raise ProgramValidationError(
+                f"{operation} requires a UB scalar source"
+            )
+        scratch = None
+        if has_tmp:
+            tmp_extent = self._access_ptr_extent(arguments[4], context)
+            if tmp_extent is not None and tmp_extent != rows * elements_per_block:
+                raise ProgramValidationError(
+                    f"{operation} tmp must hold {rows * elements_per_block} elements"
+                )
+            scratch = self._access_buffer_region(
+                arguments[4], (rows * elements_per_block,), context
+            )
+            if scratch is None:
+                return {}
+            if scratch.scope is not MemoryScope.UB:
+                raise ProgramValidationError(f"{operation} requires a UB tmp")
+            if scratch.dtype != destination.dtype:
+                raise ProgramValidationError(
+                    f"{operation} requires matching tmp and operand dtypes"
+                )
+        metadata = {
+            "dst": destination,
+            "src": source,
+            "scalar_src": scalar_source,
+            "row_expand": {
+                "rows": rows,
+                "row_elements": physical_cols,
+            },
+        }
+        if scratch is not None:
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _exp_experiment_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: exp_mask<dtype>, dst, src. ExpExperimentCodegen applies one
+        # full 256-byte vector repeat per row while preserving the physical row
+        # stride of the original 2D UB allocation.
+        if len(arguments) != 3:
+            raise UnsupportedSimOpError(
+                "functional exp_experiment requires (tag, dst, src)"
+            )
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or not (
+            tag.startswith("exp_mask<") and tag.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "exp_experiment tag must be exp_mask<dtype>"
+            )
+        destination_extent = self._access_ptr_extent(arguments[1], context)
+        source_extent = self._access_ptr_extent(arguments[2], context)
+        if not isinstance(destination_extent, int) or not isinstance(
+            source_extent, int
+        ):
+            raise UnsupportedSimOpError(
+                "functional exp_experiment requires static pointer extents"
+            )
+        if destination_extent != source_extent:
+            raise ProgramValidationError(
+                "exp_experiment source and destination extents must match"
+            )
+        destination_data = self._access_ptr_data_name(arguments[1])
+        source_data = self._access_ptr_data_name(arguments[2])
+        if destination_data is None or source_data is None:
+            return {}
+        destination_name = self.buffer_name_by_data_var.get(destination_data)
+        source_name = self.buffer_name_by_data_var.get(source_data)
+        if destination_name is None or source_name is None:
+            return {}
+        destination_spec = self.buffers[destination_name]
+        source_spec = self.buffers[source_name]
+        destination_shape = self.initial_shape_by_var.get(
+            destination_data, destination_spec.shape
+        )
+        source_shape = self.initial_shape_by_var.get(source_data, source_spec.shape)
+        if len(destination_shape) < 2 or len(source_shape) < 2:
+            raise UnsupportedSimOpError(
+                "functional exp_experiment requires original 2D buffer shapes"
+            )
+        physical_cols = destination_shape[-1]
+        if source_shape[-1] != physical_cols:
+            raise ProgramValidationError(
+                "exp_experiment source/destination row strides must match"
+            )
+        dtype = _ascend_template_dtype(tag[len("exp_mask<"):-1])
+        if dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional exp_experiment supports float16/float32 only"
+            )
+        pointer_dtypes = tuple(
+            str(getattr(argument.args[0], "dtype", ""))
+            for argument in arguments[1:3]
+        )
+        if any(pointer_dtype != dtype for pointer_dtype in pointer_dtypes):
+            raise ProgramValidationError(
+                "exp_experiment tag dtype must match operands"
+            )
+        chunk = 128 if dtype == "float16" else 64
+        if destination_extent <= 0 or destination_extent % chunk:
+            raise ProgramValidationError(
+                f"exp_experiment extent must contain whole {chunk}-element rows"
+            )
+        rows = destination_extent // chunk
+        if rows > 255:
+            raise ProgramValidationError(
+                "exp_experiment repeat count must not exceed 255"
+            )
+        itemsize = dtype_size_bytes(dtype)
+        if not isinstance(physical_cols, int) or physical_cols < chunk:
+            raise ProgramValidationError(
+                "exp_experiment physical row is smaller than its vector chunk"
+            )
+        if physical_cols * itemsize % 32:
+            raise ProgramValidationError(
+                "exp_experiment physical row stride must be 32-byte aligned"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (rows, chunk), context, physical_cols=physical_cols
+        )
+        source = self._access_buffer_region(
+            arguments[2], (rows, chunk), context, physical_cols=physical_cols
+        )
+        if destination is None or source is None:
+            return {}
+        if destination.scope is not MemoryScope.UB or source.scope is not MemoryScope.UB:
+            raise ProgramValidationError("exp_experiment requires UB operands")
+        if destination.dtype != dtype or source.dtype != dtype:
+            raise ProgramValidationError(
+                "exp_experiment tag dtype must match operands"
+            )
+        for label, region in (("destination", destination), ("source", source)):
+            if isinstance(region.byte_offset, int):
+                if region.byte_offset % 32:
+                    raise ProgramValidationError(
+                        f"exp_experiment {label} must be 32-byte aligned"
+                    )
+                column = (region.byte_offset // itemsize) % physical_cols
+                if column + chunk > physical_cols:
+                    raise ProgramValidationError(
+                        f"exp_experiment {label} chunk crosses a physical row"
+                    )
+        return {
+            "dst": destination,
+            "src": source,
+            "exp_experiment": {
+                "rows": rows,
+                "chunk": chunk,
+                "physical_cols": physical_cols,
+            },
+        }
+
+    def _l1_to_bt_metadata(
+        self,
+        operation_tag: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src(L1), dst(BT), logical element count.
+        if len(arguments) != 3:
+            return {}
+        marker = "copy_l1_to_bt<"
+        marker_start = operation_tag.find(marker)
+        if marker_start < 0 or not operation_tag.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"malformed copy_l1_to_bt template {operation_tag!r}"
+            )
+        parameters = [
+            part.strip()
+            for part in operation_tag[marker_start + len(marker):-1].split(",")
+        ]
+        if len(parameters) != 2:
+            raise UnsupportedSimOpError(
+                f"malformed copy_l1_to_bt template {operation_tag!r}"
+            )
+        length = self._runtime_int(arguments[2], context.environment)
+        if not isinstance(length, int):
+            raise UnsupportedSimOpError(
+                "functional copy_l1_to_bt requires a static element count"
+            )
+        if length <= 0:
+            raise ProgramValidationError("copy_l1_to_bt length must be positive")
+        source = self._access_buffer_region(arguments[0], (length,), context)
+        destination = self._access_buffer_region(arguments[1], (length,), context)
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.L1 or destination.scope is not MemoryScope.BT:
+            raise ProgramValidationError("copy_l1_to_bt requires L1 source and BT destination")
+        destination_template_dtype = _ascend_template_dtype(parameters[0])
+        source_template_dtype = _ascend_template_dtype(parameters[1])
+        if (
+            source.dtype != source_template_dtype
+            or destination.dtype != destination_template_dtype
+            or source.dtype != destination.dtype
+        ):
+            raise ProgramValidationError(
+                "copy_l1_to_bt requires matching buffer and template dtypes"
+            )
+        if source.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional copy_l1_to_bt currently supports float32 bias"
+            )
+        transfer_bytes = length * dtype_size_bytes(source.dtype)
+        if transfer_bytes % 64:
+            raise UnsupportedSimOpError(
+                "functional copy_l1_to_bt requires a 64-byte-aligned transfer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {"valid_elements": length, "layout": "linear"},
+            "transfer_bytes": transfer_bytes,
+        }
+
+    def _l1_to_l0_metadata(
+        self,
+        operation: str,
+        operation_tag: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final copy ABI: src, dst, dstM, dstN. The source shape and transpose
+        # flag are compile-time template arguments on the operation name.
+        if len(arguments) != 4:
+            return {}
+        marker = f"{operation}<"
+        marker_start = operation_tag.find(marker)
+        if marker_start < 0 or not operation_tag.endswith(">"):
+            return {}
+        parameters = [
+            parameter.strip()
+            for parameter in operation_tag[
+                marker_start + len(marker):-1
+            ].split(",")
+        ]
+        if len(parameters) != 4:
+            raise UnsupportedSimOpError(
+                f"malformed {operation} template {operation_tag!r}"
+            )
+        try:
+            source_rows, source_cols = (int(parameters[index]) for index in (1, 2))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                f"{operation} requires static source template extents"
+            ) from error
+        if parameters[3] not in {"true", "false"}:
+            raise UnsupportedSimOpError(
+                f"{operation} requires a literal transpose template flag"
+            )
+        transpose = parameters[3] == "true"
+        destination_dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:4]
+        )
+        if any(value is None for value in destination_dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in destination_dimensions):
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires static destination extents"
+            )
+        destination_rows, destination_cols = destination_dimensions
+        if min(source_rows, source_cols, destination_rows, destination_cols) <= 0:
+            raise ProgramValidationError(
+                f"{operation} matrix extents must be positive"
+            )
+
+        source_shape = (
+            (source_cols, source_rows) if transpose else (source_rows, source_cols)
+        )
+        destination_shape = (destination_rows, destination_cols)
+        if (
+            destination_rows > source_shape[0]
+            or destination_cols > source_shape[1]
+        ):
+            raise ProgramValidationError(
+                f"{operation} destination tile must fit its logical L1 source"
+            )
+        source_layout = "nZ" if transpose else "zN"
+        destination_layout = "l0a" if operation.endswith("l0a") else "l0b"
+
+        source_name = self._access_ptr_data_name(arguments[0])
+        destination_name = self._access_ptr_data_name(arguments[1])
+        if source_name is None or destination_name is None:
+            return {}
+        source_buffer = self.buffer_name_by_data_var.get(source_name)
+        destination_buffer = self.buffer_name_by_data_var.get(destination_name)
+        if source_buffer is None or destination_buffer is None:
+            return {}
+        source_spec = self.buffers[source_buffer]
+        destination_spec = self.buffers[destination_buffer]
+        expected_destination_scope = (
+            MemoryScope.L0A if operation.endswith("l0a") else MemoryScope.L0B
+        )
+        if (
+            source_spec.scope is not MemoryScope.L1
+            or destination_spec.scope is not expected_destination_scope
+        ):
+            raise ProgramValidationError(
+                f"{operation} requires L1 source and {expected_destination_scope.value} destination"
+            )
+        if source_spec.dtype != destination_spec.dtype:
+            raise ProgramValidationError(
+                f"{operation} requires matching source/destination dtype"
+            )
+
+        itemsize = dtype_size_bytes(source_spec.dtype)
+        source_elements = storage_elements(source_layout, source_shape, itemsize)
+        destination_elements = storage_elements(
+            destination_layout, destination_shape, itemsize
+        )
+        self._reserve_layout_capacity(
+            source_buffer, source_elements * itemsize, layout=source_layout
+        )
+        source_spec = self.buffers[source_buffer]
+        source = self._access_buffer_region(
+            arguments[0], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (destination_elements,), context
+        )
+        if source is None or destination is None:
+            return {}
+        if not isinstance(source.byte_offset, int) or source.byte_offset % BYTE_PER_C0:
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires a 32-byte-aligned source"
+            )
+        source_element_offset = source.byte_offset // itemsize
+        source_origin = next(
+            (
+                (row, col)
+                for row in range(source_shape[0])
+                for col in range(source_shape[1])
+                if physical_index(
+                    source_layout, row, col, source_shape, itemsize
+                ) == source_element_offset
+            ),
+            None,
+        )
+        if source_origin is None:
+            raise UnsupportedSimOpError(
+                f"functional {operation} cannot map its source offset to a logical tile"
+            )
+        if (
+            source_origin[0] + destination_rows > source_shape[0]
+            or source_origin[1] + destination_cols > source_shape[1]
+        ):
+            raise ProgramValidationError(
+                f"{operation} source window exceeds its logical L1 tile"
+            )
+        elements_per_c0 = BYTE_PER_C0 // itemsize
+        source_regions = []
+        if source_layout == "zN":
+            cursor = source_origin[1]
+            limit = cursor + destination_cols
+            while cursor < limit:
+                width = min(elements_per_c0 - cursor % elements_per_c0, limit - cursor)
+                offset = physical_index(
+                    source_layout, source_origin[0], cursor, source_shape, itemsize
+                )
+                source_regions.append(replace(
+                    source,
+                    shape=(destination_rows, width),
+                    byte_offset=offset * itemsize,
+                    strides_bytes=(elements_per_c0 * itemsize, itemsize),
+                ))
+                cursor += width
+            source_region_axis = 1
+        else:
+            cursor = source_origin[0]
+            limit = cursor + destination_rows
+            while cursor < limit:
+                height = min(elements_per_c0 - cursor % elements_per_c0, limit - cursor)
+                offset = physical_index(
+                    source_layout, cursor, source_origin[1], source_shape, itemsize
+                )
+                source_regions.append(replace(
+                    source,
+                    shape=(height, destination_cols),
+                    byte_offset=offset * itemsize,
+                    strides_bytes=(itemsize, elements_per_c0 * itemsize),
+                ))
+                cursor += height
+            source_region_axis = 0
+        direct_window = len(source_regions) == 1
+        source = source_regions[0] if direct_window else replace(
+            source, shape=(source_elements,), byte_offset=0, strides_bytes=None
+        )
+        for label, region, elements, spec in (
+            ("destination", destination, destination_elements, destination_spec),
+        ):
+            tile_bytes = elements * itemsize
+            if (
+                not isinstance(region.byte_offset, int)
+                or region.byte_offset % tile_bytes
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional {operation} requires a tile-base-aligned {label}"
+                )
+            buffer_size = _buffer_size_bytes(spec)
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"{operation} physical {label} tile exceeds its buffer"
+                )
+        result = {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout_transform": True,
+                "source_layout": source_layout,
+                "destination_layout": destination_layout,
+                "source_shape": source_shape,
+                "destination_shape": destination_shape,
+                "source_origin": source_origin,
+                "source_window_direct": direct_window,
+                "source_region_axis": source_region_axis,
+                "transpose": transpose,
+            },
+        }
+        if not direct_window:
+            result["src_regions"] = tuple(source_regions)
+        return result
+
+    def _l0c_to_gm_metadata(
+        self,
+        operation_tag: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: src, dst, dstStrideN, validM, validN, srcM, srcN,
+        # enableRelu, unitFlag.
+        if len(arguments) != 9:
+            return {}
+        marker = "copy_l0c_to_gm<"
+        marker_start = operation_tag.find(marker)
+        if marker_start < 0 or not operation_tag.endswith(">"):
+            return {}
+        parameters = [
+            parameter.strip()
+            for parameter in operation_tag[
+                marker_start + len(marker):-1
+            ].split(",")
+        ]
+        if len(parameters) != 6:
+            raise UnsupportedSimOpError(
+                f"malformed copy_l0c_to_gm template {operation_tag!r}"
+            )
+        if parameters[2].lower() not in {"layout::rowmajor", "layout::row_major"}:
+            raise UnsupportedSimOpError(
+                f"functional copy_l0c_to_gm requires RowMajor GM, got {parameters[2]!r}"
+            )
+        try:
+            template_rows, template_cols = (int(parameters[index]) for index in (3, 4))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires static source template extents"
+            ) from error
+        relu_templates = {"true": True, "false": False, "1": True, "0": False}
+        if parameters[5].lower() not in relu_templates:
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires a literal ReLU template flag"
+            )
+        template_relu = relu_templates[parameters[5].lower()]
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm requires static dimensions"
+            )
+        destination_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
+        if min(destination_cols, physical_rows, physical_cols) <= 0:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical extents and GM stride must be positive"
+            )
+        if valid_rows < 0 or valid_cols < 0:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid extents must not be negative"
+            )
+        if valid_rows > physical_rows or valid_cols > physical_cols:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid rectangle must fit its physical L0C tile"
+            )
+        if valid_cols > destination_cols:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid columns exceed the GM row stride"
+            )
+        if (physical_rows, physical_cols) != (template_rows, template_cols):
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical extents disagree with its template"
+            )
+        relu_argument = self._literal(self.analyzer.simplify(arguments[7]))
+        if not isinstance(relu_argument, (bool, int)):
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires a literal enable_relu argument"
+            )
+        if bool(relu_argument) != template_relu:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm ReLU argument disagrees with its template"
+            )
+        unit_flag = self._runtime_int(arguments[8], context.environment)
+        if not isinstance(unit_flag, int) or unit_flag not in {0, 3}:
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm supports unitFlag 0 or 0b11"
+            )
+
+        source_name = self._access_ptr_data_name(arguments[0])
+        if source_name is None:
+            return {}
+        source_buffer = self.buffer_name_by_data_var.get(source_name)
+        if source_buffer is None:
+            return {}
+        source_spec = self.buffers[source_buffer]
+        source_capacity_elements = storage_elements(
+            "l0c",
+            (physical_rows, physical_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source_elements = storage_elements(
+            "l0c",
+            (physical_rows, valid_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source = self._access_buffer_region(
+            arguments[0], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.L0C or destination.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm requires L0C source and GM destination"
+            )
+        source_template_dtype = _ascend_template_dtype(parameters[0])
+        destination_template_dtype = _ascend_template_dtype(parameters[1])
+        if source_template_dtype is None or destination_template_dtype is None:
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm uses an unsupported template dtype"
+            )
+        if (
+            source.dtype != source_template_dtype
+            or destination.dtype != destination_template_dtype
+        ):
+            raise ProgramValidationError(
+                "copy_l0c_to_gm buffer dtypes disagree with its template"
+            )
+        source_bytes = source_capacity_elements * dtype_size_bytes(source.dtype)
+        if (
+            not isinstance(source.byte_offset, int)
+            or source.byte_offset % source_bytes
+        ):
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm requires a tile-base-aligned source"
+            )
+        source_size = _buffer_size_bytes(source_spec)
+        if source_size is not None and source.byte_offset + source_bytes > source_size:
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical source tile exceeds its buffer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "copy": {
+                "layout_transform": True,
+                "source_layout": "l0c",
+                "destination_layout": "row_major",
+                "source_shape": (physical_rows, valid_cols),
+                "destination_shape": (valid_rows, valid_cols),
+                "relu": template_relu,
+                "unit_flag": unit_flag,
+                "destination_cols": destination_cols,
+            },
+        }
+
+    def _im2col_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Intrinsic ABI: tag, src(L1), dst(L0A), hi, wi, kh, kw, strideH,
+        # strideW, dilationH, dilationW, padL, padR, padT, padB, posM, posK,
+        # validM, validK.  This mirrors Im2ColOpCodegen and common.h.
+        if len(arguments) != 19:
+            return {}
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or not tag.startswith("im2col<") or not tag.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"functional im2col got malformed template {tag!r}"
+            )
+        dtype = _ascend_template_dtype(tag[len("im2col<"):-1].strip())
+        if dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional im2col supports the repository's float16 and "
+                "float32 convolution paths"
+            )
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[3:]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional im2col requires static image/filter/tile parameters"
+            )
+        (
+            hi, wi, kh, kw, stride_h, stride_w, dilation_h, dilation_w,
+            pad_left, pad_right, pad_top, pad_bottom, pos_m, pos_k,
+            valid_m, valid_k,
+        ) = dimensions
+        if min(hi, wi, kh, kw, stride_h, stride_w, dilation_h, dilation_w) <= 0:
+            raise ProgramValidationError(
+                "im2col image, filter, stride, and dilation values must be positive"
+            )
+        if min(pad_left, pad_right, pad_top, pad_bottom, valid_m, valid_k) < 0:
+            raise ProgramValidationError(
+                "im2col padding and valid extents must not be negative"
+            )
+        # The language wrapper records that A2 rejects non-zero K/M start
+        # points with 507015; tiled convolution uses pointer offsets instead.
+        if pos_m != 0 or pos_k != 0:
+            raise UnsupportedSimOpError(
+                "functional im2col follows the A2 contract requiring pos_m=pos_k=0"
+            )
+        kernel_points = kh * kw
+        if valid_k == 0 or valid_k % kernel_points:
+            raise ProgramValidationError(
+                "im2col valid_k must be a positive multiple of kh*kw"
+            )
+        channels = valid_k // kernel_points
+        # The validated paths use exactly one complete datatype-specific C0 group.
+        channels_per_c0 = 16 if dtype == "float16" else 8
+        if channels != channels_per_c0:
+            raise UnsupportedSimOpError(
+                f"functional {dtype} im2col currently requires one "
+                f"{channels_per_c0}-channel C0 group"
+            )
+        output_h = (
+            hi + pad_top + pad_bottom - dilation_h * (kh - 1) - 1
+        ) // stride_h + 1
+        output_w = (
+            wi + pad_left + pad_right - dilation_w * (kw - 1) - 1
+        ) // stride_w + 1
+        if output_h <= 0 or output_w <= 0:
+            raise ProgramValidationError("im2col convolution has no output positions")
+        if valid_m > output_h * output_w:
+            raise ProgramValidationError(
+                "im2col valid_m exceeds the convolution output position count"
+            )
+
+        itemsize = dtype_size_bytes(dtype)
+        source_elements = storage_elements("zn", (hi * wi, channels), itemsize)
+        destination_elements = storage_elements(
+            "l0a", (valid_m, valid_k), itemsize
+        )
+        source = self._access_buffer_region(
+            arguments[1], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[2], (destination_elements,), context
+        )
+        if source is None or destination is None:
+            return {}
+        if source.scope is not MemoryScope.L1 or destination.scope is not MemoryScope.L0A:
+            raise ProgramValidationError("im2col requires L1 source and L0A destination")
+        if source.dtype != dtype or destination.dtype != dtype:
+            raise ProgramValidationError(
+                "im2col buffer dtypes must match its template dtype"
+            )
+        for label, region, extent in (
+            ("source", source, source_elements),
+            ("destination", destination, destination_elements),
+        ):
+            tile_bytes = extent * itemsize
+            if not isinstance(region.byte_offset, int) or region.byte_offset % tile_bytes:
+                raise UnsupportedSimOpError(
+                    f"functional im2col requires a tile-base-aligned {label}"
+                )
+            buffer_size = _buffer_size_bytes(self.buffers[region.buffer])
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"im2col {label} tile exceeds its buffer"
+                )
+        return {
+            "src": source,
+            "dst": destination,
+            "im2col": {
+                "image_shape": (hi, wi),
+                "kernel": (kh, kw),
+                "stride": (stride_h, stride_w),
+                "dilation": (dilation_h, dilation_w),
+                "padding": (pad_left, pad_right, pad_top, pad_bottom),
+                "output_shape": (output_h, output_w),
+                "channels": channels,
+                "valid_m": valid_m,
+                "valid_k": valid_k,
+            },
+        }
+
+    def _mma_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        biased: bool = False,
+    ) -> Dict[str, Any]:
+        # ABI: tag, A, B, C[, BiasBT], init, K[, n_actual, unitFlag].
+        base_count = 7 if biased else 6
+        if len(arguments) not in {base_count, base_count + 2}:
+            return {}
+        tag = self._literal(arguments[0])
+        marker = "mma_bias<" if biased else "mma<"
+        if not isinstance(tag, str) or not tag.startswith(marker) or not tag.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"functional {'mma_bias' if biased else 'mma'} got malformed template {tag!r}"
+            )
+        parameters = [part.strip() for part in tag[len(marker):-1].split(",")]
+        if len(parameters) != 4:
+            raise UnsupportedSimOpError(f"malformed {marker[:-1]} template {tag!r}")
+        try:
+            rows, cols = (int(parameters[index]) for index in (2, 3))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "functional mma requires static M/N template extents"
+            ) from error
+        init_index = 5 if biased else 4
+        inner_index = init_index + 1
+        inner = self._runtime_int(arguments[inner_index], context.environment)
+        if inner is None:
+            return {}
+        if not isinstance(inner, int):
+            raise UnsupportedSimOpError("functional mma requires a static K extent")
+        if min(rows, cols, inner) <= 0:
+            raise ProgramValidationError("mma M/N/K extents must be positive")
+        init_value = self._const_int(
+            arguments[init_index], context.environment
+        )
+        if init_value is None:
+            raise UnsupportedSimOpError(
+                "functional mma requires an init flag resolvable for each loop iteration"
+            )
+        initialize = bool(init_value)
+        actual_cols = cols
+        unit_flag = 0
+        if len(arguments) == base_count + 2:
+            actual_cols = self._runtime_int(
+                arguments[inner_index + 1], context.environment
+            )
+            unit_flag = self._runtime_int(
+                arguments[inner_index + 2], context.environment
+            )
+            if not isinstance(actual_cols, (int, AffineInt, SymbolicInt)):
+                raise UnsupportedSimOpError(
+                    "functional mma requires an executable n_actual"
+                )
+            if isinstance(actual_cols, int):
+                if actual_cols <= 0 or actual_cols > cols:
+                    raise ProgramValidationError(
+                        f"mma n_actual must be in [1, {cols}], got {actual_cols}"
+                    )
+                if actual_cols % 16:
+                    raise UnsupportedSimOpError(
+                        "functional mma requires n_actual to be a multiple of 16"
+                    )
+            if not isinstance(unit_flag, int) or unit_flag not in {0, 2, 3}:
+                raise UnsupportedSimOpError(
+                    "functional mma supports unitFlag 0, 0b10, or 0b11"
+                )
+
+        input_dtype = _ascend_template_dtype(parameters[0])
+        accumulator_dtype = _ascend_template_dtype(parameters[1])
+        if (input_dtype, accumulator_dtype) not in {
+            ("float16", "float32"),
+            ("float32", "float32"),
+            ("int8", "int32"),
+        }:
+            raise UnsupportedSimOpError(
+                "functional mma supports half-to-float, float-to-float, and int8-to-int32"
+            )
+        if biased and (input_dtype, accumulator_dtype) != ("float16", "float32"):
+            raise UnsupportedSimOpError(
+                "functional mma_bias currently supports half-to-float"
+            )
+        a_elements = storage_elements(
+            "l0a", (rows, inner), dtype_size_bytes(input_dtype)
+        )
+        b_capacity_elements = storage_elements(
+            "l0b", (inner, cols), dtype_size_bytes(input_dtype)
+        )
+        c_capacity_elements = storage_elements(
+            "l0c", (rows, cols), dtype_size_bytes(accumulator_dtype)
+        )
+        if isinstance(actual_cols, int):
+            b_elements = storage_elements(
+                "l0b", (inner, actual_cols), dtype_size_bytes(input_dtype)
+            )
+            c_elements = storage_elements(
+                "l0c", (rows, actual_cols), dtype_size_bytes(accumulator_dtype)
+            )
+        else:
+            b_elements = _scale_runtime_int(
+                actual_cols, ((inner + 15) // 16) * 16
+            )
+            c_elements = _scale_runtime_int(
+                actual_cols, ((rows + 15) // 16) * 16
+            )
+        left = self._access_buffer_region(arguments[1], (a_elements,), context)
+        right = self._access_buffer_region(arguments[2], (b_elements,), context)
+        destination = self._access_buffer_region(
+            arguments[3], (c_elements,), context
+        )
+        if left is None or right is None or destination is None:
+            return {}
+        bias = None
+        if biased:
+            bias = self._access_buffer_region(
+                arguments[4], (actual_cols,), context
+            )
+            if bias is None:
+                return {}
+        if (
+            left.scope is not MemoryScope.L0A
+            or right.scope is not MemoryScope.L0B
+            or destination.scope is not MemoryScope.L0C
+        ):
+            raise ProgramValidationError("mma requires L0A, L0B, and L0C operands")
+        if (
+            left.dtype != input_dtype
+            or right.dtype != input_dtype
+            or destination.dtype != accumulator_dtype
+        ):
+            raise ProgramValidationError("mma buffer dtypes disagree with its template")
+        if biased and (
+            bias.scope is not MemoryScope.BT or bias.dtype != accumulator_dtype
+        ):
+            raise ProgramValidationError(
+                "mma_bias requires a BT bias matching the accumulator dtype"
+            )
+        for label, region, capacity_elements in (
+            ("L0A", left, a_elements),
+            ("L0B", right, b_capacity_elements),
+            ("L0C", destination, c_capacity_elements),
+        ):
+            tile_bytes = capacity_elements * dtype_size_bytes(region.dtype)
+            if (
+                not isinstance(region.byte_offset, int)
+                or region.byte_offset % tile_bytes
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional mma requires a tile-base-aligned {label} operand"
+                )
+            buffer_size = _buffer_size_bytes(self.buffers[region.buffer])
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"mma {label} physical tile exceeds its buffer"
+                )
+        metadata: Dict[str, Any] = {
+            "lhs": left,
+            "rhs": right,
+            "dst": destination,
+            "mma": {
+                "rows": rows,
+                "cols": cols,
+                "inner": inner,
+                "init": initialize,
+                "n_actual": actual_cols,
+                "unit_flag": unit_flag,
+            },
+        }
+        if unit_flag == 2:
+            metadata["unit_flag_role"] = "hold"
+        if biased:
+            metadata["bias"] = bias
+            metadata["mma"]["bias"] = True
+        elif not initialize:
+            metadata["accumulator"] = destination
+        return metadata
+
+    def _validate_unit_flag_pairs(self) -> None:
+        """Validate the hardware MMA-to-fixpipe unitFlag handshake per core."""
+        for core_id, tasks in self.tasks.items():
+            releases: list[Tuple[int, Task]] = []
+            consumed: set[str] = set()
+            for index, task in enumerate(tasks):
+                mma = task.metadata.get("mma")
+                copy = task.metadata.get("copy")
+                if isinstance(mma, Mapping) and mma.get("unit_flag") == 3:
+                    releases.append((index, task))
+                    continue
+                if not (
+                    isinstance(copy, Mapping)
+                    and copy.get("unit_flag") == 3
+                    and task.operation == "copy_l0c_to_gm"
+                ):
+                    continue
+                source = task.metadata.get("src")
+                candidates = [
+                    (release_index, release)
+                    for release_index, release in releases
+                    if release.task_id not in consumed
+                    and release.task_id in task.dependencies
+                    and isinstance(source, BufferRegion)
+                    and isinstance(release.metadata.get("dst"), BufferRegion)
+                    and self._regions_overlap(
+                        source, release.metadata["dst"], core_id
+                    )
+                ]
+                if not candidates:
+                    raise ProgramValidationError(
+                        "unitFlag=0b11 fixpipe requires a preceding paired MMA "
+                        f"on the same L0C region (task {task.task_id})"
+                    )
+                release_index, release = candidates[-1]
+                mma_cols = release.metadata["mma"]["n_actual"]
+                fix_cols = copy["destination_shape"][1]
+                if mma_cols != fix_cols:
+                    raise ProgramValidationError(
+                        "paired MMA/fixpipe unitFlag column counts disagree: "
+                        f"mma n_actual={mma_cols}, fixpipe validN={fix_cols}"
+                    )
+                consumed.add(release.task_id)
+                release_metadata = dict(release.metadata)
+                release_metadata.update({
+                    "unit_flag_role": "release",
+                    "unit_flag_pair": task.task_id,
+                })
+                tasks[release_index] = replace(release, metadata=release_metadata)
+                task_metadata = dict(task.metadata)
+                task_metadata.update({
+                    "unit_flag_role": "consume",
+                    "unit_flag_pair": release.task_id,
+                })
+                tasks[index] = replace(task, metadata=task_metadata)
+            unmatched = [
+                task.task_id for _, task in releases if task.task_id not in consumed
+            ]
+            if unmatched:
+                raise ProgramValidationError(
+                    "unitFlag=0b11 MMA requires a following paired fixpipe; "
+                    "unmatched tasks: " + ", ".join(unmatched)
+                )
+
+    def _gemm_v0_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # ABI: tag, A(L1), B(L1), C(L0C), init[, n_actual].
+        if len(arguments) not in {5, 6}:
+            return {}
+        tag = self._literal(arguments[0])
+        if (
+            not isinstance(tag, str)
+            or not tag.startswith("gemm_v0<")
+            or not tag.endswith(">")
+        ):
+            raise UnsupportedSimOpError(f"malformed gemm_v0 template {tag!r}")
+        parameters = [part.strip() for part in tag[8:-1].split(",")]
+        if len(parameters) != 8:
+            raise UnsupportedSimOpError(f"malformed gemm_v0 template {tag!r}")
+        try:
+            rows, cols, inner, k_l0_size = (
+                int(parameters[index]) for index in (2, 3, 4, 7)
+            )
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 requires static M/N/K/kL0Size"
+            ) from error
+        if min(rows, cols, inner, k_l0_size) <= 0:
+            raise ProgramValidationError("gemm_v0 extents must be positive")
+        if k_l0_size % 16 or k_l0_size > 4095:
+            raise ProgramValidationError(
+                "gemm_v0 kL0Size must be a multiple of 16 and at most 4095"
+            )
+        if parameters[5] not in {"true", "false"} or parameters[6] not in {
+            "true", "false",
+        }:
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 requires literal transpose flags"
+            )
+        transpose_a = parameters[5] == "true"
+        transpose_b = parameters[6] == "true"
+        init_value = self._const_int(arguments[4], context.environment)
+        if init_value is None:
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 requires an init flag resolvable for each loop iteration"
+            )
+        initialize = bool(init_value)
+        actual_cols = cols
+        if len(arguments) == 6:
+            actual_cols = self._runtime_int(arguments[5], context.environment)
+            if not isinstance(actual_cols, (int, AffineInt, SymbolicInt)):
+                raise UnsupportedSimOpError(
+                    "functional gemm_v0 requires an executable n_actual"
+                )
+            if isinstance(actual_cols, int):
+                if actual_cols <= 0 or actual_cols > cols:
+                    raise ProgramValidationError(
+                        f"gemm_v0 n_actual must be in [1, {cols}], got {actual_cols}"
+                    )
+                if actual_cols % 16:
+                    raise UnsupportedSimOpError(
+                        "functional gemm_v0 requires n_actual to be a multiple of 16"
+                    )
+            if not transpose_b and (
+                not isinstance(actual_cols, int) or actual_cols != cols
+            ):
+                raise UnsupportedSimOpError(
+                    "functional gemm_v0 supports partial n_actual only with transpose_B"
+                )
+
+        input_dtype = _ascend_template_dtype(parameters[0])
+        accumulator_dtype = _ascend_template_dtype(parameters[1])
+        if (input_dtype, accumulator_dtype) not in {
+            ("float16", "float32"),
+            ("int8", "int32"),
+        }:
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 supports half-to-float and int8-to-int32"
+            )
+        input_bytes = dtype_size_bytes(input_dtype)
+        max_n_by_l0b = (32 * 1024) // (k_l0_size * input_bytes)
+        n_tile = cols if transpose_b or cols <= max_n_by_l0b else max_n_by_l0b
+        if n_tile <= 0 or cols % n_tile:
+            raise ProgramValidationError(
+                "gemm_v0 N tiling does not evenly divide the output columns"
+            )
+        n_l0_split = cols // n_tile
+        step_count = ((inner + k_l0_size - 1) // k_l0_size) * n_l0_split
+        l0_slot_budget = (64 * 1024) // (2 if step_count > 1 else 1)
+        if n_tile * k_l0_size * input_bytes > l0_slot_budget:
+            raise ProgramValidationError("gemm_v0 B tile exceeds its L0B slot")
+        if rows * k_l0_size * input_bytes > l0_slot_budget:
+            raise ProgramValidationError("gemm_v0 A tile exceeds its L0A slot")
+        shape_a = (inner, rows) if transpose_a else (rows, inner)
+        shape_b = (cols, inner) if transpose_b else (inner, cols)
+        shape_c = (rows, cols)
+        a_elements = storage_elements(
+            "zn", shape_a, dtype_size_bytes(input_dtype)
+        )
+        b_elements = storage_elements(
+            "zn", shape_b, dtype_size_bytes(input_dtype)
+        )
+        c_elements = storage_elements(
+            "l0c", shape_c, dtype_size_bytes(accumulator_dtype)
+        )
+        left = self._access_buffer_region(arguments[1], (a_elements,), context)
+        right = self._access_buffer_region(arguments[2], (b_elements,), context)
+        destination = self._access_buffer_region(
+            arguments[3], (c_elements,), context
+        )
+        if left is None or right is None or destination is None:
+            return {}
+        if (
+            left.scope is not MemoryScope.L1
+            or right.scope is not MemoryScope.L1
+            or destination.scope is not MemoryScope.L0C
+        ):
+            raise ProgramValidationError("gemm_v0 requires L1, L1, and L0C operands")
+        if (
+            left.dtype != input_dtype
+            or right.dtype != input_dtype
+            or destination.dtype != accumulator_dtype
+        ):
+            raise ProgramValidationError(
+                "gemm_v0 buffer dtypes disagree with its template"
+            )
+        for label, region, elements in (
+            ("A", left, a_elements),
+            ("B", right, b_elements),
+            ("C", destination, c_elements),
+        ):
+            tile_bytes = elements * dtype_size_bytes(region.dtype)
+            if (
+                not isinstance(region.byte_offset, int)
+                or region.byte_offset % tile_bytes
+            ):
+                raise UnsupportedSimOpError(
+                    f"functional gemm_v0 requires a tile-base-aligned {label} operand"
+                )
+            buffer_size = _buffer_size_bytes(self.buffers[region.buffer])
+            if buffer_size is not None and region.byte_offset + tile_bytes > buffer_size:
+                raise ProgramValidationError(
+                    f"gemm_v0 {label} physical tile exceeds its buffer"
+                )
+        metadata: Dict[str, Any] = {
+            "lhs": left,
+            "rhs": right,
+            "dst": destination,
+            "gemm": {
+                "rows": rows,
+                "cols": cols,
+                "inner": inner,
+                "shape_a": shape_a,
+                "shape_b": shape_b,
+                "transpose_a": transpose_a,
+                "transpose_b": transpose_b,
+                "init": initialize,
+                "n_actual": actual_cols,
+                "k_l0_size": k_l0_size,
+                "n_tile": n_tile,
+                "n_l0_split": n_l0_split,
+                "step_count": step_count,
+            },
+        }
+        if not initialize:
+            metadata["accumulator"] = destination
+        return metadata
+
+    def _reduce_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) < 4:
+            return {}
+        tag = self._literal(arguments[0])
+        if not isinstance(tag, str) or "<" not in tag or not tag.endswith(">"):
+            return {}
+        kind, encoded = tag.split("<", 1)
+        kind = _short_operation(kind)
+        if kind not in _TAIL_REDUCE_OPERATIONS:
+            raise UnsupportedSimOpError(f"unsupported reduce kind {kind!r}")
+        parameters = [part.strip() for part in encoded[:-1].split(",")]
+        if len(parameters) != 4:
+            raise UnsupportedSimOpError(f"malformed reduce tag {tag!r}")
+        try:
+            rows, cols, axis = (int(parameters[index]) for index in (1, 2, 3))
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                f"reduce tag requires static M/N/axis, got {tag!r}"
+            ) from error
+        if rows < 0 or cols < 0:
+            raise ProgramValidationError("reduce extents must not be negative")
+        if axis not in {0, -1}:
+            raise UnsupportedSimOpError(f"reduce supports axis 0 or -1, got {axis}")
+
+        cursor = len(arguments) - 1
+        physical_cols = cols
+        if str(getattr(arguments[cursor], "dtype", "")) != "bool":
+            candidate = self._const_int(arguments[cursor], context.environment)
+            if candidate is None:
+                return {}
+            physical_cols = candidate
+            cursor -= 1
+        clear_value = self._literal(arguments[cursor])
+        if clear_value not in {False, True, 0, 1}:
+            return {}
+        clear = bool(clear_value)
+        scratch_arguments = arguments[3:cursor]
+        if len(scratch_arguments) > 2:
+            return {}
+        if not clear:
+            expected_tmp_counts = {0: {1}, -1: {1, 2}}[axis]
+            if len(scratch_arguments) not in expected_tmp_counts:
+                raise UnsupportedSimOpError(
+                    f"reduce clear=false axis {axis} requires "
+                    f"{sorted(expected_tmp_counts)} tmp view count, got "
+                    f"{len(scratch_arguments)}"
+                )
+        source = self._access_buffer_region(arguments[2], (rows, cols), context)
+        output_count = cols if axis == 0 else rows
+        destination = self._access_buffer_region(
+            arguments[1], (output_count,), context
+        )
+        if source is None or destination is None:
+            return {}
+        itemsize = dtype_size_bytes(source.dtype)
+        if physical_cols != cols:
+            if physical_cols < cols:
+                raise ProgramValidationError(
+                    "narrow reduce logical width must fit its physical row"
+                )
+            if axis != -1:
+                raise UnsupportedSimOpError(
+                    "narrow reduce supports only row reduction (axis=-1)"
+                )
+            if cols * itemsize > 256:
+                raise UnsupportedSimOpError(
+                    "narrow reduce logical row must fit one 256-byte vector repeat"
+                )
+            if physical_cols * itemsize % 32:
+                raise ProgramValidationError(
+                    "narrow reduce physical row must be 32-byte aligned"
+                )
+            if not clear:
+                raise UnsupportedSimOpError(
+                    "narrow reduce does not support clear=false"
+                )
+        # StorageRewrite commonly flattens the Allocate while the reduce ABI
+        # still describes a two-dimensional tile.  The ABI's physical column
+        # count, rather than BufferSpec.shape[-1], is the authoritative stride.
+        source = replace(
+            source,
+            strides_bytes=(physical_cols * itemsize, itemsize),
+        )
+        metadata: Dict[str, Any] = {
+            "src": source,
+            "dst": destination,
+            "reduce_kind": kind,
+            "reduce_axis": axis,
+            "clear": clear,
+            "rows": rows,
+            "cols": cols,
+            "physical_cols": physical_cols,
+        }
+        if not clear:
+            metadata["accumulator"] = destination
+        for index, argument in enumerate(scratch_arguments):
+            extent = self._access_ptr_extent(argument, context)
+            if extent is None:
+                return {}
+            scratch = self._access_buffer_region(argument, (extent,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch" if index == 0 else "output_scratch"] = scratch
+        return metadata
+
+    def _region_fits_buffer(self, region: BufferRegion) -> bool:
+        bounds = _region_bounds(region)
+        spec = self.buffers[region.buffer]
+        if bounds is None:
+            return region.byte_offset == 0
+        if any(not isinstance(extent, int) for extent in spec.shape):
+            return True
+        size_bytes = spec.size_bytes
+        if size_bytes is None:
+            size_bytes = dtype_size_bytes(spec.dtype)
+            for extent in spec.shape:
+                size_bytes *= extent
+        return bounds[0] >= 0 and bounds[1] <= size_bytes
+
+    def _binary_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool = False,
+    ) -> Dict[str, Any]:
+        expected_arguments = 6 if tail else 4
+        if len(arguments) != expected_arguments:
+            return {}
+        shape = self._vector_shape(arguments, context, tail=tail, count_index=3)
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        left = self._access_buffer_region(arguments[1], shape, context)
+        right = self._access_buffer_region(arguments[2], shape, context)
+        if destination is None or left is None or right is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "lhs": left, "rhs": right}
+        if tail:
+            metadata["tail"] = self._tail_details(arguments, context, 3)
+        return metadata
+
+    def _unary_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool = False,
+    ) -> Dict[str, Any]:
+        expected_arguments = 5 if tail else 3
+        if len(arguments) != expected_arguments:
+            return {}
+        shape = self._vector_shape(arguments, context, tail=tail, count_index=2)
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        source = self._access_buffer_region(arguments[1], shape, context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        if tail:
+            metadata["tail"] = self._tail_details(arguments, context, 2)
+        return metadata
+
+    def _scratch_unary_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {3, 4}:
+            return {}
+        count = self._runtime_int(arguments[-1], context.environment)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("vector count must not be negative")
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        if len(arguments) == 4:
+            scratch = self._access_buffer_region(arguments[2], (count,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _bitwise_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        if not metadata:
+            return metadata
+        if any(
+            name in metadata and not isinstance(metadata[name], BufferRegion)
+            for name in ("dst", "src", "lhs", "rhs")
+        ):
+            return {}
+        operands = [
+            value for name in ("dst", "src", "lhs", "rhs")
+            if isinstance((value := metadata.get(name)), BufferRegion)
+        ]
+        dtypes = {operand.dtype for operand in operands}
+        if len(dtypes) != 1:
+            raise ProgramValidationError("bitwise operand dtypes must match")
+        dtype = next(iter(dtypes))
+        if dtype not in {"int16", "int32", "uint16", "uint32"}:
+            raise UnsupportedSimOpError(
+                f"functional bitwise operation does not support dtype {dtype!r}"
+            )
+        return metadata
+
+    def _shift_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            return {}
+        count = self._runtime_int(arguments[3], context.environment)
+        shift = self._runtime_int(arguments[2], context.environment)
+        if count is None or shift is None:
+            raise UnsupportedSimOpError(
+                "functional bitwise shift requires executable shift/count arguments"
+            )
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("bitwise shift count must not be negative")
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or source is None:
+            return {}
+        metadata = self._bitwise_metadata({"dst": destination, "src": source})
+        if not metadata:
+            return {}
+        if isinstance(shift, int):
+            bits = dtype_size_bytes(source.dtype) * 8
+            if shift < 0 or shift > bits:
+                raise ProgramValidationError(
+                    f"bitwise shift must be in [0, {bits}], got {shift}"
+                )
+        metadata.update({"shift": shift, "count": count})
+        return metadata
+
+    def _gather_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {5, 6}:
+            return {}
+        count = self._runtime_int(arguments[4], context.environment)
+        base = self._runtime_int(arguments[3], context.environment)
+        source_extent = self._access_ptr_extent(arguments[1], context)
+        if count is None or base is None or source_extent is None:
+            raise UnsupportedSimOpError(
+                "functional gather requires executable base/count and source extent"
+            )
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("gather count must not be negative")
+        if isinstance(base, int) and base < 0:
+            raise ProgramValidationError("gather base byte address must not be negative")
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        source = self._access_buffer_region(arguments[1], (source_extent,), context)
+        offsets = self._access_buffer_region(arguments[2], (count,), context)
+        if destination is None or source is None or offsets is None:
+            return {}
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("gather source/destination dtypes must match")
+        if source.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional gather does not support dtype {source.dtype!r}"
+            )
+        if offsets.dtype not in {"int32", "uint32"}:
+            raise ProgramValidationError(
+                f"gather offsets must use int32 or uint32, got {offsets.dtype!r}"
+            )
+        for label, region in (
+            ("destination", destination), ("source", source), ("offset", offsets)
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"gather {label} pointer must be 32-byte aligned"
+                )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "offsets": offsets,
+            "base": base,
+            "count": count,
+        }
+        if len(arguments) == 6:
+            scratch_extent = self._access_ptr_extent(arguments[5], context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                arguments[5], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _gatherb_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        argument_offset = 0
+        if arguments and isinstance(self._literal(arguments[0]), str):
+            argument_offset = 1
+        operands = arguments[argument_offset:]
+        if len(operands) != 6:
+            return {}
+        repeat = self._runtime_int(operands[3], context.environment)
+        dst_block_stride = self._runtime_int(operands[4], context.environment)
+        dst_repeat_stride = self._runtime_int(operands[5], context.environment)
+        source_extent = self._access_ptr_extent(operands[1], context)
+        if any(value is None for value in (
+            repeat, dst_block_stride, dst_repeat_stride, source_extent
+        )):
+            raise UnsupportedSimOpError(
+                "functional gatherb requires executable repeat/strides and source extent"
+            )
+        if all(isinstance(value, int) for value in (
+            repeat, dst_block_stride, dst_repeat_stride
+        )):
+            if min(repeat, dst_block_stride, dst_repeat_stride) < 0:
+                raise ProgramValidationError("gatherb repeat/strides must not be negative")
+            if repeat > 255:
+                raise ProgramValidationError("gatherb repeat must not exceed 255")
+        source_base = self._access_buffer_region(operands[1], (source_extent,), context)
+        destination_base = self._access_buffer_region(operands[0], (1,), context)
+        offsets = self._access_buffer_region(operands[2], (repeat, 8), context)
+        if source_base is None or destination_base is None or offsets is None:
+            return {}
+        offsets = replace(offsets, strides_bytes=(8 * 4, 4))
+        if source_base.dtype != destination_base.dtype:
+            raise ProgramValidationError("gatherb source/destination dtypes must match")
+        if argument_offset:
+            template = self._literal(arguments[0])
+            if not (
+                isinstance(template, str)
+                and template.startswith("Gatherb<")
+                and template.endswith(">")
+            ):
+                raise ProgramValidationError("gatherb template must be Gatherb<dtype>")
+            template_dtype = _ascend_template_dtype(
+                template[len("Gatherb<"):-1]
+            )
+            if template_dtype != destination_base.dtype:
+                raise ProgramValidationError(
+                    "gatherb template dtype must match destination dtype"
+                )
+        if source_base.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional gatherb does not support dtype {source_base.dtype!r}"
+            )
+        if offsets.dtype not in {"int32", "uint32"}:
+            raise ProgramValidationError(
+                f"gatherb offsets must use int32 or uint32, got {offsets.dtype!r}"
+            )
+        for label, region in (
+            ("destination", destination_base),
+            ("source", source_base),
+            ("offset", offsets),
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"gatherb {label} pointer must be 32-byte aligned"
+                )
+        itemsize = dtype_size_bytes(source_base.dtype)
+        elements_per_block = 32 // itemsize
+        destination = replace(
+            destination_base,
+            shape=(repeat, 8, elements_per_block),
+            strides_bytes=(
+                _scale_runtime_int(dst_repeat_stride, 32),
+                _scale_runtime_int(dst_block_stride, 32),
+                itemsize,
+            ),
+        )
+        return {
+            "dst": destination,
+            "src": source_base,
+            "offsets": offsets,
+            "repeat": repeat,
+            "dst_block_stride": dst_block_stride,
+            "dst_repeat_stride": dst_repeat_stride,
+            "elements_per_block": elements_per_block,
+        }
+
+    def _gather_mask_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {4, 5}:
+            return {}
+        template = self._literal(arguments[0])
+        if not (
+            isinstance(template, str)
+            and template.startswith("GatherMask<")
+            and template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "gather_mask template must be GatherMask<dtype>"
+            )
+        destination_arg, source_arg, selector_arg = arguments[1:4]
+
+        def flat_region(pointer: Any) -> Optional[BufferRegion]:
+            data_name = self._access_ptr_data_name(pointer)
+            buffer_name = self.buffer_name_by_data_var.get(data_name or "")
+            if buffer_name is None:
+                return None
+            spec = self.buffers[buffer_name]
+            if spec.scope is not MemoryScope.UB:
+                raise ProgramValidationError("gather_mask operands must use UB scope")
+            if not all(isinstance(extent, int) for extent in spec.shape):
+                raise UnsupportedSimOpError(
+                    "functional gather_mask requires static buffer shapes"
+                )
+            elements = 1
+            for extent in spec.shape:
+                elements *= extent
+            return self._access_buffer_region(pointer, (elements,), context)
+
+        destination = flat_region(destination_arg)
+        source = flat_region(source_arg)
+        if destination is None or source is None:
+            return {}
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError(
+                "gather_mask source/destination dtypes must match"
+            )
+        template_dtype = _ascend_template_dtype(
+            template[len("GatherMask<"):-1]
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "gather_mask template dtype must match destination dtype"
+            )
+        if source.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional gather_mask does not support dtype {source.dtype!r}"
+            )
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        patterns = {"P0101", "P1010", "P0001", "P0010", "P0100", "P1000", "P1111"}
+        if isinstance(selector_arg, self.tir.StringImm):
+            pattern = self._literal(selector_arg)
+            if pattern not in patterns:
+                raise ProgramValidationError(
+                    f"unsupported gather_mask fixed pattern {pattern!r}"
+                )
+            metadata.update(mode="fixed", pattern=pattern)
+        else:
+            offsets = flat_region(selector_arg)
+            if offsets is None:
+                return {}
+            if offsets.dtype != "uint32":
+                raise ProgramValidationError(
+                    f"gather_mask custom indices must use uint32, got {offsets.dtype!r}"
+                )
+            if offsets.shape[0] > destination.shape[0]:
+                raise ProgramValidationError(
+                    "gather_mask destination is smaller than its custom index buffer"
+                )
+            metadata.update(mode="custom", offsets=offsets)
+        if len(arguments) == 5:
+            scratch = flat_region(arguments[4])
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _transpose_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 2:
+            return {}
+        specs = []
+        for pointer in arguments:
+            data_name = self._access_ptr_data_name(pointer)
+            buffer_name = self.buffer_name_by_data_var.get(data_name or "")
+            if buffer_name is None:
+                return {}
+            specs.append(self.buffers[buffer_name])
+        destination_spec, source_spec = specs
+        if source_spec.scope is not MemoryScope.UB or destination_spec.scope is not MemoryScope.UB:
+            raise ProgramValidationError("transpose requires UB source and destination")
+        if len(source_spec.shape) != 2 or len(destination_spec.shape) != 2:
+            raise UnsupportedSimOpError("functional transpose requires rank-2 buffers")
+        if not all(
+            isinstance(extent, int)
+            for extent in source_spec.shape + destination_spec.shape
+        ):
+            raise UnsupportedSimOpError("functional transpose requires static shapes")
+        if destination_spec.shape != tuple(reversed(source_spec.shape)):
+            raise ProgramValidationError(
+                "transpose destination shape must reverse the source shape"
+            )
+        if destination_spec.dtype != source_spec.dtype:
+            raise ProgramValidationError("transpose source/destination dtypes must match")
+        if source_spec.dtype not in {
+            "int8", "uint8", "int16", "uint16", "int32", "uint32",
+            "float16", "float32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional transpose does not support dtype {source_spec.dtype!r}"
+            )
+        itemsize = dtype_size_bytes(source_spec.dtype)
+        if any(extent * itemsize % 32 for extent in source_spec.shape):
+            raise ProgramValidationError(
+                "transpose source dimensions must each be 32-byte aligned"
+            )
+        destination = self._access_buffer_region(
+            arguments[0], destination_spec.shape, context
+        )
+        source = self._access_buffer_region(arguments[1], source_spec.shape, context)
+        if destination is None or source is None:
+            return {}
+        if destination.byte_offset != 0 or source.byte_offset != 0:
+            raise UnsupportedSimOpError(
+                "functional transpose currently requires whole-buffer operands"
+            )
+        return {"dst": destination, "src": source}
+
+    def _reinterpretcast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 3:
+            return {}
+        destination_extent = self._access_ptr_extent(arguments[0], context)
+        source_extent = self._access_ptr_extent(arguments[1], context)
+        cast_type = self._literal(arguments[2])
+        if destination_extent is None or source_extent is None:
+            return {}
+        if not isinstance(cast_type, str):
+            raise ProgramValidationError("reinterpretcast casttype must be a string")
+        destination = self._access_buffer_region(
+            arguments[0], (destination_extent,), context
+        )
+        source = self._access_buffer_region(arguments[1], (source_extent,), context)
+        if destination is None or source is None:
+            return {}
+        if (
+            destination.scope is not MemoryScope.UB
+            or source.scope is not MemoryScope.UB
+        ):
+            raise ProgramValidationError("reinterpretcast requires UB operands")
+        if destination.byte_offset != 0 or source.byte_offset != 0:
+            raise UnsupportedSimOpError(
+                "functional reinterpretcast currently requires whole-buffer operands"
+            )
+        cast_dtype = _ascend_template_dtype(cast_type)
+        destination_bytes = destination_extent * dtype_size_bytes(destination.dtype)
+        source_bytes = source_extent * dtype_size_bytes(source.dtype)
+        if destination_bytes != source_bytes:
+            raise ProgramValidationError(
+                "reinterpretcast source/destination byte sizes must match"
+            )
+        if cast_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "reinterpretcast casttype must match destination dtype: "
+                f"casttype={cast_type!r}, destination={destination.dtype!r}"
+            )
+        destination_spec = self.buffers[destination.buffer]
+        source_spec = self.buffers[source.buffer]
+        return {
+            "dst": destination,
+            "src": source,
+            "alias_dst": destination.buffer,
+            "alias_src": source.buffer,
+            "materialize_view": bool(
+                destination_spec.metadata.get("planned_address")
+                or source_spec.metadata.get("planned_address")
+            ),
+        }
+
+    def _topk_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final post-workspace-injection ABI:
+        # template, dst, src, tmp, K, repeatTimes, actual_num, max_actual_num.
+        if len(arguments) != 8:
+            raise UnsupportedSimOpError(
+                "functional topk requires the final eight-argument ABI"
+            )
+        template = self._literal(arguments[0])
+        k = self._const_int(arguments[4], context.environment)
+        repeat_times = self._const_int(arguments[5], context.environment)
+        actual_num = self._runtime_int(arguments[6], context.environment)
+        max_actual_num = self._const_int(arguments[7], context.environment)
+        if not isinstance(template, str):
+            raise ProgramValidationError("topk template name must be a string")
+        if k is None or repeat_times is None or max_actual_num is None:
+            raise UnsupportedSimOpError(
+                "functional topk requires static K, repeatTimes, and max_actual_num"
+            )
+        if actual_num is None:
+            raise UnsupportedSimOpError("topk actual_num is not executable")
+        if k <= 0 or max_actual_num <= 0 or k > max_actual_num:
+            raise ProgramValidationError(
+                "topk requires 0 < K <= max_actual_num"
+            )
+        expected_repeats = (max_actual_num + 31) // 32
+        if repeat_times != expected_repeats:
+            raise ProgramValidationError(
+                f"topk repeatTimes must be {expected_repeats}, got {repeat_times}"
+            )
+        if isinstance(actual_num, int) and not (k <= actual_num <= max_actual_num):
+            raise ProgramValidationError(
+                f"topk actual_num must be in [{k}, {max_actual_num}], got {actual_num}"
+            )
+        destination_extent = self._access_ptr_extent(arguments[1], context)
+        source_extent = self._access_ptr_extent(arguments[2], context)
+        scratch_extent = self._access_ptr_extent(arguments[3], context)
+        extents = (destination_extent, source_extent, scratch_extent)
+        if not all(isinstance(extent, int) for extent in extents):
+            raise UnsupportedSimOpError(
+                "functional topk requires static pointer extents"
+            )
+        if destination_extent < 2 * k:
+            raise ProgramValidationError(
+                "topk destination must contain at least 2*K elements"
+            )
+        if source_extent < max_actual_num:
+            raise ProgramValidationError(
+                "topk source extent must cover max_actual_num"
+            )
+        if scratch_extent <= 0:
+            raise ProgramValidationError("topk scratch extent must be positive")
+        destination = self._access_buffer_region(arguments[1], (2 * k,), context)
+        source = self._access_buffer_region(arguments[2], (actual_num,), context)
+        scratch = self._access_buffer_region(
+            arguments[3], (scratch_extent,), context
+        )
+        if destination is None or source is None or scratch is None:
+            return {}
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination, source, scratch)
+        ):
+            raise ProgramValidationError("topk requires UB operands")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("topk source/destination dtypes must match")
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional topk does not support dtype {source.dtype!r}"
+            )
+        if not template.startswith("TopK<") or not template.endswith(">"):
+            raise ProgramValidationError("topk template must be TopK<dtype>")
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError("topk template dtype must match operands")
+        minimum_scratch = expected_repeats * 32 * (
+            10 if source.dtype == "float16" else 4
+        )
+        if scratch_extent < minimum_scratch:
+            raise ProgramValidationError(
+                "topk scratch extent is too small: "
+                f"need at least {minimum_scratch} elements, got {scratch_extent}"
+            )
+        if isinstance(scratch.byte_offset, int) and scratch.byte_offset % 32:
+            raise ProgramValidationError(
+                "topk scratch pointer must be 32-byte aligned"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "scratch": scratch,
+            "topk": {
+                "k": k,
+                "actual_num": actual_num,
+                "max_actual_num": max_actual_num,
+                "repeat_times": repeat_times,
+            },
+        }
+
+    def _sort32_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            raise UnsupportedSimOpError(
+                "functional sort32 requires dst, src, indices, and repeatTimes"
+            )
+        repeat_times = self._runtime_int(arguments[3], context.environment)
+        if repeat_times is None:
+            raise UnsupportedSimOpError("sort32 repeatTimes is not executable")
+        if isinstance(repeat_times, int) and not (1 <= repeat_times <= 255):
+            raise ProgramValidationError(
+                f"sort32 repeatTimes must be in [1, 255], got {repeat_times}"
+            )
+        count = _scale_runtime_int(repeat_times, 32)
+        source_extent = self._access_ptr_extent(arguments[1], context)
+        index_extent = self._access_ptr_extent(arguments[2], context)
+        destination_extent = self._access_ptr_extent(arguments[0], context)
+        if not all(
+            isinstance(extent, int)
+            for extent in (source_extent, index_extent, destination_extent)
+        ):
+            raise UnsupportedSimOpError(
+                "functional sort32 requires static pointer extents"
+            )
+        source_base = self._access_buffer_region(
+            arguments[1], (source_extent,), context
+        )
+        index_base = self._access_buffer_region(
+            arguments[2], (index_extent,), context
+        )
+        destination_base = self._access_buffer_region(
+            arguments[0], (destination_extent,), context
+        )
+        if source_base is None or index_base is None or destination_base is None:
+            return {}
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination_base, source_base, index_base)
+        ):
+            raise ProgramValidationError("sort32 requires UB operands")
+        if source_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional sort32 does not support dtype {source_base.dtype!r}"
+            )
+        if destination_base.dtype != source_base.dtype:
+            raise ProgramValidationError("sort32 source/destination dtypes must match")
+        if index_base.dtype not in {"int32", "uint32"}:
+            raise ProgramValidationError("sort32 indices must use int32 or uint32")
+        output_multiplier = 4 if source_base.dtype == "float16" else 2
+        if isinstance(count, int):
+            if source_extent < count or index_extent < count:
+                raise ProgramValidationError(
+                    "sort32 source/index extents must cover repeatTimes * 32"
+                )
+            if destination_extent < output_multiplier * count:
+                raise ProgramValidationError(
+                    "sort32 destination extent is too small for encoded output"
+                )
+        for label, region in (
+            ("destination", destination_base),
+            ("source", source_base),
+            ("index", index_base),
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"sort32 {label} pointer must be 32-byte aligned"
+                )
+        return {
+            "dst": replace(
+                destination_base, shape=(_scale_runtime_int(count, output_multiplier),)
+            ),
+            "src": replace(source_base, shape=(count,)),
+            "offsets": replace(index_base, shape=(count,)),
+            "repeat_times": repeat_times,
+            "output_multiplier": output_multiplier,
+        }
+
+    def _sort_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final post-workspace-injection ABI:
+        # template, dst, src, tmp, repeatTimes, actual_num.
+        if len(arguments) != 6:
+            raise UnsupportedSimOpError(
+                "functional sort requires the final six-argument ABI"
+            )
+        template = self._literal(arguments[0])
+        repeat_times = self._runtime_int(arguments[4], context.environment)
+        actual_num = self._runtime_int(arguments[5], context.environment)
+        if repeat_times is None or actual_num is None:
+            raise UnsupportedSimOpError(
+                "sort repeatTimes and actual_num must be executable"
+            )
+        if isinstance(actual_num, int) and actual_num <= 0:
+            raise ProgramValidationError("sort actual_num must be positive")
+        if isinstance(repeat_times, int):
+            expected = (actual_num + 31) // 32 if isinstance(actual_num, int) else None
+            if repeat_times <= 0 or (expected is not None and repeat_times != expected):
+                raise ProgramValidationError(
+                    f"sort repeatTimes does not match actual_num: {repeat_times}"
+                )
+        destination_extent = self._access_ptr_extent(arguments[1], context)
+        source_extent = self._access_ptr_extent(arguments[2], context)
+        scratch_extent = self._access_ptr_extent(arguments[3], context)
+        extents = (destination_extent, source_extent, scratch_extent)
+        if not all(isinstance(extent, int) for extent in extents):
+            raise UnsupportedSimOpError(
+                "functional sort requires static pointer extents"
+            )
+        if source_extent <= 0 or destination_extent < 2 * source_extent:
+            raise ProgramValidationError(
+                "sort destination extent must be at least twice the source extent"
+            )
+        if scratch_extent <= 0:
+            raise ProgramValidationError("sort scratch extent must be positive")
+        if isinstance(actual_num, int) and actual_num > source_extent:
+            raise ProgramValidationError("sort actual_num exceeds source extent")
+        destination = self._access_buffer_region(
+            arguments[1], (_scale_runtime_int(actual_num, 2),), context
+        )
+        source = self._access_buffer_region(arguments[2], (actual_num,), context)
+        scratch = self._access_buffer_region(
+            arguments[3], (scratch_extent,), context
+        )
+        if destination is None or source is None or scratch is None:
+            return {}
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination, source, scratch)
+        ):
+            raise ProgramValidationError("sort requires UB operands")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError("sort source/destination dtypes must match")
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                f"functional sort does not support dtype {source.dtype!r}"
+            )
+        if not isinstance(template, str) or not (
+            template.startswith("Sort<") and template.endswith(">")
+        ):
+            raise ProgramValidationError("sort template must be Sort<dtype>")
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError("sort template dtype must match operands")
+        aligned_count = _scale_runtime_int(repeat_times, 32)
+        minimum_scratch = _scale_runtime_int(
+            aligned_count, 8 if source.dtype == "float16" else 2
+        )
+        if isinstance(minimum_scratch, int) and scratch_extent < minimum_scratch:
+            raise ProgramValidationError(
+                "sort scratch extent is too small: "
+                f"need at least {minimum_scratch} elements, got {scratch_extent}"
+            )
+        if isinstance(scratch.byte_offset, int) and scratch.byte_offset % 32:
+            raise ProgramValidationError(
+                "sort scratch pointer must be 32-byte aligned"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "scratch": scratch,
+            "sort": {
+                "actual_num": actual_num,
+                "repeat_times": repeat_times,
+                "source_capacity": source_extent,
+            },
+        }
+
+    def _init_sort_buf_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Final ABI: template, dst, num, rsv.  The hardware wrapper signature is
+        # InitSortBuf(src, eleNum, rsv=0); rsv is reserved and ignored, and only
+        # whole 64-int32 blocks of the reinterpreted view are written.
+        if len(arguments) != 4:
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf requires the four-argument "
+                "(template, dst, num, rsv) ABI"
+            )
+        template = self._literal(arguments[0])
+        if (
+            not isinstance(template, str)
+            or not template.startswith("InitSortBuf<")
+            or not template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "init_sort_buf template must be InitSortBuf<dtype>"
+            )
+        element_count = self._runtime_int(arguments[2], context.environment)
+        if not isinstance(element_count, int):
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf requires a static element count"
+            )
+        if element_count <= 0:
+            raise ProgramValidationError(
+                "init_sort_buf element count must be positive"
+            )
+        capacity = self._access_ptr_extent(arguments[1], context)
+        if not isinstance(capacity, int):
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf requires a static destination extent"
+            )
+        if element_count > capacity:
+            raise ProgramValidationError(
+                f"init_sort_buf element count {element_count} exceeds destination "
+                f"extent {capacity}"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (element_count,), context
+        )
+        if destination is None:
+            return {}
+        if destination.scope is not MemoryScope.UB:
+            raise ProgramValidationError("init_sort_buf requires a UB destination")
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype is None or template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "init_sort_buf template dtype must match destination"
+            )
+        if destination.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional init_sort_buf currently supports float32 workspaces; "
+                "the upstream int32-lane fill pattern has no confirmed "
+                "float16 contract"
+            )
+        covered = element_count - element_count % _INIT_SORT_BUF_BLOCK_ELEMENTS
+        return {
+            "dst": destination,
+            "init_sort_buf": {
+                "element_count": element_count,
+                "covered_elements": covered,
+            },
+        }
+
+    def _merge_sort_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # AscendC ABI: template, numWays, dst, src..., blockLen...
+        # PTO ABI:     template, numWays, dst, tmp, src..., blockLen...
+        if len(arguments) < 7:
+            raise UnsupportedSimOpError("functional merge_sort ABI is malformed")
+        template = self._literal(arguments[0])
+        if not isinstance(template, str) or not (
+            template.startswith("MergeSort<") and template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "merge_sort template must be MergeSort<dtype>"
+            )
+        template_dtype = _ascend_template_dtype(
+            template.split("<", 1)[1][:-1].strip()
+        )
+        if template_dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional merge_sort supports float16 and float32 records"
+            )
+        record_width = 4 if template_dtype == "float16" else 2
+        num_ways = self._const_int(arguments[1], context.environment)
+        if num_ways not in {2, 3, 4}:
+            raise ProgramValidationError(
+                f"merge_sort numWays must be 2, 3, or 4, got {num_ways!r}"
+            )
+        implicit_count = 3 + 2 * num_ways
+        has_scratch = len(arguments) == implicit_count + 1
+        if len(arguments) not in {implicit_count, implicit_count + 1}:
+            raise UnsupportedSimOpError(
+                f"functional {num_ways}-way merge_sort has {len(arguments)} arguments"
+            )
+        source_start = 4 if has_scratch else 3
+        length_start = source_start + num_ways
+        lengths = tuple(
+            self._const_int(argument, context.environment)
+            for argument in arguments[length_start:length_start + num_ways]
+        )
+        if any(length is None or length <= 0 for length in lengths):
+            raise ProgramValidationError("merge_sort block lengths must be positive")
+        destination_extent = self._access_ptr_extent(arguments[2], context)
+        source_extents = tuple(
+            self._access_ptr_extent(argument, context)
+            for argument in arguments[source_start:length_start]
+        )
+        if not isinstance(destination_extent, int) or not all(
+            isinstance(extent, int) for extent in source_extents
+        ):
+            raise UnsupportedSimOpError(
+                "functional merge_sort requires static pointer extents"
+            )
+        output_elements = record_width * sum(lengths)
+        if destination_extent < output_elements:
+            raise ProgramValidationError(
+                "merge_sort destination extent is too small for all pairs"
+            )
+        if any(
+            extent < record_width * length
+            for extent, length in zip(source_extents, lengths)
+        ):
+            raise ProgramValidationError(
+                "merge_sort source extent is smaller than its block length"
+            )
+        destination = self._access_buffer_region(
+            arguments[2], (output_elements,), context
+        )
+        sources = tuple(
+            self._access_buffer_region(
+                argument, (record_width * length,), context
+            )
+            for argument, length in zip(
+                arguments[source_start:length_start], lengths
+            )
+        )
+        if destination is None or any(source is None for source in sources):
+            return {}
+        typed_sources = tuple(source for source in sources if source is not None)
+        if any(
+            region.scope is not MemoryScope.UB
+            for region in (destination,) + typed_sources
+        ):
+            raise ProgramValidationError("merge_sort requires UB operands")
+        if destination.dtype != template_dtype or any(
+            source.dtype != template_dtype for source in typed_sources
+        ):
+            raise ProgramValidationError(
+                "merge_sort buffer dtypes must match its template"
+            )
+        for label, region in (("destination", destination),) + tuple(
+            (f"source{index}", source)
+            for index, source in enumerate(typed_sources)
+        ):
+            if isinstance(region.byte_offset, int) and region.byte_offset % 32:
+                raise ProgramValidationError(
+                    f"merge_sort {label} pointer must be 32-byte aligned"
+                )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src_regions": typed_sources,
+            "merge_sort": {
+                "num_ways": num_ways,
+                "lengths": lengths,
+                "record_width": record_width,
+            },
+        }
+        if has_scratch:
+            scratch_extent = self._access_ptr_extent(arguments[3], context)
+            if not isinstance(scratch_extent, int) or scratch_extent <= 0:
+                raise ProgramValidationError(
+                    "merge_sort scratch extent must be a positive static integer"
+                )
+            scratch = self._access_buffer_region(
+                arguments[3], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            if scratch.scope is not MemoryScope.UB:
+                raise ProgramValidationError("merge_sort scratch must use UB scope")
+            if isinstance(scratch.byte_offset, int) and scratch.byte_offset % 32:
+                raise ProgramValidationError(
+                    "merge_sort scratch pointer must be 32-byte aligned"
+                )
+            scratch_bytes = scratch_extent * dtype_size_bytes(scratch.dtype)
+            output_bytes = output_elements * dtype_size_bytes(destination.dtype)
+            if scratch_bytes < output_bytes:
+                raise ProgramValidationError(
+                    "merge_sort scratch extent is too small: "
+                    f"need at least {output_bytes} bytes, got {scratch_bytes}"
+                )
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _atomic_add_ub_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Lowered DMA ABI: src, dst, GM row stride, valid rows, valid columns.
+        if len(arguments) != 5:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_ub_to_gm requires five operands"
+            )
+        stride = self._runtime_int(arguments[2], context.environment)
+        rows = self._runtime_int(arguments[3], context.environment)
+        cols = self._runtime_int(arguments[4], context.environment)
+        if any(value is None for value in (stride, rows, cols)):
+            raise UnsupportedSimOpError(
+                "atomic_add_ub_to_gm dimensions must be executable"
+            )
+        if all(isinstance(value, int) for value in (stride, rows, cols)):
+            if rows <= 0 or cols <= 0 or stride < cols:
+                raise ProgramValidationError(
+                    "atomic_add_ub_to_gm requires positive rows/cols and stride >= cols"
+                )
+        source = self._access_buffer_region(arguments[0], (rows, cols), context)
+        destination = self._access_buffer_region(
+            arguments[1], (rows, cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        destination = replace(
+            destination,
+            strides_bytes=(
+                _scale_runtime_int(stride, dtype_size_bytes(destination.dtype)),
+                dtype_size_bytes(destination.dtype),
+            ),
+        )
+        if source.scope is not MemoryScope.UB or destination.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm requires UB source and GM destination"
+            )
+        if source.dtype != destination.dtype:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm source/destination dtypes must match"
+            )
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_ub_to_gm currently supports float16/float32"
+            )
+        if isinstance(cols, int) and cols * dtype_size_bytes(source.dtype) % 32:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm row width must be 32-byte aligned"
+            )
+        tag = operation.rsplit("::", 1)[-1]
+        if "<" not in tag or not tag.endswith(">"):
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm requires a dtype template"
+            )
+        parameters = [part.strip() for part in tag.split("<", 1)[1][:-1].split(",")]
+        if not parameters or _ascend_template_dtype(parameters[0]) != destination.dtype:
+            raise ProgramValidationError(
+                "atomic_add_ub_to_gm template dtype must match operands"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "accumulator": destination,
+            "atomic": {
+                "kind": "add",
+                "rows": rows,
+                "cols": cols,
+                "stride": stride,
+                "source_scope": source.scope.value,
+            },
+        }
+
+    def _atomic_add_l0c_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Lowered DMA ABI: src, dst, GM row stride, valid rows, valid columns.
+        if len(arguments) != 5:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires five operands"
+            )
+        marker = "atomic_add_l0c_to_gm<"
+        marker_start = operation.find(marker)
+        if marker_start < 0 or not operation.endswith(">"):
+            raise UnsupportedSimOpError(
+                f"malformed atomic_add_l0c_to_gm template {operation!r}"
+            )
+        parameters = [
+            part.strip()
+            for part in operation[marker_start + len(marker):-1].split(",")
+        ]
+        if len(parameters) != 5:
+            raise UnsupportedSimOpError(
+                f"malformed atomic_add_l0c_to_gm template {operation!r}"
+            )
+        if parameters[2].lower() not in {"layout::rowmajor", "layout::row_major"}:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires RowMajor GM"
+            )
+        try:
+            physical_rows, physical_cols = map(int, parameters[3:5])
+        except ValueError as error:
+            raise UnsupportedSimOpError(
+                "atomic_add_l0c_to_gm requires static template extents"
+            ) from error
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[2:5]
+        )
+        if not all(isinstance(value, int) for value in dimensions):
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires static dimensions"
+            )
+        destination_cols, valid_rows, valid_cols = dimensions
+        if min(physical_rows, physical_cols, destination_cols) <= 0:
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm physical extents and GM stride must be positive"
+            )
+        if not (0 <= valid_rows <= physical_rows):
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm valid rows exceed the physical tile"
+            )
+        if not (0 <= valid_cols <= min(physical_cols, destination_cols)):
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm valid columns exceed the physical tile or GM stride"
+            )
+        source_name = self._access_ptr_data_name(arguments[0])
+        if source_name is None:
+            return {}
+        source_buffer = self.buffer_name_by_data_var.get(source_name)
+        if source_buffer is None:
+            return {}
+        source_spec = self.buffers[source_buffer]
+        source_capacity = storage_elements(
+            "l0c", (physical_rows, physical_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source_elements = storage_elements(
+            "l0c", (physical_rows, valid_cols),
+            dtype_size_bytes(source_spec.dtype),
+        )
+        source = self._access_buffer_region(
+            arguments[0], (source_elements,), context
+        )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if source is None or destination is None:
+            return {}
+        destination = replace(
+            destination,
+            strides_bytes=(
+                destination_cols * dtype_size_bytes(destination.dtype),
+                dtype_size_bytes(destination.dtype),
+            ),
+        )
+        if source.scope is not MemoryScope.L0C or destination.scope is not MemoryScope.GM:
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm requires L0C source and GM destination"
+            )
+        source_template_dtype = _ascend_template_dtype(parameters[0])
+        destination_template_dtype = _ascend_template_dtype(parameters[1])
+        if (
+            source_template_dtype != source.dtype
+            or destination_template_dtype != destination.dtype
+        ):
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm buffer dtypes disagree with its template"
+            )
+        dtype_pair = (source.dtype, destination.dtype)
+        if dtype_pair not in {
+            ("float32", "float32"), ("float32", "float16"),
+            ("int32", "int32"),
+        }:
+            raise UnsupportedSimOpError(
+                f"functional atomic_add_l0c_to_gm does not support {dtype_pair!r}"
+            )
+        source_bytes = source_capacity * dtype_size_bytes(source.dtype)
+        if not isinstance(source.byte_offset, int) or source.byte_offset % source_bytes:
+            raise UnsupportedSimOpError(
+                "functional atomic_add_l0c_to_gm requires a tile-base-aligned source"
+            )
+        source_size = _buffer_size_bytes(source_spec)
+        if source_size is not None and source.byte_offset + source_bytes > source_size:
+            raise ProgramValidationError(
+                "atomic_add_l0c_to_gm physical source tile exceeds its buffer"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "accumulator": destination,
+            "atomic": {
+                "kind": "add",
+                "rows": valid_rows,
+                "cols": valid_cols,
+                "stride": destination_cols,
+                "source_scope": source.scope.value,
+                "source_shape": (physical_rows, valid_cols),
+            },
+        }
+
+    def _pow_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {3, 4}:
+            return {}
+        count = self._access_ptr_extent(arguments[0], context)
+        if count is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        left = self._access_buffer_region(arguments[1], (count,), context)
+        right = self._access_buffer_region(arguments[2], (count,), context)
+        if destination is None or left is None or right is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "lhs": left, "rhs": right}
+        if len(arguments) == 4:
+            scratch = self._access_buffer_region(arguments[3], (count,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _clamp_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        offset = (
+            1
+            if arguments and isinstance(getattr(arguments[0], "value", None), str)
+            else 0
+        )
+        operands = arguments[offset:]
+        scalar_count = 2 if operation == "clamp" else 1
+        base_count = 2 + scalar_count + 1
+        if len(operands) not in {base_count, base_count + 1}:
+            return {}
+        has_scratch = len(operands) == base_count + 1
+        destination_arg, source_arg = operands[:2]
+        scalar_start = 3 if has_scratch else 2
+        scalar_args = operands[scalar_start:scalar_start + scalar_count]
+        count_arg = operands[scalar_start + scalar_count]
+        count = self._runtime_int(count_arg, context.environment)
+        scalars = tuple(self._literal(self.analyzer.simplify(arg)) for arg in scalar_args)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("clamp count must not be negative")
+        if any(not isinstance(value, (bool, int, float)) for value in scalars):
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires literal bounds, got {scalars!r}"
+            )
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        source = self._access_buffer_region(source_arg, (count,), context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "src": source}
+        if operation == "clamp":
+            metadata.update(min_value=scalars[0], max_value=scalars[1])
+        else:
+            metadata["scalar"] = scalars[0]
+        if has_scratch:
+            scratch = self._access_buffer_region(operands[2], (count,), context)
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _access_ptr_extent(
+        self,
+        pointer: Any,
+        context: _Context,
+    ) -> Optional[Any]:
+        if isinstance(pointer, self.tir.Call) and str(pointer.op.name) == "tir.tvm_access_ptr":
+            if len(pointer.args) < 4:
+                return None
+            extent = self._runtime_int(pointer.args[3], context.environment)
+            if isinstance(extent, int) and extent < 0:
+                raise ProgramValidationError("access pointer extent must not be negative")
+            return extent
+        return None
+
+    def _broadcast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        offset = (
+            1
+            if arguments and isinstance(getattr(arguments[0], "value", None), str)
+            else 0
+        )
+        operands = arguments[offset:]
+        if len(operands) < 5:
+            return {}
+        destination_arg, source_arg = operands[:2]
+        cursor = 2
+        scratch_arg = None
+        if (
+            isinstance(operands[cursor], self.tir.Call)
+            and str(operands[cursor].op.name) == "tir.tvm_access_ptr"
+        ):
+            scratch_arg = operands[cursor]
+            cursor += 1
+        dimension = self._const_int(operands[cursor], context.environment)
+        if dimension not in {1, 2}:
+            raise UnsupportedSimOpError(
+                f"functional broadcast supports only rank 1 or 2, got {dimension!r}"
+            )
+        cursor += 1
+        if len(operands) != cursor + 2 * dimension:
+            return {}
+        destination_shape = tuple(
+            self._runtime_int(value, context.environment)
+            for value in operands[cursor:cursor + dimension]
+        )
+        source_shape = tuple(
+            self._runtime_int(value, context.environment)
+            for value in operands[cursor + dimension:]
+        )
+        if any(value is None for value in destination_shape + source_shape):
+            return {}
+        if any(
+            isinstance(value, int) and value < 0
+            for value in destination_shape + source_shape
+        ):
+            raise ProgramValidationError("broadcast extents must not be negative")
+        if all(isinstance(value, int) for value in destination_shape + source_shape):
+            for source_extent, destination_extent in zip(
+                source_shape, destination_shape
+            ):
+                if source_extent not in {1, destination_extent}:
+                    raise ProgramValidationError(
+                        f"cannot broadcast source shape {source_shape} to {destination_shape}"
+                    )
+        destination = self._access_buffer_region(
+            destination_arg,
+            destination_shape,
+            context,
+            physical_cols=(destination_shape[-1] if dimension == 2 else None),
+        )
+        source = self._access_buffer_region(
+            source_arg,
+            source_shape,
+            context,
+            physical_cols=(source_shape[-1] if dimension == 2 else None),
+        )
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "broadcast": {"dimension": dimension},
+        }
+        if scratch_arg is not None:
+            scratch_extent = self._access_ptr_extent(scratch_arg, context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                scratch_arg, (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _tail_broadcast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Original broadcast ABI, including its name and optional tmp, plus
+        # output/input valid rows and columns appended by tail propagation.
+        if len(arguments) not in {12, 13}:
+            return {}
+        name = self._literal(arguments[0])
+        if not isinstance(name, str):
+            return {}
+        has_scratch = len(arguments) == 13
+        dimension_index = 4 if has_scratch else 3
+        if self._const_int(arguments[dimension_index], context.environment) != 2:
+            raise UnsupportedSimOpError("tail broadcast supports only rank 2")
+        shape_index = dimension_index + 1
+        physical_shape = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[shape_index:shape_index + 4]
+        )
+        valid_shape = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[-4:]
+        )
+        if any(value is None for value in physical_shape + valid_shape):
+            return {}
+        if any(
+            isinstance(value, int) and value < 0
+            for value in physical_shape + valid_shape
+        ):
+            raise ProgramValidationError("tail broadcast extents must not be negative")
+        dst_rows, dst_cols, src_rows, src_cols = physical_shape
+        valid_rows, valid_cols, src_valid_rows, src_valid_cols = valid_shape
+        if all(isinstance(value, int) for value in physical_shape + valid_shape):
+            if valid_rows > dst_rows or valid_cols > dst_cols:
+                raise ProgramValidationError(
+                    "tail broadcast valid output must fit its physical tile"
+                )
+            if src_valid_rows > src_rows or src_valid_cols > src_cols:
+                raise ProgramValidationError(
+                    "tail broadcast valid source must fit its physical tile"
+                )
+            if src_cols == 1 and src_rows != 1:
+                axis = 1
+                if valid_rows > src_valid_rows or src_valid_cols != 1:
+                    raise ProgramValidationError(
+                        "row tail broadcast requires one valid source column"
+                    )
+                source_shape = (valid_rows, 1)
+            elif src_rows == 1 and src_cols != 1:
+                axis = 0
+                if valid_cols > src_valid_cols or src_valid_rows != 1:
+                    raise ProgramValidationError(
+                        "column tail broadcast requires one valid source row"
+                    )
+                source_shape = (1, valid_cols)
+            else:
+                raise UnsupportedSimOpError(
+                    f"tail broadcast requires [M,1] or [1,N], got {(src_rows, src_cols)}"
+                )
+        else:
+            # The propagation pass chooses the axis from static physical shape.
+            raise UnsupportedSimOpError(
+                "dynamic physical shape is not supported for tail broadcast"
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        source = self._access_buffer_region(arguments[2], source_shape, context)
+        if destination is None or source is None:
+            return {}
+        if axis == 1:
+            itemsize = dtype_size_bytes(source.dtype)
+            elements_per_block = 32 // itemsize
+            aligned_cols = (
+                (src_cols + elements_per_block - 1) // elements_per_block
+            ) * elements_per_block
+            source = replace(
+                source, strides_bytes=(aligned_cols * itemsize, itemsize)
+            )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "broadcast": {"dimension": 2, "axis": axis, "tail": True},
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "src_valid_rows": src_valid_rows,
+            "src_valid_cols": src_valid_cols,
+            "physical_rows": dst_rows,
+            "physical_cols": dst_cols,
+            "src_physical_rows": src_rows,
+            "src_physical_cols": src_cols,
+        }
+        if has_scratch:
+            scratch_extent = self._access_ptr_extent(arguments[3], context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                arguments[3], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _compare_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {5, 6}:
+            return {}
+        if len(arguments) == 6 and operation != "compare_scalar":
+            return {}
+        mode_index = 4 if len(arguments) == 6 else 3
+        count_index = mode_index + 1
+        count = self._runtime_int(arguments[count_index], context.environment)
+        mode = getattr(arguments[mode_index], "value", None)
+        if count is None or not isinstance(mode, str):
+            return {}
+        mode = mode.upper()
+        if mode not in {"EQ", "NE", "GT", "GE", "LT", "LE"}:
+            raise UnsupportedSimOpError(f"unsupported compare mode {mode!r}")
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("compare count must not be negative")
+        mask_extent = self._access_ptr_extent(arguments[0], context)
+        if mask_extent is None:
+            return {}
+        destination = self._access_buffer_region(
+            arguments[0], (mask_extent,), context
+        )
+        left = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or left is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "lhs": left,
+            "compare_mode": mode,
+            "count": count,
+        }
+        if operation == "compare":
+            right = self._access_buffer_region(arguments[2], (count,), context)
+            if right is None:
+                return {}
+            metadata["rhs"] = right
+        elif len(arguments) == 6:
+            scalar_index = self._runtime_int(arguments[3], context.environment)
+            if not isinstance(scalar_index, (int, AffineInt, SymbolicInt)):
+                raise UnsupportedSimOpError(
+                    "functional compare_scalar requires an executable scalar index"
+                )
+            scalar_source = self._access_buffer_region(
+                arguments[2], (1,), context
+            )
+            if scalar_source is None:
+                return {}
+            if scalar_source.dtype != left.dtype:
+                raise ProgramValidationError(
+                    "compare_scalar buffer dtype must match its source dtype"
+                )
+            scalar_offset = _scale_runtime_int(
+                scalar_index, dtype_size_bytes(scalar_source.dtype)
+            )
+            metadata["scalar_src"] = replace(
+                scalar_source,
+                byte_offset=_add_runtime_int(
+                    scalar_source.byte_offset, scalar_offset
+                ),
+            )
+        else:
+            scalar = self._literal(self.analyzer.simplify(arguments[2]))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"functional compare_scalar requires a literal scalar, got {scalar!r}"
+                )
+            metadata["scalar"] = scalar
+        return metadata
+
+    def _select_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) < 7:
+            return {}
+        destination_arg, mask_arg, source_arg = arguments[:3]
+        cursor = 3
+        scratch_arg = None
+        if (
+            isinstance(arguments[cursor], self.tir.Call)
+            and str(arguments[cursor].op.name) == "tir.tvm_access_ptr"
+        ):
+            scratch_arg = arguments[cursor]
+            cursor += 1
+        source_type = self._const_int(arguments[cursor], context.environment)
+        cursor += 1
+        scalar_source_arg = None
+        scalar_index_arg = None
+        if source_type == 0:
+            if len(arguments) != cursor + 4:
+                return {}
+            scalar_source_arg, scalar_index_arg, mode_arg, count_arg = arguments[
+                cursor:cursor + 4
+            ]
+            source1_arg = scalar_source_arg
+            scalar = None
+            expected_modes = {
+                "VSEL_CMPMASK_SPR", "VSEL_TENSOR_TENSOR_MODE",
+            }
+        elif source_type == 1:
+            if len(arguments) != cursor + 5:
+                return {}
+            source1_arg, mode_arg, count_arg = arguments[cursor:cursor + 3]
+            scalar = self._literal(self.analyzer.simplify(source1_arg))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"functional scalar select requires a literal, got {scalar!r}"
+                )
+            expected_modes = {"VSEL_TENSOR_SCALAR_MODE"}
+        elif source_type == 2:
+            if len(arguments) != cursor + 3:
+                return {}
+            source1_arg, mode_arg, count_arg = arguments[cursor:cursor + 3]
+            scalar = None
+            expected_modes = {
+                "VSEL_CMPMASK_SPR", "VSEL_TENSOR_TENSOR_MODE",
+            }
+        else:
+            raise UnsupportedSimOpError(
+                f"functional select supports source type 0, 1, or 2, got {source_type!r}"
+            )
+        mode = getattr(mode_arg, "value", None)
+        if mode not in expected_modes:
+            raise UnsupportedSimOpError(
+                f"select source type {source_type} requires one of "
+                f"{sorted(expected_modes)}, got {mode!r}"
+            )
+        count = self._runtime_int(count_arg, context.environment)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("select count must not be negative")
+        mask_extent = self._access_ptr_extent(mask_arg, context)
+        if mask_extent is None:
+            return {}
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        mask = self._access_buffer_region(mask_arg, (mask_extent,), context)
+        source = self._access_buffer_region(source_arg, (count,), context)
+        if destination is None or mask is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "mask": mask,
+            "lhs": source,
+            "select_mode": mode,
+            "source_type": source_type,
+        }
+        if source_type == 0:
+            scalar_index = self._runtime_int(
+                scalar_index_arg, context.environment
+            )
+            if not isinstance(scalar_index, (int, AffineInt, SymbolicInt)):
+                raise UnsupportedSimOpError(
+                    "functional select BufferLoad requires an executable index"
+                )
+            scalar_source = self._access_buffer_region(
+                scalar_source_arg, (1,), context
+            )
+            if scalar_source is None:
+                return {}
+            if scalar_source.dtype != source.dtype:
+                raise ProgramValidationError(
+                    "select BufferLoad dtype must match its tensor source dtype"
+                )
+            scalar_offset = _scale_runtime_int(
+                scalar_index, dtype_size_bytes(scalar_source.dtype)
+            )
+            metadata["scalar_src"] = replace(
+                scalar_source,
+                byte_offset=_add_runtime_int(
+                    scalar_source.byte_offset, scalar_offset
+                ),
+            )
+        elif source_type == 1:
+            metadata["scalar"] = scalar
+        else:
+            source1 = self._access_buffer_region(source1_arg, (count,), context)
+            if source1 is None:
+                return {}
+            metadata["rhs"] = source1
+        if scratch_arg is not None:
+            scratch_extent = self._access_ptr_extent(scratch_arg, context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                scratch_arg, (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _tail_compare_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Internal contract emitted by AscendTailMaskPropagation:
+        # dst, src0, src1/scalar, mode, validRow, validCol, physRow,
+        # physCol, storageCol.
+        if len(arguments) != 9:
+            return {}
+        mode = getattr(arguments[3], "value", None)
+        if mode not in {"EQ", "NE", "GT", "GE", "LT", "LE"}:
+            raise UnsupportedSimOpError(f"unsupported tail compare mode {mode!r}")
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[4:9]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        valid_rows, valid_cols, physical_rows, physical_cols, storage_cols = dimensions
+        if any(isinstance(value, int) and value < 0 for value in dimensions):
+            raise ProgramValidationError("tail compare dimensions must not be negative")
+        if all(isinstance(value, int) for value in dimensions):
+            if valid_rows > physical_rows or valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "tail compare valid rectangle must fit its physical tile"
+                )
+            if storage_cols < (physical_cols + 7) // 8:
+                raise ProgramValidationError(
+                    "tail compare packed storage width is too small"
+                )
+        packed_valid_cols: Any
+        if isinstance(valid_cols, int):
+            packed_valid_cols = (valid_cols + 7) // 8
+        else:
+            packed_valid_cols = SymbolicInt(
+                "floordiv", (SymbolicInt("add", (valid_cols, 7)), 8)
+            )
+        destination = self._access_buffer_region(
+            arguments[0], (valid_rows, packed_valid_cols), context
+        )
+        source = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "lhs": source,
+            "compare_mode": mode,
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "physical_rows": physical_rows,
+            "physical_cols": physical_cols,
+            "storage_cols": storage_cols,
+        }
+        if operation == "tail_compare_scalar":
+            scalar = self._literal(self.analyzer.simplify(arguments[2]))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"tail compare scalar requires a literal, got {scalar!r}"
+                )
+            metadata["scalar"] = scalar
+        else:
+            right = self._access_buffer_region(
+                arguments[2], (valid_rows, valid_cols), context
+            )
+            if right is None:
+                return {}
+            metadata["rhs"] = right
+        return metadata
+
+    def _tail_select_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Internal contract emitted by AscendTailMaskPropagation:
+        # kind, dst, mask, src0, tmp, src1Type, src1, mode, validRow,
+        # validCol, physRow, physCol, storageCol.
+        if len(arguments) != 13:
+            return {}
+        kind = self._literal(arguments[0])
+        source_type = self._const_int(arguments[5], context.environment)
+        expected = {
+            "Scalar": (1, "VSEL_TENSOR_SCALAR_MODE"),
+            "Tensor": (2, "VSEL_TENSOR_TENSOR_MODE"),
+        }.get(kind)
+        mode = getattr(arguments[7], "value", None)
+        if expected is None or (source_type, mode) != expected:
+            raise UnsupportedSimOpError(
+                f"unsupported tail select kind/type/mode: "
+                f"{kind!r}/{source_type!r}/{mode!r}"
+            )
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment)
+            for argument in arguments[8:13]
+        )
+        if any(value is None for value in dimensions):
+            return {}
+        valid_rows, valid_cols, physical_rows, physical_cols, storage_cols = dimensions
+        if any(isinstance(value, int) and value < 0 for value in dimensions):
+            raise ProgramValidationError("tail select dimensions must not be negative")
+        if all(isinstance(value, int) for value in dimensions):
+            if valid_rows > physical_rows or valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "tail select valid rectangle must fit its physical tile"
+                )
+            if storage_cols < (physical_cols + 7) // 8:
+                raise ProgramValidationError(
+                    "tail select packed storage width is too small"
+                )
+        if isinstance(valid_cols, int):
+            packed_valid_cols: Any = (valid_cols + 7) // 8
+        else:
+            packed_valid_cols = SymbolicInt(
+                "floordiv", (SymbolicInt("add", (valid_cols, 7)), 8)
+            )
+        destination = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        mask = self._access_buffer_region(
+            arguments[2], (valid_rows, packed_valid_cols), context
+        )
+        source = self._access_buffer_region(
+            arguments[3], (valid_rows, valid_cols), context
+        )
+        if destination is None or mask is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "mask": mask,
+            "lhs": source,
+            "select_kind": kind,
+            "select_mode": mode,
+            "source_type": source_type,
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "physical_rows": physical_rows,
+            "physical_cols": physical_cols,
+            "storage_cols": storage_cols,
+        }
+        if source_type == 1:
+            scalar = self._literal(self.analyzer.simplify(arguments[6]))
+            if not isinstance(scalar, (bool, int, float)):
+                raise UnsupportedSimOpError(
+                    f"tail scalar select requires a literal, got {scalar!r}"
+                )
+            metadata["scalar"] = scalar
+        else:
+            right = self._access_buffer_region(
+                arguments[6], (valid_rows, valid_cols), context
+            )
+            if right is None:
+                return {}
+            metadata["rhs"] = right
+
+        mask_data = self._access_ptr_data_name(arguments[2])
+        scratch_data = self._access_ptr_data_name(arguments[4])
+        if scratch_data is not None and scratch_data != mask_data:
+            scratch_extent = self._access_ptr_extent(arguments[4], context)
+            if scratch_extent is None:
+                return {}
+            scratch = self._access_buffer_region(
+                arguments[4], (scratch_extent,), context
+            )
+            if scratch is None:
+                return {}
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _access_ptr_data_name(self, pointer: Any) -> Optional[str]:
+        if (
+            isinstance(pointer, self.tir.Call)
+            and str(pointer.op.name) == "tir.tvm_access_ptr"
+            and len(pointer.args) >= 2
+        ):
+            return self._var_name(pointer.args[1])
+        return None
+
+    def _scalar_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool = False,
+    ) -> Dict[str, Any]:
+        expected_arguments = 6 if tail else 4
+        indexed_scalar = not tail and len(arguments) == 5
+        if len(arguments) != expected_arguments and not indexed_scalar:
+            return {}
+        count_index = 4 if indexed_scalar else 3
+        shape = self._vector_shape(
+            arguments, context, tail=tail, count_index=count_index
+        )
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        source = self._access_buffer_region(arguments[1], shape, context)
+        if destination is None or source is None:
+            return {}
+        metadata: Dict[str, Any] = {"dst": destination, "lhs": source}
+        if indexed_scalar:
+            scalar_index = self._runtime_int(arguments[3], context.environment)
+            scalar_source = self._access_buffer_region(arguments[2], (1,), context)
+            if scalar_index is None or scalar_source is None:
+                return {}
+            metadata["scalar_src"] = replace(
+                scalar_source,
+                byte_offset=_add_runtime_int(
+                    scalar_source.byte_offset,
+                    _scale_runtime_int(
+                        scalar_index, dtype_size_bytes(scalar_source.dtype)
+                    ),
+                ),
+            )
+        else:
+            metadata["scalar"] = self._literal(arguments[2])
+        if tail:
+            metadata["tail"] = self._tail_details(arguments, context, 3)
+        return metadata
+
+    def _cast_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 4:
+            return {}
+        shape = self._vector_shape(arguments, context, tail=False, count_index=3)
+        if shape is None:
+            return {}
+        destination = self._access_buffer_region(arguments[0], shape, context)
+        source = self._access_buffer_region(arguments[1], shape, context)
+        round_mode = self._literal(arguments[2])
+        if destination is None or source is None or not isinstance(round_mode, str):
+            return {}
+        return {
+            "dst": destination,
+            "src": source,
+            "round_mode": round_mode.upper(),
+        }
+
+    def _fill_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        # Native tl.ascend_fill carries a backend template name before the
+        # destination pointer.  Accept the equivalent call_extern form as well
+        # so bridge tests and already-lowered external calls share one contract.
+        argument_offset = 1 if len(arguments) == 4 else 0
+        if len(arguments) - argument_offset != 3:
+            return {}
+        destination_arg, scalar_arg, count_arg = arguments[argument_offset:]
+        count = self._runtime_int(count_arg, context.environment)
+        scalar = self._literal(self.analyzer.simplify(scalar_arg))
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError("fill count must not be negative")
+        if not isinstance(scalar, (bool, int, float)):
+            raise UnsupportedSimOpError(
+                f"functional fill requires a literal scalar, got {scalar!r}"
+            )
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        if destination is None:
+            return {}
+        return {"dst": destination, "scalar": scalar}
+
+    def _reduce_sum_experiment_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) not in {3, 4}:
+            return {}
+        count = self._runtime_int(arguments[-1], context.environment)
+        if count is None:
+            return {}
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError(
+                "reducesum_experiment count must not be negative"
+            )
+        destination = self._access_buffer_region(arguments[0], (1,), context)
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        if destination is None or source is None:
+            return {}
+        if destination.scope is not MemoryScope.UB or source.scope is not MemoryScope.UB:
+            raise ProgramValidationError(
+                "reducesum_experiment operands must use UB scope"
+            )
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError(
+                "reducesum_experiment source/destination dtypes must match"
+            )
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional reducesum_experiment supports float16 and float32"
+            )
+        metadata: Dict[str, Any] = {
+            "dst": destination,
+            "src": source,
+            "count": count,
+        }
+        if len(arguments) == 4:
+            scratch = self._access_buffer_region(arguments[2], (count,), context)
+            if scratch is None:
+                return {}
+            if (
+                scratch.scope is not MemoryScope.UB
+                or scratch.dtype != source.dtype
+            ):
+                raise ProgramValidationError(
+                    "reducesum_experiment scratch must match the UB source dtype"
+                )
+            metadata["scratch"] = scratch
+        return metadata
+
+    def _sum_experiment_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 6:
+            return {}
+        template = self._literal(arguments[0])
+        if not isinstance(template, str) or not (
+            template.startswith("Sum_experiment<") and template.endswith(">")
+        ):
+            raise ProgramValidationError(
+                "sum_experiment template must be Sum_experiment<dtype>"
+            )
+        outer = self._runtime_int(arguments[3], context.environment)
+        inner = self._runtime_int(arguments[4], context.environment)
+        valid = self._runtime_int(arguments[5], context.environment)
+        if any(value is None for value in (outer, inner, valid)):
+            return {}
+        if all(isinstance(value, int) for value in (outer, inner, valid)):
+            if outer < 0 or inner < 0 or valid < 0:
+                raise ProgramValidationError(
+                    "sum_experiment extents must not be negative"
+                )
+            if valid > inner:
+                raise ProgramValidationError(
+                    "sum_experiment valid width must not exceed inner width"
+                )
+        destination = self._access_buffer_region(arguments[1], (outer,), context)
+        source = self._access_buffer_region(arguments[2], (outer, inner), context)
+        if destination is None or source is None:
+            return {}
+        itemsize = dtype_size_bytes(source.dtype)
+        source = replace(
+            source,
+            strides_bytes=(_scale_runtime_int(inner, itemsize), itemsize),
+        )
+        if (
+            destination.scope is not MemoryScope.UB
+            or source.scope is not MemoryScope.UB
+        ):
+            raise ProgramValidationError("sum_experiment operands must use UB scope")
+        if destination.dtype != source.dtype:
+            raise ProgramValidationError(
+                "sum_experiment source/destination dtypes must match"
+            )
+        template_dtype = _ascend_template_dtype(
+            template[len("Sum_experiment<"):-1]
+        )
+        if template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                "sum_experiment template dtype must match destination dtype"
+            )
+        if source.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional sum_experiment supports float16 and float32"
+            )
+        if isinstance(inner, int) and inner * itemsize % 32:
+            raise ProgramValidationError(
+                "sum_experiment inner rows must be 32-byte aligned"
+            )
+        return {
+            "dst": destination,
+            "src": source,
+            "sum_experiment": {"outer": outer, "inner": inner, "valid": valid},
+        }
+
+    def _sequence_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        expected = 4 if operation == "createvecindex" else 5
+        if len(arguments) != expected:
+            return {}
+        template = self._literal(arguments[0])
+        if not isinstance(template, str) or "<" not in template or not template.endswith(">"):
+            return {}
+        template_dtype = _ascend_template_dtype(template.split("<", 1)[1][:-1].strip())
+        destination_arg = arguments[1]
+        first_arg = arguments[2]
+        if operation == "createvecindex":
+            difference: Any = 1
+            count_arg = arguments[3]
+        else:
+            difference = self._numeric_scalar(arguments[3], context)
+            count_arg = arguments[4]
+        first = self._numeric_scalar(first_arg, context)
+        count = self._runtime_int(count_arg, context.environment)
+        if first is None or difference is None or count is None:
+            raise UnsupportedSimOpError(
+                f"functional {operation} requires executable scalar/count arguments"
+            )
+        if isinstance(count, int) and count < 0:
+            raise ProgramValidationError(f"{operation} count must not be negative")
+        destination = self._access_buffer_region(destination_arg, (count,), context)
+        if destination is None:
+            return {}
+        if template_dtype is None or template_dtype != destination.dtype:
+            raise ProgramValidationError(
+                f"{operation} template dtype must match destination dtype"
+            )
+        if destination.dtype not in {
+            "float16", "float32", "int16", "int32", "uint16", "uint32",
+        }:
+            raise UnsupportedSimOpError(
+                f"functional {operation} does not support dtype {destination.dtype!r}"
+            )
+        return {
+            "dst": destination,
+            "first_value": first,
+            "difference": difference,
+            "count": count,
+        }
+
+    def _numeric_scalar(self, value: Any, context: _Context) -> Any:
+        simplified = self.analyzer.simplify(value)
+        literal = self._literal(simplified)
+        if isinstance(literal, (int, float)) and not isinstance(literal, bool):
+            return literal
+        runtime = self._runtime_int(simplified, context.environment)
+        if isinstance(runtime, (int, AffineInt, SymbolicInt)):
+            return runtime
+        return None
+
+    def _block_reduce_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 7:
+            return {}
+        repeat, mask, dst_rep_stride, src_blk_stride, src_rep_stride = (
+            self._const_int(argument, context.environment)
+            for argument in arguments[2:]
+        )
+        controls = {
+            "repeat": repeat,
+            "mask": mask,
+            "dst_rep_stride": dst_rep_stride,
+            "src_blk_stride": src_blk_stride,
+            "src_rep_stride": src_rep_stride,
+        }
+        if any(value is None for value in controls.values()):
+            raise UnsupportedSimOpError(
+                "functional block reduction requires static repeat/mask/strides"
+            )
+        if repeat < 0 or mask < 0:
+            raise ProgramValidationError("block reduction repeat/mask must not be negative")
+        if any(value < 0 for value in (
+            dst_rep_stride, src_blk_stride, src_rep_stride
+        )):
+            raise ProgramValidationError("block reduction strides must not be negative")
+
+        destination_base = self._access_buffer_region(arguments[0], (1,), context)
+        source_base = self._access_buffer_region(arguments[1], (1,), context)
+        if destination_base is None or source_base is None:
+            return {}
+        if destination_base.dtype != source_base.dtype:
+            raise ProgramValidationError("block reduction source/destination dtype must match")
+        if source_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional block reduction supports only float16/float32"
+            )
+        itemsize = dtype_size_bytes(source_base.dtype)
+        elements_per_block = 32 // itemsize
+        vector_elements = 8 * elements_per_block
+        if mask > vector_elements:
+            raise ProgramValidationError(
+                f"block reduction mask must be in [0, {vector_elements}], got {mask}"
+            )
+        active_blocks = (mask + elements_per_block - 1) // elements_per_block
+        source = replace(
+            source_base,
+            shape=(repeat, active_blocks, elements_per_block),
+            strides_bytes=(src_rep_stride * 32, src_blk_stride * 32, itemsize),
+        )
+        destination = replace(
+            destination_base,
+            shape=(repeat, active_blocks),
+            strides_bytes=(dst_rep_stride * 8 * itemsize, itemsize),
+        )
+        return {
+            "dst": destination,
+            "src": source,
+            "reduce_kind": operation.removeprefix("block_"),
+            "elements_per_block": elements_per_block,
+            **controls,
+        }
+
+    def _whole_reduce_metadata(
+        self,
+        operation: str,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        is_sum = operation == "wholereducesum"
+        expected_arguments = 7 if is_sum else 8
+        if len(arguments) != expected_arguments:
+            return {}
+        mask, repeat, dst_rep_stride, src_blk_stride, src_rep_stride = (
+            self._const_int(argument, context.environment)
+            for argument in arguments[2:7]
+        )
+        controls = {
+            "repeat": repeat,
+            "mask": mask,
+            "dst_rep_stride": dst_rep_stride,
+            "src_blk_stride": src_blk_stride,
+            "src_rep_stride": src_rep_stride,
+        }
+        if any(value is None for value in controls.values()):
+            raise UnsupportedSimOpError(
+                "functional whole reduction requires static repeat/mask/strides"
+            )
+        if repeat < 0 or mask < 0:
+            raise ProgramValidationError("whole reduction repeat/mask must not be negative")
+        if any(value < 0 for value in (
+            dst_rep_stride, src_blk_stride, src_rep_stride
+        )):
+            raise ProgramValidationError("whole reduction strides must not be negative")
+
+        order = "ORDER_ONLY_VALUE" if is_sum else self._literal(arguments[7])
+        if order not in {"ORDER_ONLY_VALUE", "ORDER_VALUE_INDEX"}:
+            raise UnsupportedSimOpError(
+                f"functional whole reduction does not support order {order!r}"
+            )
+        destination_base = self._access_buffer_region(arguments[0], (1,), context)
+        source_base = self._access_buffer_region(arguments[1], (1,), context)
+        if destination_base is None or source_base is None:
+            return {}
+        if destination_base.dtype != source_base.dtype:
+            raise ProgramValidationError("whole reduction source/destination dtype must match")
+        if source_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError(
+                "functional whole reduction supports only float16/float32"
+            )
+        itemsize = dtype_size_bytes(source_base.dtype)
+        elements_per_block = 32 // itemsize
+        vector_elements = 8 * elements_per_block
+        if mask > vector_elements:
+            raise ProgramValidationError(
+                f"whole reduction mask must be in [0, {vector_elements}], got {mask}"
+            )
+        active_blocks = (mask + elements_per_block - 1) // elements_per_block
+        output_width = 2 if order == "ORDER_VALUE_INDEX" else 1
+        source = replace(
+            source_base,
+            shape=(repeat, active_blocks, elements_per_block),
+            strides_bytes=(src_rep_stride * 32, src_blk_stride * 32, itemsize),
+        )
+        destination = replace(
+            destination_base,
+            shape=(repeat, output_width),
+            strides_bytes=(dst_rep_stride * output_width * itemsize, itemsize),
+        )
+        kind = {
+            "wholereducesum": "reduce_sum",
+            "wholereducemax": "reduce_max",
+            "wholereducemin": "reduce_min",
+        }[operation]
+        return {
+            "dst": destination,
+            "src": source,
+            "reduce_kind": kind,
+            "reduce_order": order,
+            "elements_per_block": elements_per_block,
+            **controls,
+        }
+
+    def _tail_reduce_metadata(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+    ) -> Dict[str, Any]:
+        if len(arguments) != 7:
+            raise UnsupportedSimOpError(
+                "functional tail_reduce currently requires the no-workspace 8-argument form"
+            )
+        dimension = self._const_int(arguments[2], context.environment)
+        clear = self._const_int(arguments[6], context.environment)
+        if dimension != 0 or clear != 1:
+            raise UnsupportedSimOpError(
+                "functional tail_reduce supports only dim=0 and clear=true"
+            )
+        valid_rows = self._runtime_int(arguments[3], context.environment)
+        valid_cols = self._runtime_int(arguments[4], context.environment)
+        physical_cols = self._runtime_int(arguments[5], context.environment)
+        if valid_rows is None or valid_cols is None or physical_cols is None:
+            raise UnsupportedSimOpError(
+                "tail_reduce extents must be executable runtime integer expressions"
+            )
+        if all(isinstance(value, int) for value in (
+            valid_rows, valid_cols, physical_cols
+        )) and valid_cols > physical_cols:
+            raise ProgramValidationError(
+                "tail_reduce valid columns must not exceed physical columns"
+            )
+        source = self._access_buffer_region(
+            arguments[1], (valid_rows, valid_cols), context
+        )
+        destination = self._access_buffer_region(arguments[0], (valid_cols,), context)
+        if source is None or destination is None:
+            raise UnsupportedSimOpError(
+                "tail_reduce source and destination pointers must resolve to buffers"
+            )
+        if source.dtype != "float32" or destination.dtype != "float32":
+            raise UnsupportedSimOpError(
+                "functional tail_reduce currently supports only float32"
+            )
+        if (
+            isinstance(physical_cols, int)
+            and source.strides_bytes is not None
+            and isinstance(source.strides_bytes[0], int)
+            and source.strides_bytes[0] != physical_cols * dtype_size_bytes(source.dtype)
+        ):
+            raise ProgramValidationError(
+                "tail_reduce physical columns disagree with source row stride"
+            )
+        return {
+            "src": source,
+            "dst": destination,
+            "reduce": {
+                "dimension": dimension,
+                "clear": True,
+                "valid_rows": valid_rows,
+                "valid_cols": valid_cols,
+                "physical_cols": physical_cols,
+            },
+        }
+
+    def _vector_shape(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        *,
+        tail: bool,
+        count_index: int,
+    ) -> Optional[Tuple[Any, ...]]:
+        indices = (
+            (count_index, count_index + 1, count_index + 2)
+            if tail
+            else (count_index,)
+        )
+        values = tuple(
+            self._runtime_int(arguments[index], context.environment)
+            for index in indices
+        )
+        if any(value is None for value in values):
+            return None
+        if any(isinstance(value, int) and value < 0 for value in values):
+            raise ProgramValidationError("vector extents must not be negative")
+        if tail and all(isinstance(value, int) for value in values):
+            _, valid_cols, physical_cols = values
+            if valid_cols > physical_cols:
+                raise ProgramValidationError(
+                    "tail valid columns must not exceed physical columns"
+                )
+        return values[:2] if tail else values
+
+    def _tail_details(
+        self,
+        arguments: Tuple[Any, ...],
+        context: _Context,
+        count_index: int,
+    ) -> Dict[str, Any]:
+        return {
+            "valid_rows": self._runtime_int(
+                arguments[count_index], context.environment
+            ),
+            "valid_cols": self._runtime_int(
+                arguments[count_index + 1], context.environment
+            ),
+            "physical_cols": self._runtime_int(
+                arguments[count_index + 2], context.environment
+            ),
+        }
+
+    def _access_buffer_region(
+        self,
+        pointer: Any,
+        shape: Tuple[Any, ...],
+        context: _Context,
+        *,
+        physical_cols: Any | None = None,
+    ) -> Optional[BufferRegion]:
+        data_var = pointer
+        element_offset = 0
+        region_dtype = None
+        if isinstance(pointer, self.tir.Call) and str(pointer.op.name) == "tir.tvm_access_ptr":
+            if len(pointer.args) < 4:
+                return None
+            annotated_dtype = str(getattr(pointer.args[0], "dtype", ""))
+            if annotated_dtype and annotated_dtype != "handle":
+                region_dtype = annotated_dtype
+            data_var = pointer.args[1]
+            offset = self._runtime_int(pointer.args[2], context.environment)
+            if offset is None:
+                return None
+            element_offset = offset
+        name = self.buffer_name_by_data_var.get(self._var_name(data_var))
+        if name is None:
+            return None
+        spec = self.buffers[name]
+        region_dtype = spec.dtype if region_dtype is None else region_dtype
+        itemsize = dtype_size_bytes(region_dtype)
+        strides = None
+        if len(shape) == 2:
+            physical_cols = spec.shape[-1] if physical_cols is None else physical_cols
+            if not isinstance(physical_cols, (int, AffineInt, SymbolicInt)):
+                return None
+            row_stride = (
+                physical_cols * itemsize
+                if isinstance(physical_cols, int)
+                else physical_cols.scaled(itemsize)
+            )
+            strides = (row_stride, itemsize)
+        byte_offset = (
+            element_offset * itemsize
+            if isinstance(element_offset, int)
+            else element_offset.scaled(itemsize)
+        )
+        return BufferRegion(
+            name,
+            spec.scope,
+            shape,
+            region_dtype,
+            byte_offset=byte_offset,
+            strides_bytes=strides,
+            core_id=(
+                None
+                if spec.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+                else context.core_id
+            ),
+        )
+
+    def _emit_task(
+        self,
+        operation: str,
+        context: _Context,
+        *,
+        metadata: Mapping[str, Any],
+        extra_dependencies: Tuple[str, ...] = (),
+    ) -> Task:
+        try:
+            lane, pipe, normalized = classify_operation(operation, context.lane)
+        except UnsupportedSimOpError as error:
+            span = metadata.get("span", "unknown")
+            raise UnsupportedSimOpError(
+                f"{error}; platform={self.platform}; span={span}; "
+                f"lane={context.lane.value}"
+            ) from error
+        if lane is not Lane.CONTROL:
+            pipe = self._sync_task_pipe(normalized, metadata, pipe)
+        task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
+        self.task_counter += 1
+        task_metadata = dict(metadata)
+        timing_key = str(task_metadata.get("timing_key", normalized))
+        task_metadata.setdefault("timing_key", timing_key)
+        task_metadata.setdefault("timing_calibration", self.timing_profile.calibration)
+        memory_dependencies = self._memory_dependencies(
+            task_metadata, context.core_id, context.lane
+        )
+        if memory_dependencies:
+            # Preserve why these edges exist.  They keep functional execution
+            # deterministic, but are not hardware synchronization by
+            # themselves; the adapter separately verifies cross-pipe edges.
+            task_metadata["memory_dependencies"] = memory_dependencies
+        dependencies = tuple(sorted(
+            set(memory_dependencies).union(extra_dependencies)
+        ))
+        task = Task(
+            task_id,
+            normalized,
+            context.core_id,
+            lane,
+            pipe,
+            self.timing_profile.estimate_cycles(timing_key),
+            dependencies=dependencies,
+            metadata=task_metadata,
+        )
+        self.tasks[context.core_id].append(task)
+        self._record_memory_accesses(task, context.core_id, context.lane)
+        return task
+
+    @staticmethod
+    def _sync_task_pipe(
+        operation: str, metadata: Mapping[str, Any], fallback: Pipe
+    ) -> Pipe:
+        """Place synchronization markers on the hardware pipe that executes them."""
+        pipe_name = ""
+        if operation in {"set_flag", "auto_set_flag", "set_cross_flag",
+                         "auto_set_cross_flag"}:
+            pipe_name = str(metadata.get("src_pipe", ""))
+        elif operation in {"wait_flag", "auto_wait_flag"}:
+            pipe_name = str(metadata.get("dst_pipe", ""))
+        elif operation in {"pipe_barrier", "auto_barrier"}:
+            target = str(metadata.get("target_pipe", ""))
+            if target != "all":
+                pipe_name = target
+        if not pipe_name:
+            return fallback
+        try:
+            return Pipe(pipe_name)
+        except ValueError as error:
+            raise ProgramValidationError(
+                f"synchronization operation {operation!r} names unknown pipe "
+                f"{pipe_name!r}"
+            ) from error
+
+    def _memory_dependencies(
+        self,
+        metadata: Mapping[str, Any],
+        core_id: int,
+        lane: Lane,
+    ) -> Tuple[str, ...]:
+        reads = self._operand_regions(
+            metadata,
+            (
+                "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
+                "scalar_src", "offsets", "bias",
+            ),
+        )
+        writes = self._operand_regions(
+            metadata, ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch")
+        )
+        dependencies = {
+            task_id
+            for region in reads
+            for previous, task_id, previous_lane in self.last_writes
+            if previous_lane is lane and self._regions_overlap(region, previous, core_id)
+        }
+        for region in writes:
+            dependencies.update(
+                task_id
+                for previous, task_id, previous_lane in self.last_writes + self.last_reads
+                if previous_lane is lane
+                and self._regions_overlap(region, previous, core_id)
+            )
+        return tuple(sorted(dependencies))
+
+    def _record_memory_accesses(self, task: Task, core_id: int, lane: Lane) -> None:
+        reads = self._operand_regions(
+            task.metadata,
+            (
+                "src_regions", "src", "lhs", "rhs", "mask", "accumulator",
+                "scalar_src", "offsets", "bias",
+            ),
+        )
+        writes = self._operand_regions(
+            task.metadata,
+            ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch"),
+        )
+        for region in writes:
+            self.last_writes = [
+                entry for entry in self.last_writes
+                if entry[2] is not lane
+                or not self._regions_overlap(region, entry[0], core_id)
+            ]
+            self.last_reads = [
+                entry for entry in self.last_reads
+                if entry[2] is not lane
+                or not self._regions_overlap(region, entry[0], core_id)
+            ]
+            self.last_writes.append((region, task.task_id, lane))
+        self.last_reads.extend((region, task.task_id, lane) for region in reads)
+
+    @staticmethod
+    def _operand_regions(
+        metadata: Mapping[str, Any], names: Tuple[str, ...]
+    ) -> Tuple[BufferRegion, ...]:
+        regions = []
+        has_source_regions = isinstance(metadata.get("src_regions"), (tuple, list))
+        for name in names:
+            if name == "src" and has_source_regions:
+                continue
+            value = metadata.get(name)
+            if isinstance(value, BufferRegion):
+                regions.append(value)
+            elif isinstance(value, (tuple, list)):
+                regions.extend(
+                    region for region in value if isinstance(region, BufferRegion)
+                )
+        return tuple(regions)
+
+    def _regions_overlap(
+        self, left: BufferRegion, right: BufferRegion, core_id: int
+    ) -> bool:
+        if left.scope != right.scope:
+            return False
+        left_owner = left.core_id if left.core_id is not None else core_id
+        right_owner = right.core_id if right.core_id is not None else core_id
+        if left.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}:
+            if left_owner != right_owner:
+                return False
+        left_buffer = self._resolve_active_alias(left, left_owner)
+        right_buffer = self._resolve_active_alias(right, right_owner)
+        left_spec = self.buffers[left_buffer]
+        right_spec = self.buffers[right_buffer]
+        if left_buffer == right_buffer:
+            left_base = right_base = 0
+        else:
+            left_base = left_spec.address
+            right_base = right_spec.address
+            if left_base is None or right_base is None:
+                return False
+        left_bounds = _region_bounds(left)
+        right_bounds = _region_bounds(right)
+        if left_bounds is None or right_bounds is None:
+            left_size = _buffer_size_bytes(left_spec)
+            right_size = _buffer_size_bytes(right_spec)
+            if left_size is None or right_size is None:
+                return True
+            return (
+                left_base < right_base + right_size
+                and right_base < left_base + left_size
+            )
+        left_start, left_end = (
+            left_base + left_bounds[0], left_base + left_bounds[1]
+        )
+        right_start, right_end = (
+            right_base + right_bounds[0], right_base + right_bounds[1]
+        )
+        return left_start < right_end and right_start < left_end
+
+    def _resolve_active_alias(self, region: BufferRegion, owner: int) -> str:
+        current = region.buffer
+        seen = set()
+        alias_owner = (
+            None
+            if region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+            else owner
+        )
+        while current not in seen:
+            seen.add(current)
+            target = self.active_aliases.get((region.scope, alias_owner, current))
+            if target is None:
+                break
+            current = target
+        return current
+
+    def _call_operation(self, call: Any) -> Tuple[str, Tuple[Any, ...]]:
+        name = str(call.op.name)
+        arguments = tuple(call.args)
+        if name == "tir.call_extern":
+            if not arguments:
+                raise UnsupportedSimOpError("tir.call_extern has no operation name")
+            operation = self._literal(arguments[0])
+            if not isinstance(operation, str):
+                raise UnsupportedSimOpError("tir.call_extern operation name is not a string")
+            return operation, arguments[1:]
+        return name, arguments
+
+    def _sync_metadata(self, operation: str, arguments: Tuple[Any, ...]) -> Dict[str, Any]:
+        short = _short_operation(operation)
+        metadata: Dict[str, Any] = {}
+        if short in {"set_flag", "wait_flag"}:
+            if len(arguments) >= 3:
+                metadata.update({
+                    "src_pipe": _normalize_pipe_name(self._literal(arguments[0])),
+                    "dst_pipe": _normalize_pipe_name(self._literal(arguments[1])),
+                    "flag_id": self._literal(arguments[2]),
+                })
+        elif short in {"auto_set_flag", "auto_wait_flag"} and len(arguments) >= 2:
+            event_type = str(self._literal(arguments[0]))
+            pair = event_type.split("_")
+            if len(pair) == 2:
+                metadata.update({
+                    "src_pipe": _normalize_pipe_name(pair[0]),
+                    "dst_pipe": _normalize_pipe_name(pair[1]),
+                    "flag_id": self._literal(arguments[1]),
+                })
+        elif short == "set_cross_flag" and len(arguments) >= 3:
+            metadata.update({
+                "src_pipe": _normalize_pipe_name(self._literal(arguments[0])),
+                "flag_id": self._literal(arguments[1]),
+                "mode": self._literal(arguments[2]),
+            })
+        elif short == "auto_set_cross_flag" and len(arguments) >= 3:
+            metadata.update({
+                "mode": self._literal(arguments[0]),
+                "src_pipe": _normalize_pipe_name(self._literal(arguments[1])),
+                "flag_id": self._literal(arguments[2]),
+            })
+        elif short in {"wait_cross_flag", "auto_wait_cross_flag"} and arguments:
+            metadata["flag_id"] = self._literal(arguments[0])
+            if len(arguments) >= 2:
+                metadata["wait_pipe"] = _normalize_pipe_name(
+                    self._literal(arguments[1])
+                )
+        if "barrier" in short and arguments:
+            metadata["target_pipe"] = _normalize_pipe_name(
+                self._literal(arguments[0])
+            )
+        return metadata
+
+    def _require_int(self, value: Any, environment: Mapping[Any, int], what: str) -> int:
+        result = self._const_int(value, environment)
+        if result is None:
+            raise UnsupportedSimOpError(
+                f"dynamic {what} is not supported by the first A2/A3 simulator bridge: {value}"
+            )
+        return result
+
+    def _const_int(self, value: Any, environment: Mapping[Any, int]) -> Optional[int]:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        substituted = value
+        if environment:
+            replacements = {
+                var: self.tir.IntImm(getattr(var, "dtype", "int32"), number)
+                for var, number in environment.items()
+            }
+            substituted = self.tir.stmt_functor.substitute(value, replacements)
+        simplified = self.analyzer.simplify(substituted)
+        literal = getattr(simplified, "value", None)
+        return int(literal) if isinstance(literal, (bool, int)) else None
+
+    def _affine_int(
+        self, value: Any, environment: Mapping[Any, int]
+    ) -> Optional[Any]:
+        constant = self._const_int(value, environment)
+        if constant is not None:
+            return constant
+        substituted = value
+        if environment:
+            replacements = {
+                var: self.tir.IntImm(getattr(var, "dtype", "int32"), number)
+                for var, number in environment.items()
+            }
+            substituted = self.tir.stmt_functor.substitute(value, replacements)
+        simplified = self.analyzer.simplify(substituted)
+        if isinstance(simplified, self.tir.Var):
+            return AffineInt.variable(self._var_name(simplified))
+        if isinstance(simplified, (self.tir.Add, self.tir.Sub)):
+            left = self._affine_int(simplified.a, {})
+            right = self._affine_int(simplified.b, {})
+            if left is None or right is None:
+                return None
+            left_expr = left if isinstance(left, AffineInt) else AffineInt((), left)
+            right_expr = right if isinstance(right, AffineInt) else AffineInt((), right)
+            if isinstance(simplified, self.tir.Sub):
+                right_expr = right_expr.scaled(-1)
+            result = left_expr.plus(right_expr)
+            return result.constant if not result.terms else result
+        if isinstance(simplified, self.tir.Mul):
+            left = self._affine_int(simplified.a, {})
+            right = self._affine_int(simplified.b, {})
+            if isinstance(left, int) and isinstance(right, AffineInt):
+                return right.scaled(left)
+            if isinstance(right, int) and isinstance(left, AffineInt):
+                return left.scaled(right)
+            if isinstance(left, int) and isinstance(right, int):
+                return left * right
+        return None
+
+    def _extent_or_symbol(self, value: Any, environment: Mapping[Any, int]) -> Any:
+        expression = self._runtime_int(value, environment)
+        if expression is None:
+            raise UnsupportedSimOpError(
+                f"unsupported dynamic integer expression in buffer extent: {value}"
+            )
+        return expression
+
+    def _runtime_int(
+        self, value: Any, environment: Mapping[Any, int]
+    ) -> Optional[Any]:
+        affine = self._affine_int(value, environment)
+        if affine is not None:
+            return affine
+        substituted = value
+        if environment:
+            replacements = {
+                var: self.tir.IntImm(getattr(var, "dtype", "int32"), number)
+                for var, number in environment.items()
+            }
+            substituted = self.tir.stmt_functor.substitute(value, replacements)
+        simplified = self.analyzer.simplify(substituted)
+        if isinstance(simplified, self.tir.BufferLoad):
+            dtype = str(simplified.dtype)
+            if not (dtype.startswith("int") or dtype.startswith("uint")):
+                return None
+            if len(simplified.indices) != 1:
+                return None
+            index = self._const_int(simplified.indices[0], {})
+            if index is None or index < 0:
+                return None
+            name = str(simplified.buffer.name)
+            spec = self.buffers.get(name)
+            if spec is None or spec.scope is not MemoryScope.GM:
+                return None
+            if (
+                len(spec.shape) != 1
+                or not isinstance(spec.shape[0], int)
+                or index >= spec.shape[0]
+            ):
+                raise ProgramValidationError(
+                    f"runtime scalar BufferLoad {name}[{index}] is outside its buffer"
+                )
+            return AffineInt.variable(f"{name}[{index}]")
+        operation = type(simplified).__name__
+        binary_operations = {
+            "Add": "add",
+            "And": "and",
+            "Div": "truncdiv",
+            "EQ": "eq",
+            "FloorDiv": "floordiv",
+            "FloorMod": "floormod",
+            "GE": "ge",
+            "GT": "gt",
+            "LE": "le",
+            "LT": "lt",
+            "Max": "max",
+            "Min": "min",
+            "Mul": "mul",
+            "NE": "ne",
+            "Mod": "truncmod",
+            "Or": "or",
+            "Sub": "sub",
+        }
+        if operation in binary_operations:
+            left = self._runtime_int(simplified.a, {})
+            right = self._runtime_int(simplified.b, {})
+            if left is None or right is None:
+                return None
+            return SymbolicInt(binary_operations[operation], (left, right))
+        if operation == "Not":
+            operand = self._runtime_int(simplified.a, {})
+            return None if operand is None else SymbolicInt("not", (operand,))
+        if operation == "Cast":
+            dtype = str(simplified.dtype)
+            if not (dtype.startswith("int") or dtype.startswith("uint")):
+                return None
+            return self._runtime_int(simplified.value, {})
+        if operation == "Select":
+            arguments = (
+                self._runtime_int(simplified.condition, {}),
+                self._runtime_int(simplified.true_value, {}),
+                self._runtime_int(simplified.false_value, {}),
+            )
+            if any(argument is None for argument in arguments):
+                return None
+            return SymbolicInt("select", arguments)
+        return None
+
+    def _is_zero(self, value: Any, environment: Mapping[Any, int]) -> bool:
+        literal = self._const_int(value, environment)
+        return literal == 0
+
+    @staticmethod
+    def _literal(value: Any) -> Any:
+        literal = getattr(value, "value", None)
+        if isinstance(literal, (bool, int, float, str)):
+            return literal
+        return str(value)
+
+    @staticmethod
+    def _var_name(value: Any) -> str:
+        return str(getattr(value, "name", getattr(value, "name_hint", value)))
+
+
+def _region_bounds(region: BufferRegion) -> Optional[Tuple[int, int]]:
+    values = (region.byte_offset,) + region.shape + (region.strides_bytes or ())
+    if any(isinstance(value, (AffineInt, SymbolicInt)) for value in values):
+        return None
+    if any(extent == 0 for extent in region.shape):
+        return region.byte_offset, region.byte_offset
+    itemsize = dtype_size_bytes(region.dtype)
+    strides = region.strides_bytes or contiguous_strides_bytes(region.shape, itemsize)
+    last_offset = sum(
+        (extent - 1) * stride for extent, stride in zip(region.shape, strides)
+    )
+    return region.byte_offset, region.byte_offset + last_offset + itemsize
+
+
+def _buffer_size_bytes(spec: BufferSpec) -> Optional[int]:
+    if spec.size_bytes is not None:
+        return spec.size_bytes
+    if any(not isinstance(extent, int) for extent in spec.shape):
+        return None
+    size = dtype_size_bytes(spec.dtype)
+    for extent in spec.shape:
+        size *= extent
+    return size
+
+
+def _ascend_template_dtype(token: str) -> Optional[str]:
+    return {
+        "half": "float16",
+        "float": "float32",
+        "bfloat16_t": "bfloat16",
+        "int8_t": "int8",
+        "int16_t": "int16",
+        "int": "int32",
+        "int64_t": "int64",
+        "uint8_t": "uint8",
+        "uint16_t": "uint16",
+        "uint32_t": "uint32",
+        "uint64_t": "uint64",
+    }.get(token.strip().lower())

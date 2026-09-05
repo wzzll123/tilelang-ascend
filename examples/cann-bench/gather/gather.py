@@ -1,7 +1,9 @@
+import argparse
 import math
-import torch
+# Import TileLang before Torch on macOS to avoid loading two libomp runtimes.
 import tilelang
 from tilelang import language as T
+import torch
 
 tilelang.disable_cache()
 
@@ -33,6 +35,10 @@ ALIGN_K = 32
 UB_SIZE_LIMIT = 256 * 1024
 
 _kernel_cache = {}
+_SIMULATOR = False
+_SIMULATOR_PLATFORM = "A2"
+_SIMULATOR_TRACE = None
+_DEVICE = "npu"
 
 
 def _torch_dtype_to_str(dtype):
@@ -128,6 +134,15 @@ def _gather_kernel_int64(outer_size, M2, K, TILE_OUTER, idx_dtype, word_off):
 
 
 def _get_kernel(kernel_fn, *args):
+    if _SIMULATOR:
+        simulator_factory = tilelang.jit(
+            out_idx=[-1],
+            simulator=True,
+            platform=_SIMULATOR_PLATFORM,
+            sim_config={"trace_path": _SIMULATOR_TRACE} if _SIMULATOR_TRACE else None,
+            pass_configs=GATHER_PASS_CONFIGS,
+        )(kernel_fn.__wrapped__)
+        return simulator_factory(*args)
     key = (kernel_fn.__name__,) + args
     if key not in _kernel_cache:
         _kernel_cache[key] = kernel_fn(*args)
@@ -307,18 +322,18 @@ def _make_x(x_shape, x_dtype_str, value_range):
 
     if x_dtype_str in ("float16", "float32", "bfloat16"):
         if isinstance(lo, float) and math.isnan(lo):
-            return torch.full(x_shape, float("nan"), dtype=torch_dtype, device="npu")
+            return torch.full(x_shape, float("nan"), dtype=torch_dtype, device=_DEVICE)
         if isinstance(lo, float) and (math.isinf(lo) or math.isinf(hi)):
-            base = torch.randn(x_shape, dtype=torch_dtype, device="npu")
+            base = torch.randn(x_shape, dtype=torch_dtype, device=_DEVICE)
             base.view(-1)[0] = float("inf")
             if base.numel() > 1:
                 base.view(-1)[1] = float("-inf")
             return base
         if lo == hi:
-            return torch.full(x_shape, float(lo), dtype=torch_dtype, device="npu")
-        return (torch.rand(x_shape, dtype=torch.float32, device="npu") * (hi - lo) + lo).to(torch_dtype)
+            return torch.full(x_shape, float(lo), dtype=torch_dtype, device=_DEVICE)
+        return (torch.rand(x_shape, dtype=torch.float32, device=_DEVICE) * (hi - lo) + lo).to(torch_dtype)
     else:
-        return torch.randint(int(lo), int(hi) + 1, x_shape, dtype=torch_dtype, device="npu")
+        return torch.randint(int(lo), int(hi) + 1, x_shape, dtype=torch_dtype, device=_DEVICE)
 
 
 def run_gather(case_id, x_shape, idx_shape, x_dtype_str, idx_dtype_str, dim, value_range):
@@ -328,7 +343,7 @@ def run_gather(case_id, x_shape, idx_shape, x_dtype_str, idx_dtype_str, dim, val
 
     # Index elements must fall within [0, x.shape[dim])
     dim_size = x_shape[dim]
-    index = torch.randint(0, dim_size, idx_shape, dtype=idx_torch_dtype, device="npu")
+    index = torch.randint(0, dim_size, idx_shape, dtype=idx_torch_dtype, device=_DEVICE)
 
     y = gather(x, index, dim=dim)
     ref = torch_gather(x, index, dim=dim)
@@ -355,6 +370,23 @@ def run_gather(case_id, x_shape, idx_shape, x_dtype_str, idx_dtype_str, dim, val
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="torch.gather TileLang example")
+    parser.add_argument(
+        "--simulator", action="store_true", help="Run the CPU A2/A3 simulator"
+    )
+    parser.add_argument(
+        "--platform", choices=["A2", "A3"], default="A2",
+        help="Simulator platform (used with --simulator)",
+    )
+    parser.add_argument(
+        "--trace", type=str, default=None,
+        help="Optional Chrome/Perfetto trace path in simulator mode",
+    )
+    args = parser.parse_args()
+    _SIMULATOR = args.simulator
+    _SIMULATOR_PLATFORM = args.platform
+    _SIMULATOR_TRACE = args.trace
+    _DEVICE = "cpu" if args.simulator else "npu"
     torch.manual_seed(42)
 
     # (case_id, x_shape, idx_shape, x_dtype, idx_dtype, dim, [x_range, idx_range])
@@ -380,6 +412,13 @@ if __name__ == "__main__":
         (19, [2, 511, 2049], [2, 255, 2049], "bfloat16", "int64", 1, [[-0.2, 0.2], [0, 510]]),
         (20, [4, 255, 2049], [4, 127, 2049], "float32", "int32", 2, [[-3, 6], [0, 254]]),
     ]
+    if args.simulator:
+        # Exercise the actual final-TIR gather path without making CPU simulation
+        # spend minutes on the large NPU benchmark matrix above.
+        test_cases = [
+            (1, [16, 64], [16, 32], "float32", "int32", 1,
+             [[-2, 2], [0, 63]]),
+        ]
 
     print("=" * 70)
     print("Gather TileLang-Ascend 测试 (torch.gather 语义)")
@@ -400,3 +439,5 @@ if __name__ == "__main__":
     print(f"测试完成: {passed} passed, {failed} failed")
     if failed == 0:
         print("Test Passed!")
+    else:
+        raise AssertionError(f"{failed} gather case(s) failed")

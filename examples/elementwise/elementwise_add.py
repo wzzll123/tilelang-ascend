@@ -9,13 +9,33 @@ tilelang.cache.clear_cache()
 parser = argparse.ArgumentParser(description="NPU Kernel Compilation")
 parser.add_argument("--m", type=int, default=1024, help="Matrix M dimension")
 parser.add_argument("--n", type=int, default=1024, help="Matrix N dimension")
+parser.add_argument(
+    "--simulator", action="store_true", help="Run the CPU A2/A3 simulator"
+)
+parser.add_argument(
+    "--platform", choices=["A2", "A3"], default="A2",
+    help="Simulator platform (used with --simulator)",
+)
+parser.add_argument(
+    "--trace", type=str, default=None,
+    help="Optional Chrome/Perfetto trace path in simulator mode",
+)
 args = parser.parse_args()
 
 M = args.m
 N = args.n
 
 
-@tilelang.jit(out_idx=[-1])
+jit_options = {"out_idx": [-1]}
+if args.simulator:
+    jit_options.update(
+        simulator=True,
+        platform=args.platform,
+        sim_config={"trace_path": args.trace} if args.trace else None,
+    )
+
+
+@tilelang.jit(**jit_options)
 def vec_add(M, N, block_M, block_N, dtype="float"):
     m_num = M // block_M
     n_num = N // block_N
@@ -52,10 +72,14 @@ func = vec_add(M, N, 128, 256)
 
 torch.manual_seed(0)
 
-a = torch.randn(M, N).npu()
-b = torch.randn(M, N).npu()
+a = torch.randn(M, N)
+b = torch.randn(M, N)
+if not args.simulator:
+    a = a.npu()
+    b = b.npu()
 
-torch.npu.synchronize()
+if not args.simulator:
+    torch.npu.synchronize()
 print("init successful!")
 
 c = func(a, b)
@@ -63,4 +87,4 @@ c = func(a, b)
 ref_c = a + b
 
 torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-print("Kernel Output Match!")
+print(f"Kernel Output Match! mode={'simulator' if args.simulator else 'npu'}")
