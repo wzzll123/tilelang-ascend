@@ -1172,11 +1172,6 @@ class _TirBridge:
 
         itemsize = dtype_size_bytes(source.dtype)
         elements_per_c0 = BYTE_PER_C0 // itemsize
-        if physical_rows % C0_NUM_PER_FRACTAL and source.dtype != "float32":
-            raise UnsupportedSimOpError(
-                "functional copy_gm_to_l1 requires a fractal/C0-aligned "
-                "physical tile except for the validated fp32 zN K-tail path"
-            )
         if physical_cols % elements_per_c0:
             raise UnsupportedSimOpError(
                 "functional copy_gm_to_l1 requires a C0-aligned physical tile"

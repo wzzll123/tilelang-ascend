@@ -641,8 +641,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   zN L1 尾部分形 footprint，并由 CPU JIT 回归在 A2/A3 验证双 C1 累加的完整 conv2d
   与 NumPy reference 一致。~~
 - [ ] 接入仓库中存在的高层 convolution lowering 形式。
-- [ ] 对实际完整 convolution kernel 验证 stride、dilation、非对称 padding 和 spatial
-  tail；当前这些 im2col 参数已在 bridge golden 覆盖，完整端到端只覆盖了 padding 和多 C1。
+- [x] ~~对实际完整 convolution kernel 验证 stride、dilation、非对称 padding、spatial
+  tail 和多 C1 累加；fp16 组合矩阵及 fp32 基线均在 A2/A3 simulator 与 NumPy reference
+  端到端一致。~~
 - [ ] 将 A2/A3 硬件限制编码为明确 legality check。
 
 ## P7：Atomic 与 Persistent

@@ -3143,9 +3143,11 @@ def test_real_tir_zn_gm_to_l1_copy_packs_and_clears_tail() -> None:
     np.testing.assert_array_equal(logical, expected)
 
 
-def test_zn_gm_to_l1_rejects_non_fractal_physical_tile() -> None:
-    with pytest.raises(UnsupportedSimOpError, match="fractal/C0-aligned"):
-        build_kernel_program(_gm_to_l1_zn_primfunc(physical_rows=15), platform="A2")
+def test_zn_gm_to_l1_rejects_non_fractal_rows_without_padded_storage() -> None:
+    with pytest.raises(ProgramValidationError, match="physical tile exceeds"):
+        build_kernel_program(
+            _gm_to_l1_zn_primfunc(physical_rows=15), platform="A2"
+        )
 
 
 def _gm_to_l1_zn_splice_primfunc(

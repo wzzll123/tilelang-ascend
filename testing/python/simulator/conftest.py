@@ -21,7 +21,7 @@ if "tilelang" not in sys.modules:
         # 3rdparty/tvm/python on sys.path, enabling end-to-end simulator tests
         # that compile T.prim_func kernels with simulator=True.
         import tilelang  # noqa: F401
-    except Exception:
+    except (ImportError, OSError):
         # Importing tilelang normally loads TVM and libtilelang.  The simulator
         # core is intentionally backend-neutral, so expose only the package
         # path for these tests when the native build is unavailable.
