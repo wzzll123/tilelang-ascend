@@ -237,6 +237,11 @@ region 的跨 core 更新会在 DAG/trace 中确定性串行化。目标必须�
 L0C→GM atomic_add 已支持 lowered DMA 五参数 ABI、L0C fractal layout 解码、有效尾块和
 GM row stride，并覆盖 fp32→fp32/fp16/bfloat16 与 int32→int32。转换发生在加法之前，
 destination 同样作为 accumulator 和 atomic write 参与依赖分析。
+Persistent kernel 的 final TIR wave loop 已按 core 静态展开，`tl.loop_break` 按 Ascend/
+AscendPTO codegen 的 `break;` 语义退出最近 wave loop；同一 core 的 L1/L0/UB allocation
+在各 work item 间保持 resident，任务继续纳入现有 dependency DAG、同步 liveness 和
+deadlock 诊断。A2/A3 端到端 tail-wave 用例覆盖 10 个 work item/4 cores，验证无遗漏、
+无重复且正确终止。
 transpose 已支持静态 rank-2 UB tile 的非方形转置和常用 B8/B16/B32 dtype，并验证
 source/destination shape 互换、dtype、scope、whole-buffer 和双维度 32B 对齐契约。
 reinterpretcast 已按零拷贝元数据操作实现：执行时将目标 UB allocation 重绑到源
@@ -658,7 +663,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   fp32→bfloat16 路径。~~
 - [x] ~~对同一 GM region 的跨 core atomic 冲突提供确定性的 DAG 序列化，并在 trace 中
   验证前一原子写结束后下一写启动。~~
-- [ ] 实现 Persistent kernel 的 work distribution、residency 和 liveness 模型。
+- [x] ~~实现 Persistent kernel 的 work distribution、residency 和 liveness 模型。~~
 - [ ] 覆盖 atomic contention、初始化规则、终止条件和 deadlock。
 
 ## 同步、流水与调度

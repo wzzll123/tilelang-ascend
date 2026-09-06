@@ -213,6 +213,10 @@ def build_kernel_program(
     return bridge.build(func_or_mod)
 
 
+class _LoopBreak(Exception):
+    """Internal control-flow signal for the lowered ``tl.loop_break`` intrinsic."""
+
+
 class _TirBridge:
     def __init__(
         self,
@@ -246,6 +250,7 @@ class _TirBridge:
         self.active_aliases: Dict[Tuple[MemoryScope, Optional[int], str], str] = {}
         self.task_counter = 0
         self.kernel_name = "main"
+        self.loop_break_count = 0
 
     def build(self, func_or_mod: Any) -> KernelProgram:
         func = self._select_prim_func(func_or_mod)
@@ -268,6 +273,7 @@ class _TirBridge:
             metadata={
                 "timing_calibration": self.timing_profile.calibration,
                 "source": "final-optimized-tir",
+                "loop_break_count": self.loop_break_count,
             },
         )
 
@@ -389,7 +395,11 @@ class _TirBridge:
             for value in range(minimum, minimum + extent):
                 environment = dict(context.environment)
                 environment[stmt.loop_var] = value
-                self._visit(stmt.body, replace(context, environment=environment))
+                try:
+                    self._visit(stmt.body, replace(context, environment=environment))
+                except _LoopBreak:
+                    self.loop_break_count += 1
+                    break
             return
         if isinstance(stmt, tir.IfThenElse):
             condition = self._require_int(stmt.condition, context.environment, "if condition")
@@ -522,6 +532,8 @@ class _TirBridge:
 
     def _emit_call(self, call: Any, context: _Context) -> None:
         operation, arguments = self._call_operation(call)
+        if operation == "tl.loop_break":
+            raise _LoopBreak
         lowered_operation = operation
         tail_kind = _short_operation(operation)
         if tail_kind in _TAIL_OPERATIONS:
