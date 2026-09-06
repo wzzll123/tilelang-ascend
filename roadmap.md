@@ -664,7 +664,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~对同一 GM region 的跨 core atomic 冲突提供确定性的 DAG 序列化，并在 trace 中
   验证前一原子写结束后下一写启动。~~
 - [x] ~~实现 Persistent kernel 的 work distribution、residency 和 liveness 模型。~~
-- [ ] 覆盖 atomic contention、初始化规则、终止条件和 deadlock。
+- [x] ~~覆盖 atomic contention、初始化规则、终止条件和 deadlock。~~
 
 ## 同步、流水与调度
 
