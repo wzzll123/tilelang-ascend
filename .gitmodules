@@ -3,7 +3,7 @@
 	url = https://github.com/NVIDIA/cutlass
 [submodule "3rdparty/tvm"]
 	path = 3rdparty/tvm
-	url = https://github.com/TileLang/tvm
+	url = https://github.com/wzzll123/tvm
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
 	url = https://github.com/ROCm/composable_kernel
