@@ -245,8 +245,8 @@ class _TirBridge:
         # syntax tree even though the resources execute concurrently.  Memory
         # hazards are therefore only source-order dependencies within one
         # execution lane; cross-lane visibility is established by C/V flags.
-        self.last_writes: list[Tuple[BufferRegion, str, Lane]] = []
-        self.last_reads: list[Tuple[BufferRegion, str, Lane]] = []
+        self.last_writes: list[Tuple[BufferRegion, str, Lane, int]] = []
+        self.last_reads: list[Tuple[BufferRegion, str, Lane, int]] = []
         self.active_aliases: Dict[Tuple[MemoryScope, Optional[int], str], str] = {}
         self.task_counter = 0
         self.kernel_name = "main"
@@ -5375,7 +5375,7 @@ class _TirBridge:
         task_metadata.setdefault("timing_key", timing_key)
         task_metadata.setdefault("timing_calibration", self.timing_profile.calibration)
         memory_dependencies = self._memory_dependencies(
-            task_metadata, context.core_id, context.lane
+            task_metadata, context.core_id, context.lane, operation=normalized
         )
         if memory_dependencies:
             # Preserve why these edges exist.  They keep functional execution
@@ -5429,6 +5429,8 @@ class _TirBridge:
         metadata: Mapping[str, Any],
         core_id: int,
         lane: Lane,
+        *,
+        operation: str = "",
     ) -> Tuple[str, ...]:
         reads = self._operand_regions(
             metadata,
@@ -5440,20 +5442,55 @@ class _TirBridge:
         writes = self._operand_regions(
             metadata, ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch")
         )
+        # atomic_add is the one cross-core GM op that must stay serialized for
+        # functional determinism (the simulator reproduces a fixed accumulation
+        # order); hardware makes it atomic, but the functional model orders it.
+        keep_cross_core = "atomic_add" in operation
         dependencies = {
             task_id
             for region in reads
-            for previous, task_id, previous_lane in self.last_writes
-            if previous_lane is lane and self._regions_overlap(region, previous, core_id)
+            for previous, task_id, previous_lane, previous_core in self.last_writes
+            if previous_lane is lane
+            and self._regions_overlap(region, previous, core_id)
+            and (
+                keep_cross_core
+                or self._same_on_chip_owner(region, previous, core_id, previous_core)
+            )
         }
         for region in writes:
             dependencies.update(
                 task_id
-                for previous, task_id, previous_lane in self.last_writes + self.last_reads
+                for previous, task_id, previous_lane, previous_core in (
+                    self.last_writes + self.last_reads
+                )
                 if previous_lane is lane
                 and self._regions_overlap(region, previous, core_id)
+                and (
+                    keep_cross_core
+                    or self._same_on_chip_owner(
+                        region, previous, core_id, previous_core
+                    )
+                )
             )
         return tuple(sorted(dependencies))
+
+    @staticmethod
+    def _same_on_chip_owner(
+        region: BufferRegion, previous: BufferRegion, core_id: int, previous_core: int
+    ) -> bool:
+        """Cross-core GM/WORKSPACE accesses never order by task dependency.
+
+        On real hardware, cross-core visibility of shared GM/workspace is carried
+        only by cross-core flags/barriers, never by task order.  A source-order
+        edge between two different cores' accesses to one shared GM buffer can
+        deadlock against a collective barrier (the barrier is the true ordering
+        point).  On-chip scopes (UB/L1/L0) are per-core and still need the edge
+        when both accesses belong to the same core.  Returns True only when the
+        dependency edge is meaningful.
+        """
+        if region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}:
+            return core_id == previous_core
+        return True
 
     def _record_memory_accesses(self, task: Task, core_id: int, lane: Lane) -> None:
         reads = self._operand_regions(
@@ -5478,8 +5515,10 @@ class _TirBridge:
                 if entry[2] is not lane
                 or not self._regions_overlap(region, entry[0], core_id)
             ]
-            self.last_writes.append((region, task.task_id, lane))
-        self.last_reads.extend((region, task.task_id, lane) for region in reads)
+            self.last_writes.append((region, task.task_id, lane, core_id))
+        self.last_reads.extend(
+            (region, task.task_id, lane, core_id) for region in reads
+        )
 
     @staticmethod
     def _operand_regions(
