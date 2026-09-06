@@ -632,7 +632,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## P6：Convolution 与 Im2Col
 
-- [x] ~~实现 float16/float32、单 C0 的 `im2col`（分别为 C0=16/8），覆盖
+- [x] ~~实现 float16/bfloat16/float32、单 C0 的 `im2col`（分别为 C0=16/16/8），覆盖
   padding、stride、dilation、M tail、zN L1 输入与 zZ L0A 输出，并按 A2 已验证
   contract 拒绝非零 posM/posK。~~
 - [x] ~~实现显式 im2col + MMA + NO_QUANT RowMajor fixpipe convolution，并由实际
@@ -640,11 +640,14 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~实现 fp32 C0=8 的 im2col + fp32 MMA：修正 L0B nZ 编码，处理 K=72 的
   zN L1 尾部分形 footprint，并由 CPU JIT 回归在 A2/A3 验证双 C1 累加的完整 conv2d
   与 NumPy reference 一致。~~
-- [ ] 接入仓库中存在的高层 convolution lowering 形式。
+- [x] ~~审计仓库 convolution 入口：Ascend 当前不存在另一种高层 convolution lowering，
+  有效主路径统一为 `T.tile.im2col + T.mma`；CUDA `c2d_im2col` 不属于 A2/A3 simulator。~~
 - [x] ~~对实际完整 convolution kernel 验证 stride、dilation、非对称 padding、spatial
   tail 和多 C1 累加；fp16 组合矩阵及 fp32 基线均在 A2/A3 simulator 与 NumPy reference
   端到端一致。~~
-- [ ] 将 A2/A3 硬件限制编码为明确 legality check。
+- [x] ~~将 A2/A3 `LoadData3DParamsV2` 限制编码为明确 legality check：正数 image/filter/
+  stride/dilation/valid extent、uint8 padding、uint16 image/start/extension、dtype 对应完整 C0、
+  零 posM/posK、输出位置范围、L1/L0A scope/layout footprint 和容量；错误路径均有回归。~~
 
 ## P7：Atomic 与 Persistent
 

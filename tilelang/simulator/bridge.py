@@ -2285,10 +2285,10 @@ class _TirBridge:
                 f"functional im2col got malformed template {tag!r}"
             )
         dtype = _ascend_template_dtype(tag[len("im2col<"):-1].strip())
-        if dtype not in {"float16", "float32"}:
+        if dtype not in {"float16", "bfloat16", "float32"}:
             raise UnsupportedSimOpError(
-                "functional im2col supports the repository's float16 and "
-                "float32 convolution paths"
+                "functional im2col supports the repository's float16, "
+                "bfloat16, and float32 convolution paths"
             )
         dimensions = tuple(
             self._runtime_int(argument, context.environment)
@@ -2309,9 +2309,21 @@ class _TirBridge:
             raise ProgramValidationError(
                 "im2col image, filter, stride, and dilation values must be positive"
             )
-        if min(pad_left, pad_right, pad_top, pad_bottom, valid_m, valid_k) < 0:
+        if min(pad_left, pad_right, pad_top, pad_bottom) < 0:
             raise ProgramValidationError(
-                "im2col padding and valid extents must not be negative"
+                "im2col padding must not be negative"
+            )
+        if valid_m <= 0 or valid_k <= 0:
+            raise ProgramValidationError("im2col valid extents must be positive")
+        if max(pad_left, pad_right, pad_top, pad_bottom) > 255:
+            raise ProgramValidationError(
+                "im2col padding must fit LoadData3DParamsV2 uint8 fields"
+            )
+        uint16_values = (hi, wi, pos_m, pos_k, valid_m, valid_k)
+        if max(uint16_values) > 65535:
+            raise ProgramValidationError(
+                "im2col image/start/extension values must fit "
+                "LoadData3DParamsV2 uint16 fields"
             )
         # The language wrapper records that A2 rejects non-zero K/M start
         # points with 507015; tiled convolution uses pointer offsets instead.
@@ -2320,13 +2332,13 @@ class _TirBridge:
                 "functional im2col follows the A2 contract requiring pos_m=pos_k=0"
             )
         kernel_points = kh * kw
-        if valid_k == 0 or valid_k % kernel_points:
+        if valid_k % kernel_points:
             raise ProgramValidationError(
                 "im2col valid_k must be a positive multiple of kh*kw"
             )
         channels = valid_k // kernel_points
         # The validated paths use exactly one complete datatype-specific C0 group.
-        channels_per_c0 = 16 if dtype == "float16" else 8
+        channels_per_c0 = 8 if dtype == "float32" else 16
         if channels != channels_per_c0:
             raise UnsupportedSimOpError(
                 f"functional {dtype} im2col currently requires one "

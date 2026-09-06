@@ -1,6 +1,7 @@
 """Execute the repository's fp32 im2col/MMA convolution path on CPU."""
 
 import numpy as np
+import ml_dtypes
 
 import tilelang
 import tilelang.language as T
@@ -119,9 +120,9 @@ def _reference(feature, weight, **config):
                             k_start = group * k_per_group + (
                                 kernel_row * kernel_w + kernel_col
                             ) * channels_per_c0
-                            output[m] += image @ weight[
+                            output[m] += image.astype(np.float32) @ weight[
                                 k_start:k_start + channels_per_c0
-                            ]
+                            ].astype(np.float32)
     return output
 
 
@@ -166,3 +167,23 @@ def test_fp16_convolution_stride_dilation_asymmetric_padding_and_tail() -> None:
             expected = _reference(feature, weight, **config)
             actual = kernel(feature, weight)[:config["output_positions"]]
             np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+def test_bfloat16_im2col_mma_convolution_matches_reference() -> None:
+    rng = np.random.default_rng(11)
+    for platform in ("A2", "A3"):
+        kernel, config = _conv2d_kernel(
+            platform, dtype="bfloat16", height=5, width=7,
+            output_channels=16,
+        )
+        feature = rng.normal(size=(
+            config["groups"] * config["height"] * config["width"],
+            config["channels_per_c0"],
+        )).astype(ml_dtypes.bfloat16)
+        weight = rng.normal(size=(
+            config["groups"] * config["k_per_group"],
+            config["output_channels"],
+        )).astype(ml_dtypes.bfloat16)
+        expected = _reference(feature, weight, **config)
+        actual = kernel(feature, weight)[:config["output_positions"]]
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)

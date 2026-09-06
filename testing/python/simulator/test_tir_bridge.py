@@ -4,6 +4,7 @@
 
 import pytest
 import numpy as np
+import ml_dtypes
 
 tvm = pytest.importorskip("tvm")
 from tvm.script import tir as T  # noqa: E402
@@ -7395,7 +7396,7 @@ def test_indexed_scalar_vector_form_reads_selected_ub_element() -> None:
 def _im2col_primfunc(
     *, image_shape=(5, 7), kernel=(3, 3), stride=(1, 1),
     dilation=(1, 1), padding=(1, 1, 1, 1), pos_m=0, pos_k=0,
-    dtype="float16",
+    dtype="float16", valid_m_override=None, valid_k_override=None,
 ):
     hi, wi = image_shape
     kh, kw = kernel
@@ -7405,9 +7406,11 @@ def _im2col_primfunc(
     output_h = (hi + pt + pb - dh * (kh - 1) - 1) // sh + 1
     output_w = (wi + pl + pr - dw * (kw - 1) - 1) // sw + 1
     valid_m = output_h * output_w
-    channels = 16 if dtype == "float16" else 8
+    channels = 8 if dtype == "float32" else 16
     itemsize = np.dtype(dtype).itemsize
     valid_k = kh * kw * channels
+    valid_m = valid_m if valid_m_override is None else valid_m_override
+    valid_k = valid_k if valid_k_override is None else valid_k_override
     source_elements = storage_elements("zn", (hi * wi, channels), itemsize)
     destination_elements = storage_elements("l0a", (valid_m, valid_k), itemsize)
     source = tvm.tir.decl_buffer(
@@ -7417,8 +7420,11 @@ def _im2col_primfunc(
         (destination_elements,), dtype, name="im2col_destination",
         scope="wmma.matrix_a",
     )
+    template_dtype = {
+        "float16": "half", "bfloat16": "bfloat16_t", "float32": "float",
+    }[dtype]
     call = tvm.tir.call_extern(
-        "handle", "tl.ascend_im2col", f"im2col<{'half' if dtype == 'float16' else 'float'}>",
+        "handle", "tl.ascend_im2col", f"im2col<{template_dtype}>",
         source.access_ptr("r"), destination.access_ptr("w"),
         hi, wi, kh, kw, sh, sw, dh, dw, pl, pr, pt, pb,
         pos_m, pos_k, valid_m, valid_k,
@@ -7452,6 +7458,11 @@ def _im2col_primfunc(
             "stride": (1, 1), "dilation": (1, 1),
             "padding": (1, 1, 1, 1), "dtype": "float32",
         },
+        {
+            "image_shape": (5, 7), "kernel": (3, 3),
+            "stride": (1, 1), "dilation": (1, 1),
+            "padding": (1, 1, 1, 1), "dtype": "bfloat16",
+        },
     ],
 )
 def test_im2col_extracts_padded_strided_dilated_l0a_tile(
@@ -7471,8 +7482,9 @@ def test_im2col_extracts_padded_strided_dilated_l0a_tile(
     sh, sw = configuration["stride"]
     dh, dw = configuration["dilation"]
     pl, _pr, pt, _pb = configuration["padding"]
-    dtype = np.dtype(configuration.get("dtype", "float16"))
-    channels = 16 if dtype == np.float16 else 8
+    dtype_name = configuration.get("dtype", "float16")
+    dtype = np.dtype(ml_dtypes.bfloat16) if dtype_name == "bfloat16" else np.dtype(dtype_name)
+    channels = 8 if dtype == np.float32 else 16
     feature = np.arange(hi * wi * channels, dtype=dtype).reshape(hi * wi, channels)
     expected = np.zeros((valid_m, valid_k), dtype=dtype)
     for m in range(valid_m):
@@ -7501,3 +7513,18 @@ def test_im2col_rejects_nonzero_hardware_start_point() -> None:
     primfunc, _ = _im2col_primfunc(pos_m=16)
     with pytest.raises(UnsupportedSimOpError, match="pos_m=pos_k=0"):
         build_kernel_program(primfunc, platform="A2")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"valid_m_override": 0}, "valid extents must be positive"),
+        ({"valid_k_override": 0}, "valid extents must be positive"),
+        ({"padding": (256, 0, 0, 0)}, "uint8"),
+        ({"valid_m_override": 65536}, "uint16"),
+    ],
+)
+def test_im2col_rejects_unrepresentable_hardware_parameters(kwargs, message) -> None:
+    primfunc, _ = _im2col_primfunc(**kwargs)
+    with pytest.raises(ProgramValidationError, match=message):
+        build_kernel_program(primfunc, platform="A3")
