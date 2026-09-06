@@ -235,9 +235,8 @@ row stride；destination 同时作为 accumulator read 和 atomic write 建模�
 region 的跨 core 更新会在 DAG/trace 中确定性串行化。目标必须预先初始化，未初始化读取、
 非 32B 行宽、scope/dtype/template 错误均明确失败。
 L0C→GM atomic_add 已支持 lowered DMA 五参数 ABI、L0C fractal layout 解码、有效尾块和
-GM row stride，并覆盖 fp32→fp32/fp16 与 int32→int32。转换发生在加法之前，destination
-同样作为 accumulator 和 atomic write 参与依赖分析；bfloat16 因当前 NumPy host 表示/codec
-尚未落地而继续 fail closed。
+GM row stride，并覆盖 fp32→fp32/fp16/bfloat16 与 int32→int32。转换发生在加法之前，
+destination 同样作为 accumulator 和 atomic write 参与依赖分析。
 transpose 已支持静态 rank-2 UB tile 的非方形转置和常用 B8/B16/B32 dtype，并验证
 source/destination shape 互换、dtype、scope、whole-buffer 和双维度 32B 对齐契约。
 reinterpretcast 已按零拷贝元数据操作实现：执行时将目标 UB allocation 重绑到源
@@ -655,8 +654,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   要求和 read-modify-write 功能语义。~~
 - [x] ~~实现 L0C→GM atomic_add 的 layout 解码、有效尾块、GM stride，以及
   fp32→fp32/fp16、int32→int32 转换。~~
-- [ ] 在 host bfloat16 表示与 layout codec 落地后补齐 L0C→GM atomic_add 的
-  fp32→bfloat16 路径。
+- [x] ~~在 host bfloat16 表示与 layout codec 落地后补齐 L0C→GM atomic_add 的
+  fp32→bfloat16 路径。~~
 - [x] ~~对同一 GM region 的跨 core atomic 冲突提供确定性的 DAG 序列化，并在 trace 中
   验证前一原子写结束后下一写启动。~~
 - [ ] 实现 Persistent kernel 的 work distribution、residency 和 liveness 模型。

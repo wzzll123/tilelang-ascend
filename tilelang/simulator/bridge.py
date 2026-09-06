@@ -4072,6 +4072,7 @@ class _TirBridge:
         dtype_pair = (source.dtype, destination.dtype)
         if dtype_pair not in {
             ("float32", "float32"), ("float32", "float16"),
+            ("float32", "bfloat16"),
             ("int32", "int32"),
         }:
             raise UnsupportedSimOpError(

@@ -486,7 +486,8 @@ def _atomic_add_l0c_primfunc(
         (rows, cols), destination_dtype, name="output", scope="global"
     )
     dtype_names = {
-        "float16": "half", "float32": "float", "int32": "int",
+        "float16": "half", "bfloat16": "bfloat16_t",
+        "float32": "float", "int32": "int",
     }
     atomic = tvm.tir.call_extern(
         "handle",
@@ -4196,7 +4197,12 @@ def test_real_tir_l0c_to_gm_executes_relu_tail_and_dtype_conversion() -> None:
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 @pytest.mark.parametrize(
     ("source_dtype", "destination_dtype"),
-    [("float32", "float32"), ("float32", "float16"), ("int32", "int32")],
+    [
+        ("float32", "float32"),
+        ("float32", "float16"),
+        ("float32", "bfloat16"),
+        ("int32", "int32"),
+    ],
 )
 def test_l0c_atomic_add_decodes_tail_converts_then_accumulates(
     platform, source_dtype, destination_dtype
@@ -4213,18 +4219,24 @@ def test_l0c_atomic_add_decodes_tail_converts_then_accumulates(
         "atomic_add_l0c_to_gm", Lane.CUBE, Pipe.FIX,
     )
     assert task.metadata["accumulator"] == task.metadata["dst"]
-    logical = np.arange(16 * 32, dtype=np.dtype(source_dtype)).reshape(16, 32)
+    source_np_dtype = np.dtype(source_dtype)
+    destination_np_dtype = (
+        np.dtype(ml_dtypes.bfloat16)
+        if destination_dtype == "bfloat16"
+        else np.dtype(destination_dtype)
+    )
+    logical = np.arange(16 * 32, dtype=source_np_dtype).reshape(16, 32)
     output = BufferRegion(
         "output", MemoryScope.GM, (16, 32), destination_dtype
     )
-    initial = np.full((16, 32), 2, dtype=np.dtype(destination_dtype))
+    initial = np.full((16, 32), 2, dtype=destination_np_dtype)
     simulator = FunctionalSimulator(program)
     simulator.write(task.metadata["src"], pack_matrix(logical, "l0c"))
     simulator.write(output, initial)
     simulator.run()
 
     expected = initial.copy()
-    expected[:13, :17] += logical[:13, :17].astype(destination_dtype)
+    expected[:13, :17] += logical[:13, :17].astype(destination_np_dtype)
     np.testing.assert_array_equal(simulator.read(output), expected)
 
 
