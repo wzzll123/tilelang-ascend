@@ -115,8 +115,14 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
             "load-0", "copy_gm_to_l1", 0, Lane.CUBE, Pipe.MTE2, 0, 10,
             metadata={"bytes": 4096},
         ),
-        ExecutionRecord("load-1", "copy_gm_to_l1", 0, Lane.CUBE, Pipe.MTE2, 5, 15),
-        ExecutionRecord("mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 10, 30),
+        ExecutionRecord(
+            "load-1", "copy_gm_to_l1", 0, Lane.CUBE, Pipe.MTE2, 5, 15,
+            metadata={"memory_dependencies": ("load-0",)},
+        ),
+        ExecutionRecord(
+            "mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 10, 30,
+            metadata={"memory_dependencies": ("load-1",)},
+        ),
         ExecutionRecord(
             "wait", "wait_flag", 1, Lane.VECTOR_0, Pipe.SCALAR, 8, 12,
             category="wait", stall_reason="event",
@@ -130,6 +136,9 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     assert stats.utilization_by_resource["core-0/cube/mte2"] == pytest.approx(0.5)
     assert stats.wait_cycles_by_reason == {"event": 4}
     assert stats.completion_cycle_by_core == {0: 30, 1: 12}
+    assert stats.operation_counts == {
+        "copy_gm_to_l1": 2, "mma": 1, "wait_flag": 1,
+    }
 
     trace_path = ChromeTraceExporter("A2", "uncalibrated-unit-cost").write(
         tmp_path / "trace.json", records
@@ -146,6 +155,17 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     assert complete_events[0]["args"]["bytes"] == 4096
     assert metadata["args"]["timestamp_unit"] == "simulator_cycle"
     assert metadata["args"]["calibration"] == "uncalibrated-unit-cost"
+    assert metadata["args"]["schema_version"] == "1.0"
+    assert trace["schemaVersion"] == "1.0"
+    flows = [
+        event for event in trace["traceEvents"]
+        if event.get("cat") == "dependency"
+    ]
+    assert [(event["ph"], event["args"]["from"], event["args"]["to"])
+            for event in flows] == [
+        ("s", "load-0", "load-1"), ("f", "load-0", "load-1"),
+        ("s", "load-1", "mma"), ("f", "load-1", "mma"),
+    ]
 
 
 def test_empty_stats_are_well_defined() -> None:
@@ -154,3 +174,4 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.makespan_cycles == 0
     assert stats.task_count == 0
     assert stats.to_dict()["utilization_by_resource"] == {}
+    assert stats.to_dict()["operation_counts"] == {}

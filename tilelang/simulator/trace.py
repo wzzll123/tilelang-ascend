@@ -13,6 +13,9 @@ from .errors import ProgramValidationError
 from .program import Lane, Pipe, Task
 
 
+TRACE_SCHEMA_VERSION = "1.0"
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -122,6 +125,7 @@ class ChromeTraceExporter:
                 "pid": "simulator",
                 "tid": 0,
                 "args": {
+                    "schema_version": TRACE_SCHEMA_VERSION,
                     "platform": self.platform,
                     "timestamp_unit": "simulator_cycle",
                     "calibration": self.calibration,
@@ -154,7 +158,45 @@ class ChromeTraceExporter:
                 "tid": record.resource,
                 "args": args,
             })
-        return {"traceEvents": events, "displayTimeUnit": "ns"}
+        records_by_id = {
+            record.task_id: record
+            for record in record_list
+            if record.category == "operation"
+        }
+        for consumer in records_by_id.values():
+            for producer_id in consumer.metadata.get("memory_dependencies", ()):
+                producer = records_by_id.get(str(producer_id))
+                if producer is None:
+                    continue
+                flow_id = f"memory:{producer.task_id}:{consumer.task_id}"
+                events.extend((
+                    {
+                        "name": "memory_dependency",
+                        "cat": "dependency",
+                        "ph": "s",
+                        "id": flow_id,
+                        "ts": producer.end_cycle,
+                        "pid": f"core-{producer.core_id}",
+                        "tid": producer.resource,
+                        "args": {"from": producer.task_id, "to": consumer.task_id},
+                    },
+                    {
+                        "name": "memory_dependency",
+                        "cat": "dependency",
+                        "ph": "f",
+                        "bp": "e",
+                        "id": flow_id,
+                        "ts": consumer.start_cycle,
+                        "pid": f"core-{consumer.core_id}",
+                        "tid": consumer.resource,
+                        "args": {"from": producer.task_id, "to": consumer.task_id},
+                    },
+                ))
+        return {
+            "schemaVersion": TRACE_SCHEMA_VERSION,
+            "traceEvents": events,
+            "displayTimeUnit": "ns",
+        }
 
     def write(self, path: Union[str, Path], records: Iterable[ExecutionRecord]) -> Path:
         """Write a trace document and return its resolved output path."""

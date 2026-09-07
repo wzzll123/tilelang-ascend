@@ -34,6 +34,7 @@ class SimulationStats:
     utilization_by_resource: Mapping[str, float]
     wait_cycles_by_reason: Mapping[str, int]
     completion_cycle_by_core: Mapping[int, int]
+    operation_counts: Mapping[str, int]
 
     @classmethod
     def from_records(cls, records: Iterable[ExecutionRecord]) -> "SimulationStats":
@@ -41,17 +42,21 @@ class SimulationStats:
         record_list = list(records)
         if not record_list:
             empty = MappingProxyType({})
-            return cls(0, 0, empty, empty, empty, empty)
+            return cls(0, 0, empty, empty, empty, empty, empty)
 
         makespan = max(record.end_cycle for record in record_list)
         intervals: Dict[str, List[Tuple[int, int]]] = {}
         waits: Dict[str, int] = {}
         completion: Dict[int, int] = {}
+        operation_counts: Dict[str, int] = {}
         for record in record_list:
             resource = f"core-{record.core_id}/{record.resource}"
             intervals.setdefault(resource, []).append((record.start_cycle, record.end_cycle))
             completion[record.core_id] = max(
                 completion.get(record.core_id, 0), record.end_cycle
+            )
+            operation_counts[record.operation] = (
+                operation_counts.get(record.operation, 0) + 1
             )
             if record.stall_reason is not None:
                 waits[record.stall_reason] = (
@@ -70,6 +75,7 @@ class SimulationStats:
             utilization_by_resource=MappingProxyType(utilization),
             wait_cycles_by_reason=MappingProxyType(waits),
             completion_cycle_by_core=MappingProxyType(completion),
+            operation_counts=MappingProxyType(operation_counts),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -81,4 +87,5 @@ class SimulationStats:
             "utilization_by_resource": dict(self.utilization_by_resource),
             "wait_cycles_by_reason": dict(self.wait_cycles_by_reason),
             "completion_cycle_by_core": dict(self.completion_cycle_by_core),
+            "operation_counts": dict(self.operation_counts),
         }

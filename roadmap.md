@@ -702,10 +702,13 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~为 core/lane/pipe、operation、wait reason 和未校准 profile 输出基础元数据。~~
 - [x] ~~提供 overlap-aware makespan、pipe utilization、wait cycles 和 core completion
   统计。~~
-- [ ] 输出 dependency/flag flow events、queue depth、live local-memory 和 active-core counter。
-- [ ] 统计各 memory path bytes、operation counts、peak local-memory 和 hazard counts。
+- [x] ~~输出 memory dependency flow events。~~
+- [ ] 输出 flag flow events、queue depth、live local-memory 和 active-core counter。
+- [x] ~~统计 operation counts。~~
+- [ ] 统计各 memory path bytes、peak local-memory 和 hazard counts。
 - [ ] 标记 critical path、load imbalance、copy/compute overlap 和主要 stall 原因。
-- [ ] 增加 trace schema/version 回归测试和 trace comparison 工具。
+- [x] ~~增加 trace schema/version 回归测试。~~
+- [ ] 增加 trace comparison 工具。
 
 ## P8：A2/A3 Timing Calibration 与硬化
 
