@@ -35,6 +35,7 @@ class SimulationStats:
     wait_cycles_by_reason: Mapping[str, int]
     completion_cycle_by_core: Mapping[int, int]
     operation_counts: Mapping[str, int]
+    load_imbalance_cycles: int
 
     @classmethod
     def from_records(cls, records: Iterable[ExecutionRecord]) -> "SimulationStats":
@@ -42,7 +43,7 @@ class SimulationStats:
         record_list = list(records)
         if not record_list:
             empty = MappingProxyType({})
-            return cls(0, 0, empty, empty, empty, empty, empty)
+            return cls(0, 0, empty, empty, empty, empty, empty, 0)
 
         makespan = max(record.end_cycle for record in record_list)
         intervals: Dict[str, List[Tuple[int, int]]] = {}
@@ -68,6 +69,7 @@ class SimulationStats:
             resource: cycles / makespan if makespan else 0.0
             for resource, cycles in busy.items()
         }
+        completion_values = tuple(completion.values())
         return cls(
             makespan_cycles=makespan,
             task_count=len(record_list),
@@ -76,6 +78,10 @@ class SimulationStats:
             wait_cycles_by_reason=MappingProxyType(waits),
             completion_cycle_by_core=MappingProxyType(completion),
             operation_counts=MappingProxyType(operation_counts),
+            load_imbalance_cycles=(
+                max(completion_values) - min(completion_values)
+                if completion_values else 0
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -88,4 +94,5 @@ class SimulationStats:
             "wait_cycles_by_reason": dict(self.wait_cycles_by_reason),
             "completion_cycle_by_core": dict(self.completion_cycle_by_core),
             "operation_counts": dict(self.operation_counts),
+            "load_imbalance_cycles": self.load_imbalance_cycles,
         }

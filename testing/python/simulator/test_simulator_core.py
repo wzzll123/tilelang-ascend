@@ -139,6 +139,7 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     assert stats.operation_counts == {
         "copy_gm_to_l1": 2, "mma": 1, "wait_flag": 1,
     }
+    assert stats.load_imbalance_cycles == 18
 
     trace_path = ChromeTraceExporter("A2", "uncalibrated-unit-cost").write(
         tmp_path / "trace.json", records
@@ -157,6 +158,12 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     assert metadata["args"]["calibration"] == "uncalibrated-unit-cost"
     assert metadata["args"]["schema_version"] == "1.0"
     assert trace["schemaVersion"] == "1.0"
+    active_core_events = [
+        event for event in trace["traceEvents"]
+        if event.get("name") == "active_cores"
+    ]
+    assert [(event["ts"], event["args"]["active_cores"])
+            for event in active_core_events] == [(0, 1), (30, 0)]
     flows = [
         event for event in trace["traceEvents"]
         if event.get("cat") == "dependency"
@@ -175,6 +182,7 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.task_count == 0
     assert stats.to_dict()["utilization_by_resource"] == {}
     assert stats.to_dict()["operation_counts"] == {}
+    assert stats.to_dict()["load_imbalance_cycles"] == 0
 
 
 def test_trace_exports_matched_flag_flow() -> None:
@@ -193,3 +201,23 @@ def test_trace_exports_matched_flag_flow() -> None:
     ]
     assert [(event["ph"], event["ts"]) for event in flows] == [("s", 3), ("f", 3)]
     assert all(event["args"] == {"from": "set", "to": "wait"} for event in flows)
+
+
+def test_trace_active_core_counter_deduplicates_pipe_overlap() -> None:
+    records = (
+        ExecutionRecord("c0-load", "copy", 0, Lane.CUBE, Pipe.MTE2, 0, 8),
+        ExecutionRecord("c0-mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 4, 12),
+        ExecutionRecord("c1-op", "add", 1, Lane.VECTOR_0, Pipe.VECTOR, 5, 10),
+        ExecutionRecord(
+            "c2-wait", "wait", 2, Lane.CUBE, Pipe.SCALAR, 1, 20,
+            category="wait", stall_reason="flag",
+        ),
+    )
+
+    trace = ChromeTraceExporter("A2", "uncalibrated-unit-cost").to_dict(records)
+    counters = [
+        event for event in trace["traceEvents"]
+        if event.get("name") == "active_cores"
+    ]
+    assert [(event["ts"], event["args"]["active_cores"])
+            for event in counters] == [(0, 1), (5, 2), (10, 1), (12, 0)]

@@ -141,6 +141,7 @@ class ChromeTraceExporter:
                 "tid": resource,
                 "args": {"name": resource},
             })
+        events.extend(self._active_core_events(record_list))
         for record in record_list:
             args = _json_safe(record.metadata)
             args["task_id"] = record.task_id
@@ -202,6 +203,44 @@ class ChromeTraceExporter:
             "traceEvents": events,
             "displayTimeUnit": "ns",
         }
+
+    @staticmethod
+    def _active_core_events(records: Iterable[ExecutionRecord]) -> List[Dict[str, Any]]:
+        """Emit a global counter after unioning overlapping pipes on each core."""
+        intervals_by_core: Dict[int, List[tuple[int, int]]] = {}
+        for record in records:
+            if record.category != "operation" or record.duration_cycles == 0:
+                continue
+            intervals_by_core.setdefault(record.core_id, []).append(
+                (record.start_cycle, record.end_cycle)
+            )
+
+        transitions: Dict[int, int] = {}
+        for intervals in intervals_by_core.values():
+            merged: List[tuple[int, int]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            for start, end in merged:
+                transitions[start] = transitions.get(start, 0) + 1
+                transitions[end] = transitions.get(end, 0) - 1
+
+        active = 0
+        events = []
+        for cycle, delta in sorted(transitions.items()):
+            active += delta
+            events.append({
+                "name": "active_cores",
+                "cat": "counter",
+                "ph": "C",
+                "ts": cycle,
+                "pid": "simulator",
+                "tid": "counters",
+                "args": {"active_cores": active},
+            })
+        return events
 
     def write(self, path: Union[str, Path], records: Iterable[ExecutionRecord]) -> Path:
         """Write a trace document and return its resolved output path."""

@@ -704,10 +704,12 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   统计。~~
 - [x] ~~输出 memory dependency flow events。~~
 - [x] ~~输出 local 与 cross mode 0/1/2 flag flow events。~~
-- [ ] 输出 queue depth、live local-memory 和 active-core counter。
+- [x] ~~输出 active-core counter（同 core 多 pipe overlap 去重，wait 不计为 active）。~~
+- [ ] 输出 queue depth 和 live local-memory。
 - [x] ~~统计 operation counts。~~
 - [ ] 统计各 memory path bytes、peak local-memory 和 hazard counts。
-- [ ] 标记 critical path、load imbalance、copy/compute overlap 和主要 stall 原因。
+- [x] ~~统计 active cores 的 completion spread（`load_imbalance_cycles`）。~~
+- [ ] 标记 critical path、copy/compute overlap 和主要 stall 原因。
 - [x] ~~增加 trace schema/version 回归测试。~~
 - [ ] 增加 trace comparison 工具。
 
