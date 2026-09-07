@@ -12,10 +12,12 @@ the bounds recursively without converging -- each round re-intersected a var's
 constraints and nested the min/max endpoints one level deeper -- hanging
 lowering for >10 minutes.
 
-The fix bounds the relaxation recursion depth (``kMaxRelaxDepth``) and keeps
-relaxation monotone, so the hang is gone.  These tests run the compile in a
-subprocess with a hard timeout: before the fix the subprocess is killed by the
-timeout (test goes red); after the fix it completes (test goes green).
+The fix backports apache/tvm#19670 (commit ``96b8257``): fully-relaxed variable
+intervals are memoized and an in-progress set breaks cyclic dependencies.  It
+therefore removes the exponential repeated expansion without imposing an
+arbitrary depth or expression-complexity cutoff.  These tests run the compile
+in a subprocess with a hard timeout: before the fix the subprocess is killed by
+the timeout (test goes red); after the fix it completes (test goes green).
 """
 
 from __future__ import annotations
@@ -90,9 +92,9 @@ def test_mutually_referential_var_domains_terminate():
         from tvm import tir
         from tvm.arith import Analyzer, IntervalSet
 
-        # A cycle of vars whose upper bounds reference one another; with many
-        # vars the upstream depth budget (== number of dom vars) permits deep
-        # min/max nesting during relaxation.
+        # A cycle of vars whose upper bounds reference one another.  The
+        # in-progress set must break the cycle rather than recursively nesting
+        # min/max bounds until the old depth budget is exhausted.
         N = 12
         vs = [tir.Var(f"v{i}", "int32") for i in range(N)]
         ana = Analyzer()
