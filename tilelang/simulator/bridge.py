@@ -1888,9 +1888,9 @@ class _TirBridge:
             raise ProgramValidationError(
                 "copy_l1_to_bt requires matching buffer and template dtypes"
             )
-        if source.dtype != "float32":
+        if source.dtype not in {"float32", "int32"}:
             raise UnsupportedSimOpError(
-                "functional copy_l1_to_bt currently supports float32 bias"
+                "functional copy_l1_to_bt supports float32/int32 bias"
             )
         transfer_bytes = length * dtype_size_bytes(source.dtype)
         if transfer_bytes % 64:
@@ -2500,9 +2500,15 @@ class _TirBridge:
                 "functional mma supports half-to-float, bfloat16-to-float, "
                 "float-to-float, and int8-to-int32"
             )
-        if biased and (input_dtype, accumulator_dtype) != ("float16", "float32"):
+        if biased and (input_dtype, accumulator_dtype) not in {
+            ("float16", "float32"),
+            ("bfloat16", "float32"),
+            ("float32", "float32"),
+            ("int8", "int32"),
+        }:
             raise UnsupportedSimOpError(
-                "functional mma_bias currently supports half-to-float"
+                "functional mma_bias supports half/bfloat16/float-to-float "
+                "and int8-to-int32"
             )
         a_elements = storage_elements(
             "l0a", (rows, inner), dtype_size_bytes(input_dtype)

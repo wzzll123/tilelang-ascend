@@ -566,7 +566,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   simulator bindings 解析符号 footprint，并在执行前校验范围和 16 列粒度。~~
 - [x] ~~实现显式 `mma` 与高层 `gemm_v0` 的 int8×int8→int32 功能路径，覆盖 K-tail、
   init/accumulate、transpose 和多 K-stage 展开。~~
-- [ ] 实现 bf16/fp32 input 等其它硬件支持的 MMA dtype，并明确各模式的精度语义。
+- [x] ~~实现 fp16/bf16/fp32 input→fp32 与 int8 input→int32 的 MMA 和 `mma_bias`；
+  浮点输入按其 storage dtype 量化后扩展至 fp32 累加。~~
 - [x] ~~实现 MMA/fixpipe `unitFlag` 配对协议，覆盖 `0b10` hold、`0b11` release/consume、
   partial-N source footprint、同 L0C region/列数校验和 trace pair metadata。~~
 - [ ] 实现 quant、非 RowMajor 输出和其它 fixpipe variants。
@@ -596,14 +597,15 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 ## P4：Bias、Fixpipe 与量化
 
-- [x] ~~实现 float32 RowMajor L1→BT 的 64B 对齐 copy，以及 half→float32
-  bias-initialized MMA 的 M 维广播、RAW dependency 和 init 参数兼容语义。~~
+- [x] ~~实现 float32/int32 RowMajor L1→BT 的 64B 对齐 copy，以及
+  fp16/bf16/fp32→fp32 与 int8→int32 bias-initialized MMA 的 M 维广播、RAW dependency
+  和 init 参数兼容语义。~~
 - [ ] 支持非 64B 整倍数 bias copy 的真实向上取整 DMA footprint，并补齐其它合法
   bias dtype/shape variants。
 - [x] ~~完成当前仓库 `NO_QUANT + RowMajor` fixpipe 的 ReLU on/off、valid rectangle、
   fp32→fp32/fp16 与 int32→int32 输出。~~ 其它 fused/quant/layout 选项等待语言层暴露。
-- [x] ~~实现 standalone L0C→GM 和 UB→UB 的 fp32→fp16 转换。~~ bfloat16 host 表示与
-  位级 contract 尚未落地，继续 fail-closed。
+- [x] ~~实现 standalone L0C→GM 和 UB→UB 的 fp32→fp16/bfloat16 转换，
+  bfloat16 使用 `ml_dtypes` host 表示与 RNE 位级 golden。~~
 - [ ] 实现仓库实际暴露的 integer quant/dequant、rounding 和 saturation 语义。
 - [ ] 增加 bit/ULP golden、边界值、BT capacity 和 MMA/fixpipe 配对协议测试。
 

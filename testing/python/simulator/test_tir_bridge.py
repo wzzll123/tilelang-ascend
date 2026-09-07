@@ -559,32 +559,46 @@ def _mma_primfunc(
     return tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
 
 
-def _mma_bias_primfunc(*, bias_scope="shared.bt", bias_length=16, init=True):
+def _mma_bias_primfunc(
+    *, bias_scope="shared.bt", bias_length=16, init=True,
+    input_dtype="float16",
+):
     rows, cols, inner = 16, 16, 13
+    input_itemsize = {"int8": 1, "float16": 2, "bfloat16": 2, "float32": 4}[
+        input_dtype
+    ]
+    accumulator_dtype = "int32" if input_dtype == "int8" else "float32"
+    input_token = {
+        "int8": "int8_t", "float16": "half", "bfloat16": "bfloat16_t",
+        "float32": "float",
+    }[input_dtype]
+    accumulator_token = "int" if accumulator_dtype == "int32" else "float"
     l0a = tvm.tir.decl_buffer(
-        (storage_elements("l0a", (rows, inner), 2),),
-        "float16", name="l0a", scope="wmma.matrix_a",
+        (storage_elements("l0a", (rows, inner), input_itemsize),),
+        input_dtype, name="l0a", scope="wmma.matrix_a",
     )
     l0b = tvm.tir.decl_buffer(
-        (storage_elements("l0b", (inner, cols), 2),),
-        "float16", name="l0b", scope="wmma.matrix_b",
+        (storage_elements("l0b", (inner, cols), input_itemsize),),
+        input_dtype, name="l0b", scope="wmma.matrix_b",
     )
     l0c = tvm.tir.decl_buffer(
-        (storage_elements("l0c", (rows, cols), 4),),
-        "float32", name="l0c", scope="wmma.accumulator",
+        (storage_elements("l0c", (rows, cols), 4),), accumulator_dtype,
+        name="l0c", scope="wmma.accumulator",
     )
     bias_l1 = tvm.tir.decl_buffer(
-        (bias_length,), "float32", name="bias_l1", scope="shared.l1"
+        (bias_length,), accumulator_dtype, name="bias_l1", scope="shared.l1"
     )
     bias_bt = tvm.tir.decl_buffer(
-        (bias_length,), "float32", name="bias_bt", scope=bias_scope
+        (bias_length,), accumulator_dtype, name="bias_bt", scope=bias_scope
     )
     copy_bias = tvm.tir.call_extern(
-        "handle", "tl::ascend::copy_l1_to_bt<float, float>",
+        "handle",
+        f"tl::ascend::copy_l1_to_bt<{accumulator_token}, {accumulator_token}>",
         bias_l1.access_ptr("r"), bias_bt.access_ptr("w"), bias_length,
     )
     mma = tvm.tir.call_extern(
-        "handle", "tl.ascend_mma", "mma_bias<half, float, 16, 16>",
+        "handle", "tl.ascend_mma",
+        f"mma_bias<{input_token}, {accumulator_token}, 16, 16>",
         l0a.access_ptr("r"), l0b.access_ptr("r"),
         l0c.access_ptr("w" if init else "rw"),
         bias_bt.access_ptr("r"), init, inner,
@@ -4415,11 +4429,15 @@ def test_mma_rejects_unsupported_int8_accumulator_dtype() -> None:
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 @pytest.mark.parametrize("initialize", [True, False])
+@pytest.mark.parametrize(
+    "input_dtype", ["float16", "bfloat16", "float32", "int8"]
+)
 def test_mma_bias_copies_bt_and_broadcasts_across_rows(
-    platform, initialize
+    platform, initialize, input_dtype
 ) -> None:
     program = build_kernel_program(
-        _mma_bias_primfunc(init=initialize), platform=platform
+        _mma_bias_primfunc(init=initialize, input_dtype=input_dtype),
+        platform=platform,
     )
     copy_bias, mma = program.tasks
     assert (copy_bias.operation, copy_bias.lane, copy_bias.pipe) == (
@@ -4432,16 +4450,31 @@ def test_mma_bias_copies_bt_and_broadcasts_across_rows(
     assert mma.metadata["mma"]["bias"] is True
     assert "accumulator" not in mma.metadata
 
-    left = (np.arange(16 * 13, dtype=np.float16).reshape(16, 13) - 50) / 32
-    right = (np.arange(13 * 16, dtype=np.float16).reshape(13, 16) - 70) / 64
-    bias = np.linspace(-2, 2, 16, dtype=np.float32)
+    input_np_dtype = (
+        np.dtype(ml_dtypes.bfloat16)
+        if input_dtype == "bfloat16"
+        else np.dtype(input_dtype)
+    )
+    if input_dtype == "int8":
+        left = (np.arange(16 * 13).reshape(16, 13) % 11 - 5).astype(input_np_dtype)
+        right = (np.arange(13 * 16).reshape(13, 16) % 7 - 3).astype(input_np_dtype)
+        bias = np.arange(16, dtype=np.int32) - 8
+    else:
+        left = ((np.arange(16 * 13, dtype=np.float32).reshape(16, 13) - 50) / 32).astype(
+            input_np_dtype
+        )
+        right = ((np.arange(13 * 16, dtype=np.float32).reshape(13, 16) - 70) / 64).astype(
+            input_np_dtype
+        )
+        bias = np.linspace(-2, 2, 16, dtype=np.float32)
     simulator = FunctionalSimulator(program)
     simulator.write(mma.metadata["lhs"], pack_matrix(left, "l0a"))
     simulator.write(mma.metadata["rhs"], pack_matrix(right, "l0b"))
     simulator.write(copy_bias.metadata["src"], bias)
     simulator.run()
 
-    expected = left.astype(np.float32) @ right.astype(np.float32) + bias
+    compute_dtype = np.int32 if input_dtype == "int8" else np.float32
+    expected = left.astype(compute_dtype) @ right.astype(compute_dtype) + bias
     np.testing.assert_allclose(
         unpack_matrix(simulator.read(mma.metadata["dst"]), "l0c", (16, 16)),
         expected,
