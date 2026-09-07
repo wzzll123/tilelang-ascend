@@ -30,6 +30,7 @@ class SyncDecision:
     ready_cycle: Optional[int] = 0
     reason: Optional[str] = None
     detail: str = ""
+    producer_task_ids: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.ready_cycle is not None and self.ready_cycle < 0:
@@ -239,9 +240,9 @@ class FlagBarrierSynchronizationModel:
     })
 
     def __init__(self) -> None:
-        self._tokens: Dict[FlagKey, Deque[int]] = defaultdict(deque)
+        self._tokens: Dict[FlagKey, Deque[Tuple[int, str]]] = defaultdict(deque)
         self._collective_ready: Dict[
-            CollectiveKey, Dict[Participant, list[int]]
+            CollectiveKey, Dict[Participant, list[Tuple[int, str]]]
         ] = defaultdict(lambda: defaultdict(list))
         self._collective_wait_phase: Dict[
             Tuple[CollectiveKey, Participant], int
@@ -387,9 +388,10 @@ class FlagBarrierSynchronizationModel:
                     detail=self._format_flag_key(key),
                 )
             return SyncDecision(
-                ready_cycle=max(ordering_cycle, tokens[0]),
+                ready_cycle=max(ordering_cycle, tokens[0][0]),
                 reason="local flag",
                 detail=self._format_flag_key(key),
+                producer_task_ids=(tokens[0][1],),
             )
 
         if operation in self._WAIT_CROSS:
@@ -416,10 +418,11 @@ class FlagBarrierSynchronizationModel:
             return SyncDecision(
                 ready_cycle=max(
                     ordering_cycle,
-                    max(self._tokens[key][0] for key in keys),
+                    max(self._tokens[key][0][0] for key in keys),
                 ),
                 reason="cross flag",
                 detail="; ".join(self._format_flag_key(key) for key in keys),
+                producer_task_ids=tuple(self._tokens[key][0][1] for key in keys),
             )
 
         if operation in self._BARRIER_ALL or operation in self._PIPE_BARRIER:
@@ -450,11 +453,11 @@ class FlagBarrierSynchronizationModel:
                     f"set task {task.task_id!r} reused an outstanding "
                     f"{self._format_flag_key(key)}"
                 )
-            self._tokens[key].append(record.end_cycle)
+            self._tokens[key].append((record.end_cycle, task.task_id))
         elif operation in self._SET_CROSS:
             mode = self._cross_mode(task)
             if mode in {0, 1}:
-                self._on_collective_set(task, mode, record.end_cycle)
+                self._on_collective_set(task, mode, record)
             else:
                 for key in self._cross_set_keys_mode2(task):
                     tokens = self._tokens[key]
@@ -464,7 +467,7 @@ class FlagBarrierSynchronizationModel:
                             f"{self._format_flag_key(key)} at "
                             f"{_MAX_CROSS_FLAG_CREDITS} outstanding credits"
                         )
-                    tokens.append(record.end_cycle)
+                    tokens.append((record.end_cycle, task.task_id))
         elif operation in self._WAIT_LOCAL:
             key = self._local_flag_key(task)
             tokens = self._tokens.get(key)
@@ -565,13 +568,18 @@ class FlagBarrierSynchronizationModel:
         return SyncDecision(
             ready_cycle=max(
                 ordering_cycle,
-                max(ready[participant][phase] for participant in expected),
+                max(ready[participant][phase][0] for participant in expected),
             ),
             reason="cross flag",
             detail=f"mode={mode} id={self._flag_id(task)} phase={phase}",
+            producer_task_ids=tuple(
+                ready[participant][phase][1] for participant in expected
+            ),
         )
 
-    def _on_collective_set(self, task: Task, mode: int, end_cycle: int) -> None:
+    def _on_collective_set(
+        self, task: Task, mode: int, record: ExecutionRecord
+    ) -> None:
         key = self._collective_key(task, mode)
         producer = self._participant(task)
         expected = self._collective_participants(key)
@@ -590,7 +598,7 @@ class FlagBarrierSynchronizationModel:
                 f"id={self._flag_id(task)} for {self._format_participant(producer)} "
                 f"at {_MAX_CROSS_FLAG_CREDITS} outstanding phases"
             )
-        ready.append(end_cycle)
+        ready.append((record.end_cycle, task.task_id))
 
     def _collective_key(self, task: Task, mode: int) -> CollectiveKey:
         lane_kind = self._lane_kind(task)

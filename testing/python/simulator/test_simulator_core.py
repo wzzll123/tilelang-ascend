@@ -175,3 +175,21 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.task_count == 0
     assert stats.to_dict()["utilization_by_resource"] == {}
     assert stats.to_dict()["operation_counts"] == {}
+
+
+def test_trace_exports_matched_flag_flow() -> None:
+    records = (
+        ExecutionRecord("set", "set_flag", 0, Lane.CUBE, Pipe.MTE2, 0, 3),
+        ExecutionRecord(
+            "wait", "wait_flag", 0, Lane.CUBE, Pipe.MTE1, 3, 4,
+            metadata={"sync_producers": ("set",)},
+        ),
+    )
+
+    trace = ChromeTraceExporter("A3", "uncalibrated-unit-cost").to_dict(records)
+    flows = [
+        event for event in trace["traceEvents"]
+        if event.get("name") == "flag_dependency"
+    ]
+    assert [(event["ph"], event["ts"]) for event in flows] == [("s", 3), ("f", 3)]
+    assert all(event["args"] == {"from": "set", "to": "wait"} for event in flows)

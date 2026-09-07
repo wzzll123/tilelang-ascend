@@ -119,7 +119,13 @@ class DiscreteEventScheduler:
                         f"exceeding max_cycles={config.max_cycles}"
                     )
 
-                record = ExecutionRecord.from_task(task, start_cycle, end_cycle)
+                record = ExecutionRecord.from_task(
+                    task,
+                    start_cycle,
+                    end_cycle,
+                    metadata={"sync_producers": decision.producer_task_ids}
+                    if decision.producer_task_ids else None,
+                )
                 completed[task.task_id] = record
                 records.append(record)
                 pending.remove(task.task_id)

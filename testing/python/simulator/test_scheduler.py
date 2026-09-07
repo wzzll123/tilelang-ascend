@@ -132,6 +132,7 @@ def test_local_flag_wait_starts_when_set_completes_and_consumes_token() -> None:
     records = {record.task_id: record for record in result.records}
 
     assert records["wait"].start_cycle == records["set"].end_cycle
+    assert records["wait"].metadata["sync_producers"] == ("set",)
     assert result.stats.wait_cycles_by_reason == {"local flag": 1}
 
 

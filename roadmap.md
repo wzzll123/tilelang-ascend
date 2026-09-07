@@ -703,7 +703,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~提供 overlap-aware makespan、pipe utilization、wait cycles 和 core completion
   统计。~~
 - [x] ~~输出 memory dependency flow events。~~
-- [ ] 输出 flag flow events、queue depth、live local-memory 和 active-core counter。
+- [x] ~~输出 local 与 cross mode 0/1/2 flag flow events。~~
+- [ ] 输出 queue depth、live local-memory 和 active-core counter。
 - [x] ~~统计 operation counts。~~
 - [ ] 统计各 memory path bytes、peak local-memory 和 hazard counts。
 - [ ] 标记 critical path、load imbalance、copy/compute overlap 和主要 stall 原因。
