@@ -81,6 +81,33 @@ def test_poison_tracking_is_independent_of_byte_value_and_policy() -> None:
     assert warning_runtime.reporter.diagnostics[0].kind == "read-before-write"
 
 
+def test_local_memory_high_watermark_is_per_scope_max_not_core_sum() -> None:
+    memory = MemoryRuntime((0, 1), hazard_check="off")
+    memory.allocate(
+        BufferSpec("ub0-a", MemoryScope.UB, (16,), "uint8"),
+        core_id=0,
+        address=0,
+    )
+    memory.allocate(
+        BufferSpec("ub0-b", MemoryScope.UB, (16,), "uint8"),
+        core_id=0,
+        address=32,
+    )
+    memory.allocate(
+        BufferSpec("ub1", MemoryScope.UB, (64,), "uint8"),
+        core_id=1,
+        address=0,
+    )
+    memory.allocate(
+        BufferSpec("l1", MemoryScope.L1, (32,), "uint8"),
+        core_id=0,
+        address=16,
+    )
+    memory.allocate(BufferSpec("gm", MemoryScope.GM, (1024,), "uint8"))
+
+    assert memory.local_memory_high_watermark_bytes == {"ub": 64, "l1": 48}
+
+
 def test_partial_write_and_absolute_address_range() -> None:
     allocation = MemoryRuntime((0,)).allocate(
         BufferSpec("gm", MemoryScope.GM, (16,), "uint8"), address=128

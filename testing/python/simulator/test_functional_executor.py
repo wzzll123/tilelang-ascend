@@ -82,6 +82,7 @@ def test_gm_ub_vector_add_gm_with_two_aiv_cores_and_tail() -> None:
 
     np.testing.assert_array_equal(simulator.read(whole_out), x + y)
     assert result.schedule.stats.makespan_cycles == 15
+    assert result.schedule.stats.peak_local_memory_bytes_by_scope["ub"] == 120
     assert {record.core_id for record in result.schedule.records} == {0, 1}
 
 

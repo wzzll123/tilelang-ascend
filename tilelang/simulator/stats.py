@@ -88,6 +88,7 @@ class SimulationStats:
     operation_counts: Mapping[str, int]
     memory_bytes_by_path: Mapping[str, int]
     hazard_counts: Mapping[str, int]
+    peak_local_memory_bytes_by_scope: Mapping[str, int]
     load_imbalance_cycles: int
 
     @classmethod
@@ -97,6 +98,7 @@ class SimulationStats:
         *,
         bindings: Optional[Mapping[str, int | float]] = None,
         hazard_diagnostics: Iterable[HazardDiagnostic] = (),
+        local_memory_high_watermark_bytes: Optional[Mapping[str, int]] = None,
     ) -> "SimulationStats":
         """Compute overlap-aware resource utilization and simple stall totals."""
         runtime_bindings = bindings or {}
@@ -116,6 +118,9 @@ class SimulationStats:
                 operation_counts=empty,
                 memory_bytes_by_path=empty,
                 hazard_counts=MappingProxyType(hazard_counts),
+                peak_local_memory_bytes_by_scope=MappingProxyType(
+                    dict(local_memory_high_watermark_bytes or {})
+                ),
                 load_imbalance_cycles=0,
             )
 
@@ -168,6 +173,9 @@ class SimulationStats:
             operation_counts=MappingProxyType(operation_counts),
             memory_bytes_by_path=MappingProxyType(memory_bytes),
             hazard_counts=MappingProxyType(hazard_counts),
+            peak_local_memory_bytes_by_scope=MappingProxyType(
+                dict(local_memory_high_watermark_bytes or {})
+            ),
             load_imbalance_cycles=(
                 max(completion_values) - min(completion_values)
                 if completion_values else 0
@@ -186,5 +194,8 @@ class SimulationStats:
             "operation_counts": dict(self.operation_counts),
             "memory_bytes_by_path": dict(self.memory_bytes_by_path),
             "hazard_counts": dict(self.hazard_counts),
+            "peak_local_memory_bytes_by_scope": dict(
+                self.peak_local_memory_bytes_by_scope
+            ),
             "load_imbalance_cycles": self.load_imbalance_cycles,
         }

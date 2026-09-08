@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from itertools import product
 from numbers import Integral
 import re
+from types import MappingProxyType
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 from .errors import (
@@ -407,6 +408,21 @@ class MemoryRuntime:
         if core_id not in self.core_ids:
             raise ProgramValidationError(f"core_id {core_id} is not part of this runtime")
         return self._vector1_owner_offset + core_id
+
+    @property
+    def local_memory_high_watermark_bytes(self) -> Mapping[str, int]:
+        """Return the maximum resident address-space size for each local scope.
+
+        Local memories are private to a hardware owner, so usage is the maximum
+        high watermark across owners rather than their sum. The address-space
+        backing already reflects planned aliases, reuse, alignment, and holes.
+        """
+        usage: Dict[str, int] = {}
+        for (scope, owner), backing in self._address_spaces.items():
+            if scope in _SHARED_SCOPES or owner is None:
+                continue
+            usage[scope.value] = max(usage.get(scope.value, 0), len(backing.data))
+        return MappingProxyType(usage)
 
 
 def _concrete_shape(shape: Sequence[object]) -> Tuple[int, ...]:

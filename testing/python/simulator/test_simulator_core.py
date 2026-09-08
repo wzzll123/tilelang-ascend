@@ -194,6 +194,7 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.to_dict()["operation_counts"] == {}
     assert stats.to_dict()["memory_bytes_by_path"] == {}
     assert stats.to_dict()["hazard_counts"] == {}
+    assert stats.to_dict()["peak_local_memory_bytes_by_scope"] == {}
     assert stats.to_dict()["load_imbalance_cycles"] == 0
 
 

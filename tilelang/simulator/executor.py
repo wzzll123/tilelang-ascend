@@ -212,6 +212,9 @@ class FunctionalSimulator:
                 schedule.records,
                 bindings=self.bindings,
                 hazard_diagnostics=self.memory.reporter.diagnostics,
+                local_memory_high_watermark_bytes=(
+                    self.memory.local_memory_high_watermark_bytes
+                ),
             ),
         )
         return FunctionalExecutionResult(schedule=schedule, memory=self.memory)
