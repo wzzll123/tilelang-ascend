@@ -14,6 +14,7 @@ from tilelang.simulator import (
     ChromeTraceExporter,
     CoreProgram,
     ExecutionRecord,
+    HazardDiagnostic,
     KernelProgram,
     Lane,
     MemoryScope,
@@ -192,6 +193,7 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.to_dict()["utilization_by_resource"] == {}
     assert stats.to_dict()["operation_counts"] == {}
     assert stats.to_dict()["memory_bytes_by_path"] == {}
+    assert stats.to_dict()["hazard_counts"] == {}
     assert stats.to_dict()["load_imbalance_cycles"] == 0
 
 
@@ -224,6 +226,21 @@ def test_stats_do_not_count_vector_operand_bytes_as_memory_transfer() -> None:
     )
 
     assert SimulationStats.from_records((record,)).memory_bytes_by_path == {}
+
+
+def test_stats_count_hazard_diagnostics_by_kind() -> None:
+    diagnostics = (
+        HazardDiagnostic("read-before-write", "first"),
+        HazardDiagnostic("read-before-write", "second"),
+        HazardDiagnostic("overlapping-allocation", "third"),
+    )
+
+    stats = SimulationStats.from_records((), hazard_diagnostics=diagnostics)
+
+    assert stats.hazard_counts == {
+        "read-before-write": 2,
+        "overlapping-allocation": 1,
+    }
 
 
 def test_trace_exports_matched_flag_flow() -> None:

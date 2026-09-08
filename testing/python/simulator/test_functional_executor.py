@@ -16,6 +16,7 @@ from tilelang.simulator import (
     MemoryScope,
     Pipe,
     ProgramValidationError,
+    SimulatorConfig,
     SymbolicInt,
     Task,
     UninitializedMemoryError,
@@ -433,3 +434,30 @@ def test_symbolic_integer_division_matches_tir_floor_and_truncation() -> None:
     assert SymbolicInt("truncmod", (value, 3)).evaluate({"value": -5}) == -2
     with pytest.raises(ProgramValidationError, match="division by zero"):
         SymbolicInt("floordiv", (value, 0)).evaluate({"value": 1})
+
+
+def test_warn_mode_exposes_functional_hazard_counts_in_stats() -> None:
+    source = BufferRegion("source", MemoryScope.GM, (4,), "float32")
+    destination = BufferRegion("destination", MemoryScope.GM, (4,), "float32")
+    program = KernelProgram(
+        "hazard-stats",
+        "A2",
+        (CoreProgram(0, (
+            Task(
+                "copy", "copy_gm_to_gm", 0, Lane.VECTOR_0, Pipe.MTE2, 1,
+                metadata={"src": source, "dst": destination},
+            ),
+        )),),
+        buffers=(
+            BufferSpec("source", MemoryScope.GM, (4,), "float32"),
+            BufferSpec("destination", MemoryScope.GM, (4,), "float32"),
+        ),
+    )
+    simulator = FunctionalSimulator(
+        program, SimulatorConfig(platform="A2", hazard_check="warn")
+    )
+
+    with pytest.warns(RuntimeWarning, match="read-before-write"):
+        result = simulator.run()
+
+    assert result.schedule.stats.hazard_counts == {"read-before-write": 1}

@@ -20,6 +20,7 @@ from .program import (
     Task,
 )
 from .scheduler import DiscreteEventScheduler, ScheduleResult
+from .stats import SimulationStats
 from .sync import FlagBarrierSynchronizationModel
 
 # Row-wise broadcast binary experiment ops: dst row i = src0 row i op scalar_i.
@@ -205,6 +206,14 @@ class FunctionalSimulator:
                 self._execute(task)
             finally:
                 self._active_lane = None
+        schedule = replace(
+            schedule,
+            stats=SimulationStats.from_records(
+                schedule.records,
+                bindings=self.bindings,
+                hazard_diagnostics=self.memory.reporter.diagnostics,
+            ),
+        )
         return FunctionalExecutionResult(schedule=schedule, memory=self.memory)
 
     def _execute(self, task: Task) -> None:

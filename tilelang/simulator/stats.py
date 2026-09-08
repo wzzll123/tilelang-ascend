@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .errors import ProgramValidationError
+from .hazard import HazardDiagnostic
 from .memory import dtype_size_bytes
 from .program import AffineInt, BufferRegion, SymbolicInt
 from .trace import ExecutionRecord
@@ -86,6 +87,7 @@ class SimulationStats:
     completion_cycle_by_core: Mapping[int, int]
     operation_counts: Mapping[str, int]
     memory_bytes_by_path: Mapping[str, int]
+    hazard_counts: Mapping[str, int]
     load_imbalance_cycles: int
 
     @classmethod
@@ -94,13 +96,28 @@ class SimulationStats:
         records: Iterable[ExecutionRecord],
         *,
         bindings: Optional[Mapping[str, int | float]] = None,
+        hazard_diagnostics: Iterable[HazardDiagnostic] = (),
     ) -> "SimulationStats":
         """Compute overlap-aware resource utilization and simple stall totals."""
         runtime_bindings = bindings or {}
         record_list = list(records)
         if not record_list:
             empty = MappingProxyType({})
-            return cls(0, 0, empty, empty, empty, empty, empty, empty, 0)
+            hazard_counts: Dict[str, int] = {}
+            for diagnostic in hazard_diagnostics:
+                hazard_counts[diagnostic.kind] = hazard_counts.get(diagnostic.kind, 0) + 1
+            return cls(
+                makespan_cycles=0,
+                task_count=0,
+                busy_cycles_by_resource=empty,
+                utilization_by_resource=empty,
+                wait_cycles_by_reason=empty,
+                completion_cycle_by_core=empty,
+                operation_counts=empty,
+                memory_bytes_by_path=empty,
+                hazard_counts=MappingProxyType(hazard_counts),
+                load_imbalance_cycles=0,
+            )
 
         makespan = max(record.end_cycle for record in record_list)
         intervals: Dict[str, List[Tuple[int, int]]] = {}
@@ -108,6 +125,9 @@ class SimulationStats:
         completion: Dict[int, int] = {}
         operation_counts: Dict[str, int] = {}
         memory_bytes: Dict[str, int] = {}
+        hazard_counts: Dict[str, int] = {}
+        for diagnostic in hazard_diagnostics:
+            hazard_counts[diagnostic.kind] = hazard_counts.get(diagnostic.kind, 0) + 1
         for record in record_list:
             resource = f"core-{record.core_id}/{record.resource}"
             intervals.setdefault(resource, []).append((record.start_cycle, record.end_cycle))
@@ -147,6 +167,7 @@ class SimulationStats:
             completion_cycle_by_core=MappingProxyType(completion),
             operation_counts=MappingProxyType(operation_counts),
             memory_bytes_by_path=MappingProxyType(memory_bytes),
+            hazard_counts=MappingProxyType(hazard_counts),
             load_imbalance_cycles=(
                 max(completion_values) - min(completion_values)
                 if completion_values else 0
@@ -164,5 +185,6 @@ class SimulationStats:
             "completion_cycle_by_core": dict(self.completion_cycle_by_core),
             "operation_counts": dict(self.operation_counts),
             "memory_bytes_by_path": dict(self.memory_bytes_by_path),
+            "hazard_counts": dict(self.hazard_counts),
             "load_imbalance_cycles": self.load_imbalance_cycles,
         }
