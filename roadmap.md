@@ -378,7 +378,7 @@ TILELANG_LIBRARY_PATH="$PWD/build" \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `519 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `571 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。本地 CPU 已能运行 simulator lowering/JIT；NPU codegen 和真机
 交叉验证仍需要 Linux+CANN，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -455,6 +455,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   fp16 每行 128 元素，覆盖多行、in-place、column offset、physical stride、A2/A3、
   dtype/extent/alignment/cross-row 错误路径和实际语言层 final TIR。~~
 - [x] ~~补齐 GM↔UB copy 的 symbolic affine runtime extent 和动态 element offset。~~
+- [x] ~~修正高维 GM slice 的二维 copy footprint：GM↔UB 与 GM→L1 使用 lowering
+  intrinsic 携带的物理行步长，而不是误用逻辑 buffer 的最后一维；GQA/FA 的跨行
+  poison 与 read-before-write 检查现在覆盖真实地址。~~
 - [x] ~~实现完整物理 destination view 的 GM→UB literal pad 写入，并对越界 slice
   禁用 pad。~~
 - [x] ~~实现上述白名单内的非仿射 runtime region，并用真实 TIR 覆盖
@@ -466,6 +469,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   dependency 语义。~~
 - [x] ~~实现 createvecindex/arith_progression 的 offset、常用 dtype、runtime
   first/difference/count、wraparound、dependency 和 template dtype 验证。~~
+- [x] ~~支持 `CreateVecIndex` 中由整数运行时表达式转换到浮点 first value 的 TIR
+  `Cast`，覆盖 GQA causal mask 的 loop-var affine 起点。~~
 - [x] ~~实现 bitwise AND/OR/XOR/NOT 与 scalar left/right shift 的 offset、count、
   int16/int32/uint16/uint32 定宽语义、scratch dependency 和 shift 范围验证。~~
 - [x] ~~实现 leaky_relu 和 in-place accumulator 语义的 axpy。~~
@@ -711,7 +716,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~输出 active-core counter（同 core 多 pipe overlap 去重，wait 不计为 active）。~~
 - [ ] 输出 queue depth 和 live local-memory。
 - [x] ~~统计 operation counts。~~
-- [ ] 统计各 memory path bytes、peak local-memory 和 hazard counts。
+- [x] ~~统计各 memory path 的静态 logical payload bytes；优先使用 lowering 提供的
+  `transfer_bytes`，否则从 destination region 推导，动态未绑定值明确跳过。~~
+- [ ] 统计 peak local-memory 和 hazard counts，并为 runtime bindings 补动态 path bytes。
 - [x] ~~统计 active cores 的 completion spread（`load_imbalance_cycles`）。~~
 - [ ] 标记 critical path、copy/compute overlap 和主要 stall 原因。
 - [x] ~~增加 trace schema/version 回归测试。~~
@@ -754,7 +761,7 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前 simulator 核心测试基线：527 passed，覆盖 memory、scheduler、sync、trace、
+- [x] ~~当前 simulator 核心测试基线：571 passed，覆盖 memory、scheduler、sync、trace、
   functional executor、真实 TIR bridge、跨 pipe 同步 hazard 和 shmem rejection；另有
   2 个依赖 native module 的 JIT 集成测试文件，覆盖自动同步回滚以及 FA 使用的二维
   row broadcast/runtime float scalar。~~

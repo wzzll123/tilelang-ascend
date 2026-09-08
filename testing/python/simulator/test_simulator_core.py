@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from tilelang.simulator import (
+    AffineInt,
+    BufferRegion,
     BufferSpec,
     ChromeTraceExporter,
     CoreProgram,
@@ -110,14 +112,20 @@ def test_kernel_program_rejects_cycles_and_invalid_lane_pipe_pair() -> None:
 
 
 def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
+    gm = BufferRegion("input", MemoryScope.GM, (1024,), "float32")
+    l1 = BufferRegion("tile", MemoryScope.L1, (1024,), "float32", core_id=0)
     records = [
         ExecutionRecord(
             "load-0", "copy_gm_to_l1", 0, Lane.CUBE, Pipe.MTE2, 0, 10,
-            metadata={"bytes": 4096},
+            metadata={"bytes": 4096, "src": gm, "dst": l1},
         ),
         ExecutionRecord(
             "load-1", "copy_gm_to_l1", 0, Lane.CUBE, Pipe.MTE2, 5, 15,
-            metadata={"memory_dependencies": ("load-0",)},
+            metadata={
+                "memory_dependencies": ("load-0",),
+                "src": gm,
+                "dst": l1,
+            },
         ),
         ExecutionRecord(
             "mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 10, 30,
@@ -139,6 +147,7 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     assert stats.operation_counts == {
         "copy_gm_to_l1": 2, "mma": 1, "wait_flag": 1,
     }
+    assert stats.memory_bytes_by_path == {"gm->l1": 8192}
     assert stats.load_imbalance_cycles == 18
 
     trace_path = ChromeTraceExporter("A2", "uncalibrated-unit-cost").write(
@@ -182,7 +191,36 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.task_count == 0
     assert stats.to_dict()["utilization_by_resource"] == {}
     assert stats.to_dict()["operation_counts"] == {}
+    assert stats.to_dict()["memory_bytes_by_path"] == {}
     assert stats.to_dict()["load_imbalance_cycles"] == 0
+
+
+def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:
+    dynamic = AffineInt.variable("count")
+    records = (
+        ExecutionRecord(
+            "dynamic-copy", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 0, 1,
+            metadata={
+                "src": BufferRegion("input", MemoryScope.GM, (dynamic,), "float16"),
+                "dst": BufferRegion(
+                    "tile", MemoryScope.UB, (dynamic,), "float16", core_id=0
+                ),
+            },
+        ),
+    )
+
+    assert SimulationStats.from_records(records).memory_bytes_by_path == {}
+
+
+def test_stats_do_not_count_vector_operand_bytes_as_memory_transfer() -> None:
+    source = BufferRegion("lhs", MemoryScope.UB, (64,), "float32", core_id=0)
+    destination = BufferRegion("out", MemoryScope.UB, (64,), "float32", core_id=0)
+    record = ExecutionRecord(
+        "add", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 0, 1,
+        metadata={"src": source, "dst": destination},
+    )
+
+    assert SimulationStats.from_records((record,)).memory_bytes_by_path == {}
 
 
 def test_trace_exports_matched_flag_flow() -> None:

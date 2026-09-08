@@ -3,9 +3,12 @@
 """Basic schedule statistics derived from simulator execution records."""
 
 from dataclasses import dataclass
+from numbers import Integral
 from types import MappingProxyType
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .memory import dtype_size_bytes
+from .program import BufferRegion
 from .trace import ExecutionRecord
 
 
@@ -24,6 +27,35 @@ def _union_length(intervals: Sequence[Tuple[int, int]]) -> int:
     return total + current_end - current_start
 
 
+def _static_region_nbytes(region: BufferRegion) -> Optional[int]:
+    """Return logical payload bytes when every region extent is static."""
+    elements = 1
+    for extent in region.shape:
+        if not isinstance(extent, Integral) or isinstance(extent, bool):
+            return None
+        elements *= int(extent)
+    return elements * dtype_size_bytes(region.dtype)
+
+
+def _memory_path(metadata: Mapping[str, Any]) -> Optional[str]:
+    source = metadata.get("src")
+    destination = metadata.get("dst")
+    if not isinstance(source, BufferRegion) or not isinstance(destination, BufferRegion):
+        return None
+    return f"{source.scope.value}->{destination.scope.value}"
+
+
+def _transfer_bytes(metadata: Mapping[str, Any]) -> Optional[int]:
+    """Resolve a task's logical transfer size without guessing dynamic values."""
+    explicit = metadata.get("transfer_bytes", metadata.get("bytes"))
+    if isinstance(explicit, Integral) and not isinstance(explicit, bool):
+        return int(explicit)
+    destination = metadata.get("dst")
+    if isinstance(destination, BufferRegion):
+        return _static_region_nbytes(destination)
+    return None
+
+
 @dataclass(frozen=True)
 class SimulationStats:
     """Summary metrics for comparing simulator schedules."""
@@ -35,6 +67,7 @@ class SimulationStats:
     wait_cycles_by_reason: Mapping[str, int]
     completion_cycle_by_core: Mapping[int, int]
     operation_counts: Mapping[str, int]
+    memory_bytes_by_path: Mapping[str, int]
     load_imbalance_cycles: int
 
     @classmethod
@@ -43,13 +76,14 @@ class SimulationStats:
         record_list = list(records)
         if not record_list:
             empty = MappingProxyType({})
-            return cls(0, 0, empty, empty, empty, empty, empty, 0)
+            return cls(0, 0, empty, empty, empty, empty, empty, empty, 0)
 
         makespan = max(record.end_cycle for record in record_list)
         intervals: Dict[str, List[Tuple[int, int]]] = {}
         waits: Dict[str, int] = {}
         completion: Dict[int, int] = {}
         operation_counts: Dict[str, int] = {}
+        memory_bytes: Dict[str, int] = {}
         for record in record_list:
             resource = f"core-{record.core_id}/{record.resource}"
             intervals.setdefault(resource, []).append((record.start_cycle, record.end_cycle))
@@ -59,6 +93,13 @@ class SimulationStats:
             operation_counts[record.operation] = (
                 operation_counts.get(record.operation, 0) + 1
             )
+            path = (
+                _memory_path(record.metadata)
+                if record.operation.startswith("copy_") else None
+            )
+            transferred = _transfer_bytes(record.metadata) if path is not None else None
+            if path is not None and transferred is not None:
+                memory_bytes[path] = memory_bytes.get(path, 0) + transferred
             if record.stall_reason is not None:
                 waits[record.stall_reason] = (
                     waits.get(record.stall_reason, 0) + record.duration_cycles
@@ -78,6 +119,7 @@ class SimulationStats:
             wait_cycles_by_reason=MappingProxyType(waits),
             completion_cycle_by_core=MappingProxyType(completion),
             operation_counts=MappingProxyType(operation_counts),
+            memory_bytes_by_path=MappingProxyType(memory_bytes),
             load_imbalance_cycles=(
                 max(completion_values) - min(completion_values)
                 if completion_values else 0
@@ -94,5 +136,6 @@ class SimulationStats:
             "wait_cycles_by_reason": dict(self.wait_cycles_by_reason),
             "completion_cycle_by_core": dict(self.completion_cycle_by_core),
             "operation_counts": dict(self.operation_counts),
+            "memory_bytes_by_path": dict(self.memory_bytes_by_path),
             "load_imbalance_cycles": self.load_imbalance_cycles,
         }
