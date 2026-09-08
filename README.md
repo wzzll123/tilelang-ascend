@@ -47,7 +47,7 @@ Supported areas include:
 - FP16, BF16, FP32, and common integer data paths;
 - Flash Attention and explicit im2col convolution execution.
 
-The simulator is a functional and debugging model, not a cycle-accurate performance model. SHMEM is intentionally outside the current scope.
+The simulator is a functional and debugging model, not a cycle-accurate performance model. SHMEM is not supported in the current implementation, but remains a long-term roadmap item for distributed memory, communication, synchronization, and trace modeling.
 
 See [roadmap.md](./roadmap.md) for the detailed coverage matrix, completed work, validation cases, known limitations, and remaining tasks.
 
@@ -113,3 +113,11 @@ Each contribution is paired with an issue that documents the observed failure, e
 - simulator fidelity for compiler-generated TIR;
 - synchronization, memory-layout, tail-tile, Cube, fixpipe, and convolution correctness;
 - converting real operator failures into upstream compiler improvements.
+
+## Long-term roadmap
+
+- SHMEM put/get and symmetric-memory semantics;
+- cross-core and cross-device communication ordering;
+- SHMEM-aware memory hazards, synchronization deadlocks, and trace flows;
+- communication/computation overlap and topology-aware timing calibration;
+- multi-device functional examples and differential validation against real A2/A3 systems.

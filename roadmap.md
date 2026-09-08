@@ -2,8 +2,9 @@
 
 更新时间：2026-09-05
 
-本路线图只覆盖 Ascend A2/A3（C220）。`shmem` 永久不支持，也不列为待办项；任何
-shmem scope 或 intrinsic 都必须 fail fast。详细设计和验收原则见
+本路线图当前主线只覆盖 Ascend A2/A3（C220）的单设备功能语义。`shmem` 在当前版本
+仍必须 fail fast，禁止以空操作或近似语义静默执行；但 SHMEM 是长期 roadmap，待单设备
+执行、同步和 trace 模型稳定后，再分阶段实现。详细设计和验收原则见
 [`docs/a2_a3_simulator_design.md`](docs/a2_a3_simulator_design.md)。
 
 说明：只有已经实现并通过测试的事项才使用删除线。部分完成的阶段会拆成已完成和
@@ -87,7 +88,8 @@ bridge 必须 fail-closed：无法确定 operation、scope、shape、offset、la
 
 ### 不可破坏的语义约束
 
-- `shmem` 永久不支持；不要实现空操作或近似替代。
+- `shmem` 当前不支持，所有相关 scope/intrinsic 必须 fail fast；长期实现前不得使用空操作
+  或近似替代掩盖能力缺口。
 - GM/workspace 在 core 间共享；L1/L0/UB/BT/LOCAL 必须逐 core 隔离。
 - storage rewrite 后的 byte address、lifetime 和 alias 是内存真相，buffer 名只用于诊断。
 - 读取未写入 byte 必须触发 poison/hazard；值恰好为 `0xff` 不能代表未初始化。
@@ -725,6 +727,29 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [ ] 用 held-out kernels 报告绝对误差、排序相关性和误差区间。
 - [ ] 在性能模型通过验证门槛前，禁止把模拟 cycle 当作真实 latency 或 autotuner
   objective。
+
+## P9：SHMEM 长期路线
+
+SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前，现有 bridge 和 executor
+继续对 SHMEM scope/intrinsic fail fast，避免错误地把通信当作普通 GM copy。长期按以下
+顺序推进：
+
+- [ ] 收集 TileLang SHMEM frontend、lowered TIR、Ascend SHMEM runtime 以及 A2/A3 真机
+  行为，固化 put/get、symmetric memory、PE、team 和 completion 的准确 contract。
+- [ ] 建立多 PE 地址空间与 symmetric allocation 模型，区分本地 GM、远端 GM、workspace
+  和通信可见性。
+- [ ] 实现 blocking/non-blocking put/get、fence、quiet、barrier 和 completion ordering，
+  并为非法 PE、越界、生命周期错误和未完成通信 fail fast。
+- [ ] 将 SHMEM communication event 纳入 scheduler dependency DAG，与 DMA、Vector、Cube
+  及跨核 flag 共同检查 RAW/WAR/WAW 和同步协议。
+- [ ] 扩展 deadlock 报告，展示等待 PE、team、通信句柄、memory region、producer 和
+  source span。
+- [ ] 扩展 Perfetto trace，输出跨 PE flow、传输 bytes、队列深度、通信/计算 overlap 和
+  critical path。
+- [ ] 增加 CPU-only 多 PE 功能回归，覆盖环形通信、all-to-all 风格交换、producer-consumer、
+  contention、非对齐/tail 以及错误同步。
+- [ ] 在 A2/A3 多设备环境做 differential validation；在获得可靠测量前，不将模拟通信
+  cycle 用作真实性能结论或 autotuning objective。
 
 ## 测试与交付门槛
 
