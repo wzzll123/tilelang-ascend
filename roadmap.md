@@ -714,7 +714,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~输出 memory dependency flow events。~~
 - [x] ~~输出 local 与 cross mode 0/1/2 flag flow events。~~
 - [x] ~~输出 active-core counter（同 core 多 pipe overlap 去重，wait 不计为 active）。~~
-- [ ] 输出 queue depth 和 live local-memory。
+- [x] ~~输出逐 `(core, lane, pipe)` FIFO queue depth：仅统计依赖/同步已满足、但资源仍
+  忙的等待区间，并与 flag/barrier stall 分离。~~
+- [ ] 输出随执行时间变化的 live local-memory。
 - [x] ~~统计 operation counts。~~
 - [x] ~~统计各 memory path 的静态 logical payload bytes；优先使用 lowering 提供的
   `transfer_bytes`，否则从 destination region 推导；传入 runtime bindings 时支持动态

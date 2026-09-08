@@ -81,7 +81,8 @@ class DiscreteEventScheduler:
             for task in tasks:
                 if task.task_id not in pending:
                     continue
-                required = set(task.dependencies)
+                dependency_required = set(task.dependencies)
+                required = set(dependency_required)
                 predecessor = fifo_predecessor.get(task.task_id)
                 if predecessor is not None:
                     required.add(predecessor)
@@ -98,18 +99,24 @@ class DiscreteEventScheduler:
                     continue
 
                 dependency_cycle = max(
-                    (completed[task_id].end_cycle for task_id in required), default=0
+                    (completed[task_id].end_cycle for task_id in dependency_required),
+                    default=0,
                 )
-                start_cycle = max(dependency_cycle, decision.ready_cycle or 0)
-                if start_cycle > dependency_cycle:
+                resource_cycle = (
+                    completed[predecessor].end_cycle if predecessor is not None else 0
+                )
+                synchronization_cycle = decision.ready_cycle or 0
+                ready_cycle = max(dependency_cycle, synchronization_cycle)
+                start_cycle = max(ready_cycle, resource_cycle)
+                if synchronization_cycle > max(dependency_cycle, resource_cycle):
                     records.append(ExecutionRecord(
                         task_id=f"{task.task_id}#wait",
                         operation="wait",
                         core_id=task.core_id,
                         lane=task.lane,
                         pipe=task.pipe,
-                        start_cycle=dependency_cycle,
-                        end_cycle=start_cycle,
+                        start_cycle=max(dependency_cycle, resource_cycle),
+                        end_cycle=synchronization_cycle,
                         category="wait",
                         stall_reason=decision.reason or "synchronization",
                         metadata={
@@ -124,12 +131,16 @@ class DiscreteEventScheduler:
                         f"exceeding max_cycles={config.max_cycles}"
                     )
 
+                trace_metadata = {}
+                if decision.producer_task_ids:
+                    trace_metadata["sync_producers"] = decision.producer_task_ids
+                if start_cycle > ready_cycle:
+                    trace_metadata["queue_enter_cycle"] = ready_cycle
                 record = ExecutionRecord.from_task(
                     task,
                     start_cycle,
                     end_cycle,
-                    metadata={"sync_producers": decision.producer_task_ids}
-                    if decision.producer_task_ids else None,
+                    metadata=trace_metadata or None,
                 )
                 completed[task.task_id] = record
                 records.append(record)

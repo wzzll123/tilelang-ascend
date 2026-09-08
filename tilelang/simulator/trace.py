@@ -142,6 +142,7 @@ class ChromeTraceExporter:
                 "args": {"name": resource},
             })
         events.extend(self._active_core_events(record_list))
+        events.extend(self._queue_depth_events(record_list))
         for record in record_list:
             args = _json_safe(record.metadata)
             args["task_id"] = record.task_id
@@ -239,6 +240,40 @@ class ChromeTraceExporter:
                 "pid": "simulator",
                 "tid": "counters",
                 "args": {"active_cores": active},
+            })
+        return events
+
+    @staticmethod
+    def _queue_depth_events(records: Iterable[ExecutionRecord]) -> List[Dict[str, Any]]:
+        """Emit per-resource counters for tasks ready but waiting behind FIFO work."""
+        transitions: Dict[tuple[int, str, int], int] = {}
+        for record in records:
+            if record.category != "operation":
+                continue
+            queued_at = record.metadata.get("queue_enter_cycle")
+            if not isinstance(queued_at, int) or queued_at >= record.start_cycle:
+                continue
+            resource = (record.core_id, record.resource)
+            transitions[(resource[0], resource[1], queued_at)] = (
+                transitions.get((resource[0], resource[1], queued_at), 0) + 1
+            )
+            transitions[(resource[0], resource[1], record.start_cycle)] = (
+                transitions.get((resource[0], resource[1], record.start_cycle), 0) - 1
+            )
+
+        depths: Dict[tuple[int, str], int] = {}
+        events: List[Dict[str, Any]] = []
+        for (core_id, resource, cycle), delta in sorted(transitions.items()):
+            key = (core_id, resource)
+            depths[key] = depths.get(key, 0) + delta
+            events.append({
+                "name": "queue_depth",
+                "cat": "counter",
+                "ph": "C",
+                "ts": cycle,
+                "pid": f"core-{core_id}",
+                "tid": resource,
+                "args": {"queue_depth": depths[key]},
             })
         return events
 

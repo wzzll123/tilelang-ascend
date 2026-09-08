@@ -41,7 +41,9 @@ def test_dependencies_and_pipe_fifo_determine_start_cycles() -> None:
 
     assert (records["load-0"].start_cycle, records["load-0"].end_cycle) == (0, 4)
     assert (records["load-1"].start_cycle, records["load-1"].end_cycle) == (4, 10)
+    assert records["load-1"].metadata["queue_enter_cycle"] == 0
     assert (records["mma"].start_cycle, records["mma"].end_cycle) == (10, 20)
+    assert not any(record.category == "wait" for record in result.records)
     assert result.stats.makespan_cycles == 20
 
 

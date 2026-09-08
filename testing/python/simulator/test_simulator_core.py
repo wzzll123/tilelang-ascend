@@ -124,6 +124,7 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
             "load-1", "copy_gm_to_l1", 0, Lane.CUBE, Pipe.MTE2, 5, 15,
             metadata={
                 "memory_dependencies": ("load-0",),
+                "queue_enter_cycle": 0,
                 "src": gm,
                 "dst": l1,
             },
@@ -174,6 +175,12 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     ]
     assert [(event["ts"], event["args"]["active_cores"])
             for event in active_core_events] == [(0, 1), (30, 0)]
+    queue_events = [
+        event for event in trace["traceEvents"]
+        if event.get("name") == "queue_depth"
+    ]
+    assert [(event["ts"], event["args"]["queue_depth"])
+            for event in queue_events] == [(0, 1), (5, 0)]
     flows = [
         event for event in trace["traceEvents"]
         if event.get("cat") == "dependency"
