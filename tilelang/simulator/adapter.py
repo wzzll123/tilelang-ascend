@@ -109,7 +109,15 @@ class SimulatorKernelAdapter:
                 self.config.platform,
                 self.config.timing_profile.calibration,
             )
-            self.last_trace = exporter.write(self.config.trace_path, result.records)
+            timeline = (
+                self.last_execution.memory.local_memory_live_bytes(result.records)
+                if self.last_execution is not None else ()
+            )
+            self.last_trace = exporter.write(
+                self.config.trace_path,
+                result.records,
+                local_memory_timeline=timeline,
+            )
 
     def get_kernel_source(self) -> str:
         """Return the authoritative final pre-codegen TIR script."""

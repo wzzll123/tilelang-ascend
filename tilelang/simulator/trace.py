@@ -108,7 +108,12 @@ class ChromeTraceExporter:
         self.platform = platform
         self.calibration = calibration
 
-    def to_dict(self, records: Iterable[ExecutionRecord]) -> Dict[str, Any]:
+    def to_dict(
+        self,
+        records: Iterable[ExecutionRecord],
+        *,
+        local_memory_timeline: Iterable[tuple[int, Mapping[str, int]]] = (),
+    ) -> Dict[str, Any]:
         """Convert records to a JSON-serializable trace document."""
         record_list = list(records)
         events: List[Dict[str, Any]] = [
@@ -143,6 +148,16 @@ class ChromeTraceExporter:
             })
         events.extend(self._active_core_events(record_list))
         events.extend(self._queue_depth_events(record_list))
+        for cycle, usage in local_memory_timeline:
+            events.append({
+                "name": "live_local_memory_bytes",
+                "cat": "counter",
+                "ph": "C",
+                "ts": cycle,
+                "pid": "simulator",
+                "tid": "counters",
+                "args": dict(usage),
+            })
         for record in record_list:
             args = _json_safe(record.metadata)
             args["task_id"] = record.task_id
@@ -277,9 +292,21 @@ class ChromeTraceExporter:
             })
         return events
 
-    def write(self, path: Union[str, Path], records: Iterable[ExecutionRecord]) -> Path:
+    def write(
+        self,
+        path: Union[str, Path],
+        records: Iterable[ExecutionRecord],
+        *,
+        local_memory_timeline: Iterable[tuple[int, Mapping[str, int]]] = (),
+    ) -> Path:
         """Write a trace document and return its resolved output path."""
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(self.to_dict(records), indent=2), encoding="utf-8")
+        output.write_text(
+            json.dumps(
+                self.to_dict(records, local_memory_timeline=local_memory_timeline),
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         return output.resolve()

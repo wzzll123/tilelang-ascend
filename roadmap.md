@@ -378,7 +378,7 @@ TILELANG_LIBRARY_PATH="$PWD/build" \
   /Users/wzz/miniconda3/bin/python -m pytest testing/python/simulator -q
 ```
 
-当前基线为 `574 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
+当前基线为 `576 passed`。TVM 在 Python 3.13 下会产生 parser deprecation warnings；这些
 不是 simulator failure。本地 CPU 已能运行 simulator lowering/JIT；NPU codegen 和真机
 交叉验证仍需要 Linux+CANN，最终 timing 还需要分别在 A2/A3 真机校准。
 
@@ -716,7 +716,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~输出 active-core counter（同 core 多 pipe overlap 去重，wait 不计为 active）。~~
 - [x] ~~输出逐 `(core, lane, pipe)` FIFO queue depth：仅统计依赖/同步已满足、但资源仍
   忙的等待区间，并与 flag/barrier stall 分离。~~
-- [ ] 输出随执行时间变化的 live local-memory。
+- [x] ~~从 execution record 的首次/末次实际访问推导 allocation live interval，按
+  owner/scope 的物理地址 union 去重 alias，并输出随 cycle 变化的 local-memory counter。~~
 - [x] ~~统计 operation counts。~~
 - [x] ~~统计各 memory path 的静态 logical payload bytes；优先使用 lowering 提供的
   `transfer_bytes`，否则从 destination region 推导；传入 runtime bindings 时支持动态
@@ -767,7 +768,7 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前 simulator 核心测试基线：574 passed，覆盖 memory、scheduler、sync、trace、
+- [x] ~~当前 simulator 核心测试基线：576 passed，覆盖 memory、scheduler、sync、trace、
   functional executor、真实 TIR bridge、跨 pipe 同步 hazard 和 shmem rejection；另有
   2 个依赖 native module 的 JIT 集成测试文件，覆盖自动同步回滚以及 FA 使用的二维
   row broadcast/runtime float scalar。~~

@@ -287,3 +287,19 @@ def test_trace_active_core_counter_deduplicates_pipe_overlap() -> None:
     ]
     assert [(event["ts"], event["args"]["active_cores"])
             for event in counters] == [(0, 1), (5, 2), (10, 1), (12, 0)]
+
+
+def test_trace_exports_live_local_memory_counters() -> None:
+    trace = ChromeTraceExporter("A2", "uncalibrated-unit-cost").to_dict(
+        (),
+        local_memory_timeline=((0, {"ub": 64}), (7, {})),
+    )
+    counters = [
+        event for event in trace["traceEvents"]
+        if event.get("name") == "live_local_memory_bytes"
+    ]
+
+    assert [(event["ts"], event["args"]) for event in counters] == [
+        (0, {"ub": 64}),
+        (7, {}),
+    ]

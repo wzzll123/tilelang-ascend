@@ -2,6 +2,7 @@
 # Licensed under the MIT License.
 """CPU-only tests for the static simulator adapter."""
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -135,6 +136,13 @@ def test_functional_adapter_executes_numpy_inputs_and_returns_output(
     assert adapter.last_execution is not None
     assert adapter.last_schedule is adapter.last_execution.schedule
     assert adapter.last_trace == (tmp_path / "functional.json").resolve()
+    trace = json.loads(adapter.last_trace.read_text(encoding="utf-8"))
+    live_memory = [
+        event for event in trace["traceEvents"]
+        if event.get("name") == "live_local_memory_bytes"
+    ]
+    assert live_memory
+    assert any(event["args"].get("ub", 0) > 0 for event in live_memory)
 
 
 def test_functional_adapter_preserves_cpu_torch_interface() -> None:

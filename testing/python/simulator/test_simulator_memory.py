@@ -7,14 +7,18 @@ import pytest
 from tilelang.simulator import (
     A2_A3_LOCAL_CAPACITIES,
     AddressRange,
+    BufferRegion,
     BufferSpec,
     CoreProgram,
+    ExecutionRecord,
     KernelProgram,
+    Lane,
     MemoryBoundsError,
     MemoryCapacityError,
     MemoryHazardError,
     MemoryRuntime,
     MemoryScope,
+    Pipe,
     SimulatorHazardWarning,
     UninitializedMemoryError,
     dtype_size_bytes,
@@ -106,6 +110,32 @@ def test_local_memory_high_watermark_is_per_scope_max_not_core_sum() -> None:
     memory.allocate(BufferSpec("gm", MemoryScope.GM, (1024,), "uint8"))
 
     assert memory.local_memory_high_watermark_bytes == {"ub": 64, "l1": 48}
+
+
+def test_local_memory_live_bytes_follow_actual_allocation_use() -> None:
+    memory = MemoryRuntime((0,))
+    memory.allocate(BufferSpec("first", MemoryScope.UB, (16,), "uint8"), core_id=0)
+    memory.allocate(BufferSpec("second", MemoryScope.UB, (16,), "uint8"), core_id=0)
+    first = BufferRegion("first", MemoryScope.UB, (16,), "uint8")
+    second = BufferRegion("second", MemoryScope.UB, (16,), "uint8")
+    records = (
+        ExecutionRecord(
+            "first-use", "fill", 0, Lane.VECTOR_0, Pipe.VECTOR, 0, 5,
+            metadata={"dst": first},
+        ),
+        ExecutionRecord(
+            "second-use", "fill", 0, Lane.VECTOR_0, Pipe.VECTOR, 3, 8,
+            metadata={"dst": second},
+        ),
+    )
+
+    assert [(cycle, dict(usage)) for cycle, usage in
+            memory.local_memory_live_bytes(records)] == [
+        (0, {"ub": 16}),
+        (3, {"ub": 32}),
+        (5, {"ub": 16}),
+        (8, {}),
+    ]
 
 
 def test_partial_write_and_absolute_address_range() -> None:

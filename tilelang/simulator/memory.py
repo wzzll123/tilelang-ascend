@@ -7,7 +7,7 @@ from itertools import product
 from numbers import Integral
 import re
 from types import MappingProxyType
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 from .errors import (
     MemoryAccessError,
@@ -17,7 +17,14 @@ from .errors import (
     UninitializedMemoryError,
 )
 from .hazard import HazardDiagnostic, HazardReporter
-from .program import AffineInt, BufferSpec, KernelProgram, MemoryScope, SymbolicInt
+from .program import (
+    AffineInt,
+    BufferRegion,
+    BufferSpec,
+    KernelProgram,
+    MemoryScope,
+    SymbolicInt,
+)
 
 
 # Physical local-memory address-space capacities for A2/A3.  The AscendC
@@ -424,6 +431,62 @@ class MemoryRuntime:
             usage[scope.value] = max(usage.get(scope.value, 0), len(backing.data))
         return MappingProxyType(usage)
 
+    def local_memory_live_bytes(
+        self, records: Iterable[Any]
+    ) -> Tuple[Tuple[int, Mapping[str, int]], ...]:
+        """Return per-scope live allocation bytes at memory-use transitions."""
+        lifetimes: Dict[int, Tuple[MemoryAllocation, int, int]] = {}
+        for record in records:
+            if getattr(record, "category", None) != "operation":
+                continue
+            owner = (
+                self.vector1_owner(record.core_id)
+                if getattr(record.lane, "value", None) == "vector1"
+                else record.core_id
+            )
+            for region in _buffer_regions(record.metadata):
+                if region.scope in _SHARED_SCOPES:
+                    continue
+                allocation = self.get(region.buffer, scope=region.scope, core_id=owner)
+                identity = id(allocation)
+                previous = lifetimes.get(identity)
+                if previous is None:
+                    lifetimes[identity] = (
+                        allocation, record.start_cycle, record.end_cycle
+                    )
+                else:
+                    lifetimes[identity] = (
+                        allocation,
+                        min(previous[1], record.start_cycle),
+                        max(previous[2], record.end_cycle),
+                    )
+
+        transitions: Dict[int, list[Tuple[bool, MemoryAllocation]]] = {}
+        for allocation, start, end in lifetimes.values():
+            transitions.setdefault(start, []).append((True, allocation))
+            transitions.setdefault(end, []).append((False, allocation))
+
+        active: Dict[int, MemoryAllocation] = {}
+        timeline = []
+        for cycle in sorted(transitions):
+            for entering, allocation in transitions[cycle]:
+                if not entering:
+                    active.pop(id(allocation), None)
+            for entering, allocation in transitions[cycle]:
+                if entering:
+                    active[id(allocation)] = allocation
+            ranges: Dict[Tuple[MemoryScope, int], list[AddressRange]] = {}
+            for allocation in active.values():
+                ranges.setdefault(
+                    (allocation.spec.scope, int(allocation.core_id)), []
+                ).append(allocation.address_range)
+            by_scope: Dict[str, int] = {}
+            for (scope, _owner), intervals in ranges.items():
+                occupied = _merged_range_size(intervals)
+                by_scope[scope.value] = max(by_scope.get(scope.value, 0), occupied)
+            timeline.append((cycle, MappingProxyType(by_scope)))
+        return tuple(timeline)
+
 
 def _concrete_shape(shape: Sequence[object]) -> Tuple[int, ...]:
     if any(not isinstance(extent, Integral) for extent in shape):
@@ -432,6 +495,33 @@ def _concrete_shape(shape: Sequence[object]) -> Tuple[int, ...]:
     if any(extent < 0 for extent in result):
         raise ProgramValidationError("memory allocation/view shape has a negative extent")
     return result
+
+
+def _buffer_regions(value: Any) -> Tuple[BufferRegion, ...]:
+    if isinstance(value, BufferRegion):
+        return (value,)
+    if isinstance(value, Mapping):
+        return tuple(
+            region for item in value.values() for region in _buffer_regions(item)
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(region for item in value for region in _buffer_regions(item))
+    return ()
+
+
+def _merged_range_size(ranges: Iterable[AddressRange]) -> int:
+    ordered = sorted(ranges)
+    if not ordered:
+        return 0
+    total = 0
+    start, end = ordered[0].start, ordered[0].end
+    for interval in ordered[1:]:
+        if interval.start <= end:
+            end = max(end, interval.end)
+        else:
+            total += end - start
+            start, end = interval.start, interval.end
+    return total + end - start
 
 
 def _resolve_extent(value: object, bindings: Mapping[str, int | float]) -> int:
