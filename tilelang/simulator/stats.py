@@ -7,8 +7,9 @@ from numbers import Integral
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .errors import ProgramValidationError
 from .memory import dtype_size_bytes
-from .program import BufferRegion
+from .program import AffineInt, BufferRegion, SymbolicInt
 from .trace import ExecutionRecord
 
 
@@ -27,13 +28,27 @@ def _union_length(intervals: Sequence[Tuple[int, int]]) -> int:
     return total + current_end - current_start
 
 
-def _static_region_nbytes(region: BufferRegion) -> Optional[int]:
-    """Return logical payload bytes when every region extent is static."""
+def _runtime_int(value: Any, bindings: Mapping[str, int | float]) -> Optional[int]:
+    if isinstance(value, (AffineInt, SymbolicInt)):
+        try:
+            return value.evaluate(bindings)
+        except ProgramValidationError:
+            return None
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    return None
+
+
+def _region_nbytes(
+    region: BufferRegion, bindings: Mapping[str, int | float]
+) -> Optional[int]:
+    """Return logical payload bytes when all region extents can be resolved."""
     elements = 1
     for extent in region.shape:
-        if not isinstance(extent, Integral) or isinstance(extent, bool):
+        resolved = _runtime_int(extent, bindings)
+        if resolved is None:
             return None
-        elements *= int(extent)
+        elements *= resolved
     return elements * dtype_size_bytes(region.dtype)
 
 
@@ -45,14 +60,17 @@ def _memory_path(metadata: Mapping[str, Any]) -> Optional[str]:
     return f"{source.scope.value}->{destination.scope.value}"
 
 
-def _transfer_bytes(metadata: Mapping[str, Any]) -> Optional[int]:
+def _transfer_bytes(
+    metadata: Mapping[str, Any], bindings: Mapping[str, int | float]
+) -> Optional[int]:
     """Resolve a task's logical transfer size without guessing dynamic values."""
     explicit = metadata.get("transfer_bytes", metadata.get("bytes"))
-    if isinstance(explicit, Integral) and not isinstance(explicit, bool):
-        return int(explicit)
+    resolved = _runtime_int(explicit, bindings)
+    if resolved is not None:
+        return resolved
     destination = metadata.get("dst")
     if isinstance(destination, BufferRegion):
-        return _static_region_nbytes(destination)
+        return _region_nbytes(destination, bindings)
     return None
 
 
@@ -71,8 +89,14 @@ class SimulationStats:
     load_imbalance_cycles: int
 
     @classmethod
-    def from_records(cls, records: Iterable[ExecutionRecord]) -> "SimulationStats":
+    def from_records(
+        cls,
+        records: Iterable[ExecutionRecord],
+        *,
+        bindings: Optional[Mapping[str, int | float]] = None,
+    ) -> "SimulationStats":
         """Compute overlap-aware resource utilization and simple stall totals."""
+        runtime_bindings = bindings or {}
         record_list = list(records)
         if not record_list:
             empty = MappingProxyType({})
@@ -97,7 +121,10 @@ class SimulationStats:
                 _memory_path(record.metadata)
                 if record.operation.startswith("copy_") else None
             )
-            transferred = _transfer_bytes(record.metadata) if path is not None else None
+            transferred = (
+                _transfer_bytes(record.metadata, runtime_bindings)
+                if path is not None else None
+            )
             if path is not None and transferred is not None:
                 memory_bytes[path] = memory_bytes.get(path, 0) + transferred
             if record.stall_reason is not None:

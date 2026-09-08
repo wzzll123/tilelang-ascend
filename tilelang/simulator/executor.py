@@ -194,7 +194,7 @@ class FunctionalSimulator:
         schedule = DiscreteEventScheduler(
             self.config,
             synchronization=FlagBarrierSynchronizationModel(),
-        ).run(self.program)
+        ).run(self.program, bindings=self.bindings)
         task_by_id = {task.task_id: task for task in self.program.tasks}
         for record in schedule.records:
             if record.category == "wait":

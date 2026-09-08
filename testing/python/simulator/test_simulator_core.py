@@ -210,6 +210,9 @@ def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:
     )
 
     assert SimulationStats.from_records(records).memory_bytes_by_path == {}
+    assert SimulationStats.from_records(
+        records, bindings={"count": 7}
+    ).memory_bytes_by_path == {"gm->ub": 14}
 
 
 def test_stats_do_not_count_vector_operand_bytes_as_memory_transfer() -> None:

@@ -47,7 +47,12 @@ class DiscreteEventScheduler:
         self.config = config
         self.synchronization = synchronization or NoOpSynchronizationModel()
 
-    def run(self, program: KernelProgram) -> ScheduleResult:
+    def run(
+        self,
+        program: KernelProgram,
+        *,
+        bindings: Optional[Mapping[str, int | float]] = None,
+    ) -> ScheduleResult:
         """Schedule ``program`` and return trace-ready records plus summary statistics."""
         config = self.config or SimulatorConfig(platform=program.platform)
         if config.platform != program.platform:
@@ -149,7 +154,7 @@ class DiscreteEventScheduler:
         )
         return ScheduleResult(
             records=ordered_records,
-            stats=SimulationStats.from_records(ordered_records),
+            stats=SimulationStats.from_records(ordered_records, bindings=bindings),
         )
 
     @staticmethod

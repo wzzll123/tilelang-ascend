@@ -717,8 +717,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [ ] 输出 queue depth 和 live local-memory。
 - [x] ~~统计 operation counts。~~
 - [x] ~~统计各 memory path 的静态 logical payload bytes；优先使用 lowering 提供的
-  `transfer_bytes`，否则从 destination region 推导，动态未绑定值明确跳过。~~
-- [ ] 统计 peak local-memory 和 hazard counts，并为 runtime bindings 补动态 path bytes。
+  `transfer_bytes`，否则从 destination region 推导；传入 runtime bindings 时支持动态
+  affine/symbolic path bytes，未绑定值明确跳过。~~
+- [ ] 统计 peak local-memory 和 hazard counts。
 - [x] ~~统计 active cores 的 completion spread（`load_imbalance_cycles`）。~~
 - [ ] 标记 critical path、copy/compute overlap 和主要 stall 原因。
 - [x] ~~增加 trace schema/version 回归测试。~~
