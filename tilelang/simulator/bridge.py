@@ -989,6 +989,11 @@ class _TirBridge:
                 "valid_cols": valid_cols,
                 "stride_n": self._literal(arguments[2]),
             }
+            # The GM side of a strided copy is a [valid_rows, valid_cols] tile
+            # whose true row stride is the copy's stride_n argument (elements),
+            # not the GM buffer's last logical dim.  Resolve it for the GM-side
+            # region so poison tracking marks the real strided rows.
+            gm_row_stride = self._runtime_int(arguments[2], context.environment)
             gm_to_ub = "copy_gm_to_ub" in normalized
             legacy_ub_to_gm = not gm_to_ub and len(arguments) >= 8
             if (gm_to_ub or legacy_ub_to_gm) and len(arguments) > 5:
@@ -1033,12 +1038,16 @@ class _TirBridge:
                 shape,
                 context,
                 physical_cols=None if gm_to_ub else physical_cols,
+                # gm_to_ub: source is the GM tile -> use the copy's row stride.
+                row_stride_elems=gm_row_stride if gm_to_ub else None,
             )
             destination = self._access_buffer_region(
                 arguments[1],
                 shape,
                 context,
                 physical_cols=physical_cols if gm_to_ub else None,
+                # ub_to_gm: destination is the GM tile -> use the copy's stride.
+                row_stride_elems=None if gm_to_ub else gm_row_stride,
             )
         else:
             length = self._runtime_int(arguments[2], context.environment)
@@ -1093,7 +1102,9 @@ class _TirBridge:
                     "GM-to-L1 valid columns exceed the GM row stride"
                 )
         source = self._access_buffer_region(
-            arguments[0], (valid_rows, valid_cols), context
+            arguments[0], (valid_rows, valid_cols), context,
+            # GM source row stride is source_cols, not spec.shape[-1].
+            row_stride_elems=source_cols,
         )
         destination = self._access_buffer_region(
             arguments[1], (valid_rows, valid_cols), context
@@ -1161,7 +1172,10 @@ class _TirBridge:
             )
 
         source = self._access_buffer_region(
-            arguments[0], (valid_rows, valid_cols), context
+            arguments[0], (valid_rows, valid_cols), context,
+            # GM source is a [valid_rows, valid_cols] tile of a wider row-major
+            # tensor; its true row stride is source_cols, not spec.shape[-1].
+            row_stride_elems=source_cols,
         )
         destination_name = self._access_ptr_data_name(arguments[1])
         if source is None or destination_name is None:
@@ -5299,6 +5313,7 @@ class _TirBridge:
         context: _Context,
         *,
         physical_cols: Any | None = None,
+        row_stride_elems: Any | None = None,
     ) -> Optional[BufferRegion]:
         data_var = pointer
         element_offset = 0
@@ -5322,13 +5337,23 @@ class _TirBridge:
         itemsize = dtype_size_bytes(region_dtype)
         strides = None
         if len(shape) == 2:
-            physical_cols = spec.shape[-1] if physical_cols is None else physical_cols
-            if not isinstance(physical_cols, (int, AffineInt, SymbolicInt)):
+            # The GM row stride of a sliced higher-rank tensor (e.g. a [rows, D]
+            # tile of a [B, S, Hq, D] BSND output) is the copy's row-stride
+            # argument, not the buffer's last logical dim.  Prefer an explicit
+            # row_stride_elems; otherwise fall back to physical_cols, then to
+            # spec.shape[-1] (a tightly packed 2-D buffer).
+            if row_stride_elems is not None:
+                stride_source = row_stride_elems
+            else:
+                stride_source = (
+                    spec.shape[-1] if physical_cols is None else physical_cols
+                )
+            if not isinstance(stride_source, (int, AffineInt, SymbolicInt)):
                 return None
             row_stride = (
-                physical_cols * itemsize
-                if isinstance(physical_cols, int)
-                else physical_cols.scaled(itemsize)
+                stride_source * itemsize
+                if isinstance(stride_source, int)
+                else stride_source.scaled(itemsize)
             )
             strides = (row_stride, itemsize)
         byte_offset = (
