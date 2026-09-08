@@ -11,6 +11,47 @@
 
 Tile Language Ascend (**tilelang-ascend**) is a specialized variant of the tile-lang domain-specific language, specifically optimized for Huawei Ascend NPU (Neural Processing Unit) architecture. Built upon the foundation of tile-lang's Pythonic syntax and [TVM](https://tvm.apache.org/) compiler infrastructure, tilelang-ascend enables developers to efficiently create high-performance AI compute kernels tailored for Ascend processors, including operations like GEMM, vector operations, and attention mechanisms. Tilelang-ascend allows developers to focus on productivity without sacrificing the low-level optimizations necessary for state-of-the-art performance on the NPU. The compiler backend supports two technical routes: [Ascend C & PTO](https://github.com/tile-ai/tilelang-ascend/tree/ascendc_pto) and [AscendNPU IR](https://github.com/tile-ai/tilelang-ascend/tree/npuir).
 
+## Agent-Evolving Compiler Fork
+
+This fork explores an **agent-evolving compiler** workflow: coding agents continuously inspect real kernels, reproduce compiler and code-generation failures, add executable regressions, implement narrowly scoped fixes, and validate the result with both an A2/A3 functional simulator and NPU tests. The goal is not to replace compiler engineering review, but to make the feedback loop from a failing kernel to a reviewed compiler improvement faster and more reproducible.
+
+The development loop is:
+
+```text
+real kernel / failure
+        ↓
+TIR and generated-code inspection
+        ↓
+CPU-only A2/A3 simulation + dependency trace
+        ↓
+minimal regression and compiler fix
+        ↓
+Ascend NPU validation and upstream issue / PR
+```
+
+### Extended compiler capabilities
+
+- A2/A3 functional simulation directly from lowered TIR, without invoking BiSheng for functional checks.
+- Execution tracing for memory accesses, pipeline dependencies, flag matching, active-core utilization, hazards, and synchronization deadlocks.
+- AscendC and PTO coverage for vector, DMA, Cube/MMA, fixpipe, atomic, persistent-kernel, and convolution-related paths.
+- FP16, BF16, FP32, and common integer data paths, including FP32 Cube execution and BF16 functional simulation.
+- Explicit convolution `im2col` execution through the L1 → L0A → MMA → L0C → GM path, including padding and tail tiles.
+- Dynamic-tail and physical-layout handling across GM, UB, L1, L0A/L0B, and L0C.
+
+The simulator focuses on **A2/A3 functional correctness and debugging**. It is not a cycle-accurate performance model, and SHMEM is intentionally outside its current scope. See [roadmap.md](./roadmap.md) for the implemented coverage, validation matrix, known limits, and remaining work.
+
+### Representative fixes developed in this fork
+
+- Correct physical row strides for two-dimensional GM ↔ UB subregion copies ([PR #1756](https://github.com/tile-ai/tilelang-ascend/pull/1756)).
+- Preserve TIR floor semantics for negative integer division and modulo ([PR #1757](https://github.com/tile-ai/tilelang-ascend/pull/1757)).
+- Keep memory-planning liveness valid through scope exits ([PR #1755](https://github.com/tile-ai/tilelang-ascend/pull/1755)).
+- Reject unsupported copies with more than two active source dimensions instead of silently dropping data ([PR #1754](https://github.com/tile-ai/tilelang-ascend/pull/1754)).
+- Lower scalar BF16-to-FP32 conversions through the supported AscendC path ([PR #1758](https://github.com/tile-ai/tilelang-ascend/pull/1758)).
+- Compute multidimensional scalar-buffer offsets from all indices and strides ([PR #1761](https://github.com/tile-ai/tilelang-ascend/pull/1761)).
+- Add AscendC `im2col` tile extraction ([PR #1759](https://github.com/tile-ai/tilelang-ascend/pull/1759)) and native FP32 GEMM support ([PR #1760](https://github.com/tile-ai/tilelang-ascend/pull/1760)).
+
+Each upstream contribution is paired with an issue describing the observable failure, expected behavior, and regression boundary.
+
 <p align="center">
   <img src="./images/tl-ascend-gemm.png" width="100%" alt="image">
 
