@@ -5047,6 +5047,14 @@ class _TirBridge:
         literal = self._literal(simplified)
         if isinstance(literal, (int, float)) and not isinstance(literal, bool):
             return literal
+        # Strip a numeric cast (e.g. createvecindex's cast(t * block_n, float32))
+        # and evaluate the inner integer expression; the executor widens the
+        # resolved integer to the destination dtype, which is exact for the
+        # integer-valued indices these sequences generate.
+        if isinstance(simplified, self.tir.Cast):
+            inner = self._numeric_scalar(simplified.value, context)
+            if inner is not None:
+                return inner
         runtime = self._runtime_int(simplified, context.environment)
         if isinstance(runtime, (int, AffineInt, SymbolicInt)):
             return runtime

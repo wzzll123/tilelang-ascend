@@ -5319,6 +5319,31 @@ def test_sequence_intrinsics_reject_negative_count_and_dtype_mismatch() -> None:
         )
 
 
+def test_createvecindex_resolves_cast_runtime_first() -> None:
+    """createvecindex first = cast(loop_var * const, float32) must resolve.
+
+    GQA's causal mask calls createvecindex(col_idx, cast(t * block_n, float32))
+    and createvecindex(bound_vec, cast(s0 + h_start + diff_s, float32)): the
+    first value is a runtime integer expression wrapped in a float cast.  The
+    bridge must strip the cast and keep the inner affine expression executable.
+    """
+    t = tvm.tir.Var("t", "int32")
+    first = tvm.tir.Cast("float32", t * 128)
+    program = build_kernel_program(
+        _sequence_primfunc("createvecindex", dtype="float32", first=first, count=7),
+        platform="A2",
+    )
+    sequence = program.tasks[0]
+    assert sequence.metadata["first_value"] == AffineInt.variable("t").scaled(128)
+
+    simulator = FunctionalSimulator(program, bindings={"t": 3})
+    simulator.run()
+    np.testing.assert_array_equal(
+        simulator.read(program.tasks[1].metadata["dst"]),
+        np.array([384, 385, 386, 387, 388, 389, 390], dtype=np.float32),
+    )
+
+
 @pytest.mark.parametrize("dtype", ["int16", "uint16"])
 @pytest.mark.parametrize(
     ("operation", "implementation", "with_scratch"),
