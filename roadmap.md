@@ -801,7 +801,8 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
    验收。剩余 copy variants 以真实 final TIR 出现为准；`copy_l0c_to_ub` 须先确认被
    workspace reduction 改写前后的实际 contract，再实现 CV handoff。
 5. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。
-6. sync-only 已进入 executor 快速路径；继续用 GQA 真实矩阵核对全量/骨架同步结论。
-   当前归档设计的 `decode`/`decode_causal` 会在两种模式共同经过的 bridge 中因非
-   fractal-row-aligned zN 子块目的偏移 fail-closed，需先修正或确认该 copy contract；
-   `multitask` 还需在内存充足的隔离环境完成编译/执行对照。
+6. ~~sync-only 已进入 executor 快速路径；`decode`/`decode_causal` 的两项 shared
+   bridge blocker 已修复：codegen 合法的 32B-aligned rebased zN destination，以及
+   causal mask 中“浮点表示、整数语义”的 Let/Cast scalar。A2 sync-only `decode`
+   (`0.362s`) 与 `decode_causal` (`0.423s`) 均无 hazard/静态同步诊断。~~ 下一步在
+   内存充足的隔离环境完成 `multitask` 的编译/执行对照，并继续核对全量/骨架同步结论。
