@@ -2,8 +2,11 @@
 # Licensed under the MIT License.
 """Functional execution of concrete simulator tasks on CPU memory."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -96,6 +99,95 @@ _BITWISE_BINARY_OPERATIONS = {
     "bitwise_xor": np.bitwise_xor,
 }
 
+_SYNCHRONIZATION_OPERATIONS = frozenset(
+    {
+        "set_flag",
+        "wait_flag",
+        "auto_set_flag",
+        "auto_wait_flag",
+        "set_cross_flag",
+        "wait_cross_flag",
+        "auto_set_cross_flag",
+        "auto_wait_cross_flag",
+        "barrier_all",
+        "pipe_barrier",
+        "auto_barrier",
+    }
+)
+
+_SYNC_ONLY_EXPLICIT_OPERATIONS = frozenset(
+    {
+        "axpy",
+        "mul_add_dst",
+        "mma",
+        "mma_bias",
+        "gemm_v0",
+        "im2col",
+        "bitwise_not",
+        "bitwise_lshift",
+        "bitwise_rshift",
+        "cast",
+        "fill",
+        "reducesum_experiment",
+        "sum_experiment",
+        "brcb_experiment",
+        "row_expand_mul_experiment",
+        "row_expand_sub_experiment",
+        "row_expand_div_experiment",
+        "arith_progression",
+        "createvecindex",
+        "gather",
+        "gatherb",
+        "gather_mask",
+        "transpose",
+        "reinterpretcast",
+        "topk",
+        "sort32",
+        "sort",
+        "init_sort_buf",
+        "merge_sort",
+        "atomic_add_ub_to_gm",
+        "atomic_add_l0c_to_gm",
+        "clamp",
+        "clamp_max",
+        "clamp_min",
+        "broadcast",
+        "tail_broadcast",
+        "compare",
+        "compare_scalar",
+        "tail_compare",
+        "tail_compare_scalar",
+        "select",
+        "tail_select",
+        "reduce",
+        "block_reduce_max",
+        "block_reduce_min",
+        "block_reduce_sum",
+        "wholereducemax",
+        "wholereducemin",
+        "wholereducesum",
+    }
+)
+
+_READ_REGION_KEYS = (
+    "src_regions",
+    "src",
+    "lhs",
+    "rhs",
+    "mask",
+    "accumulator",
+    "scalar_src",
+    "offsets",
+    "bias",
+)
+_WRITE_REGION_KEYS = (
+    "dst_regions",
+    "dst",
+    "pad_dst",
+    "scratch",
+    "output_scratch",
+)
+
 
 @dataclass(frozen=True)
 class FunctionalExecutionResult:
@@ -103,6 +195,7 @@ class FunctionalExecutionResult:
 
     schedule: ScheduleResult
     memory: MemoryRuntime
+    numeric_results_available: bool = True
 
 
 class FunctionalSimulator:
@@ -111,15 +204,13 @@ class FunctionalSimulator:
     def __init__(
         self,
         program: KernelProgram,
-        config: Optional[SimulatorConfig] = None,
-        bindings: Optional[Mapping[str, int | float]] = None,
+        config: SimulatorConfig | None = None,
+        bindings: Mapping[str, int | float] | None = None,
     ) -> None:
         self.program = program
         self.config = config or SimulatorConfig(platform=program.platform)
         if self.config.platform != program.platform:
-            raise ProgramValidationError(
-                "functional simulator config platform does not match the program"
-            )
+            raise ProgramValidationError("functional simulator config platform does not match the program")
         self.bindings = dict(bindings or {})
         self._validate_runtime_contracts()
         self.memory = MemoryRuntime.from_program(
@@ -136,59 +227,42 @@ class FunctionalSimulator:
                 actual_cols = _resolve_int(details["n_actual"], self.bindings)
                 template_cols = _resolve_int(details["cols"], self.bindings)
                 if actual_cols <= 0 or actual_cols > template_cols:
-                    raise ProgramValidationError(
-                        f"mma n_actual must be in [1, {template_cols}], got {actual_cols}"
-                    )
+                    raise ProgramValidationError(f"mma n_actual must be in [1, {template_cols}], got {actual_cols}")
                 if actual_cols % 16:
-                    raise ProgramValidationError(
-                        "mma n_actual must be a multiple of 16, "
-                        f"got {actual_cols}"
-                    )
+                    raise ProgramValidationError(f"mma n_actual must be a multiple of 16, got {actual_cols}")
             topk = task.metadata.get("topk")
             if isinstance(topk, Mapping):
                 actual_num = _resolve_int(topk["actual_num"], self.bindings)
                 k = _resolve_int(topk["k"], self.bindings)
-                max_actual_num = _resolve_int(
-                    topk["max_actual_num"], self.bindings
-                )
+                max_actual_num = _resolve_int(topk["max_actual_num"], self.bindings)
                 if actual_num < k or actual_num > max_actual_num:
-                    raise ProgramValidationError(
-                        f"topk actual_num must be in [{k}, {max_actual_num}], "
-                        f"got {actual_num}"
-                    )
+                    raise ProgramValidationError(f"topk actual_num must be in [{k}, {max_actual_num}], got {actual_num}")
             sort = task.metadata.get("sort")
             if isinstance(sort, Mapping):
                 actual_num = _resolve_int(sort["actual_num"], self.bindings)
                 repeat_times = _resolve_int(sort["repeat_times"], self.bindings)
                 capacity = _resolve_int(sort["source_capacity"], self.bindings)
                 if actual_num <= 0 or actual_num > capacity:
-                    raise ProgramValidationError(
-                        f"sort actual_num must be in [1, {capacity}], got {actual_num}"
-                    )
+                    raise ProgramValidationError(f"sort actual_num must be in [1, {capacity}], got {actual_num}")
                 expected_repeats = (actual_num + 31) // 32
                 if repeat_times != expected_repeats:
-                    raise ProgramValidationError(
-                        "sort repeatTimes must equal ceil(actual_num / 32), "
-                        f"got {repeat_times}"
-                    )
+                    raise ProgramValidationError(f"sort repeatTimes must equal ceil(actual_num / 32), got {repeat_times}")
 
     def write(self, region: BufferRegion, values: Any, *, task_core_id: int = 0) -> None:
         """Initialize a concrete region from an array-like CPU value."""
         view = self._resolve(region, task_core_id)
         array = np.asarray(values, dtype=_numpy_dtype(region.dtype))
         if array.shape != view.shape:
-            raise ProgramValidationError(
-                f"input for {region.buffer!r} has shape {array.shape}, expected {view.shape}"
-            )
+            raise ProgramValidationError(f"input for {region.buffer!r} has shape {array.shape}, expected {view.shape}")
         view.allocation.write(view, np.ascontiguousarray(array).tobytes(order="C"))
 
     def read(self, region: BufferRegion, *, task_core_id: int = 0) -> np.ndarray:
         """Read a concrete region into an independent NumPy array."""
+        if self.config.sync_only:
+            raise UnsupportedSimOpError("numeric results are unavailable when sync_only=True")
         view = self._resolve(region, task_core_id)
         payload = view.allocation.read(view)
-        return np.frombuffer(payload, dtype=_numpy_dtype(region.dtype)).reshape(
-            view.shape
-        ).copy()
+        return np.frombuffer(payload, dtype=_numpy_dtype(region.dtype)).reshape(view.shape).copy()
 
     def run(self) -> FunctionalExecutionResult:
         """Schedule the program, then apply operations in deterministic event order."""
@@ -212,17 +286,22 @@ class FunctionalSimulator:
                 schedule.records,
                 bindings=self.bindings,
                 hazard_diagnostics=self.memory.reporter.diagnostics,
-                local_memory_high_watermark_bytes=(
-                    self.memory.local_memory_high_watermark_bytes
-                ),
+                local_memory_high_watermark_bytes=(self.memory.local_memory_high_watermark_bytes),
             ),
         )
-        return FunctionalExecutionResult(schedule=schedule, memory=self.memory)
+        return FunctionalExecutionResult(
+            schedule=schedule,
+            memory=self.memory,
+            numeric_results_available=not self.config.sync_only,
+        )
 
     def _execute(self, task: Task) -> None:
         if task.metadata.get("trace_only") is True:
             return
         operation = task.operation.lower()
+        if self.config.sync_only:
+            self._execute_sync_only(task, operation)
+            return
         if "copy" in operation or "datacopy" in operation or "data_copy" in operation:
             self._copy(task)
             return
@@ -353,15 +432,59 @@ class FunctionalSimulator:
         if operation in _REDUCE_OPERATIONS:
             self._reduce(task, operation)
             return
-        if operation in {"set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
-                         "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
-                         "auto_wait_cross_flag", "barrier_all", "pipe_barrier",
-                         "auto_barrier"}:
+        if operation in {
+            "set_flag",
+            "wait_flag",
+            "auto_set_flag",
+            "auto_wait_flag",
+            "set_cross_flag",
+            "wait_cross_flag",
+            "auto_set_cross_flag",
+            "auto_wait_cross_flag",
+            "barrier_all",
+            "pipe_barrier",
+            "auto_barrier",
+        }:
             return
-        raise UnsupportedSimOpError(
-            f"functional execution is not implemented for {task.operation!r} "
-            f"(task {task.task_id!r})"
+        raise UnsupportedSimOpError(f"functional execution is not implemented for {task.operation!r} (task {task.task_id!r})")
+
+    def _execute_sync_only(self, task: Task, operation: str) -> None:
+        """Execute synchronization and poison metadata without numeric payloads."""
+        if operation in _SYNCHRONIZATION_OPERATIONS:
+            return
+        supported = (
+            "copy" in operation
+            or "datacopy" in operation
+            or "data_copy" in operation
+            or operation in _BINARY_OPERATIONS
+            or operation in _BITWISE_BINARY_OPERATIONS
+            or operation in _SCALAR_OPERATIONS
+            or operation in _UNARY_OPERATIONS
+            or operation in _REDUCE_OPERATIONS
+            or operation in _SYNC_ONLY_EXPLICIT_OPERATIONS
         )
+        if not supported:
+            raise UnsupportedSimOpError(f"sync-only execution is not implemented for {task.operation!r} (task {task.task_id!r})")
+        if operation == "reinterpretcast":
+            self._reinterpretcast(task)
+            return
+
+        reads = list(_metadata_regions(task.metadata, _READ_REGION_KEYS))
+        writes = list(_metadata_regions(task.metadata, _WRITE_REGION_KEYS))
+        if operation.startswith("atomic_add"):
+            reads.extend(region for region in writes if region not in reads and region is not task.metadata.get("pad_dst"))
+
+        sources_initialized = True
+        for region in reads:
+            view = self._resolve(region, task.core_id)
+            if not view.allocation.check_initialized(view):
+                sources_initialized = False
+
+        pad_destination = task.metadata.get("pad_dst")
+        for region in writes:
+            view = self._resolve(region, task.core_id)
+            initialized = True if region is pad_destination else sources_initialized
+            view.allocation.mark_initialized(view, initialized)
 
     def _copy(self, task: Task) -> None:
         source = _operand(task, "src")
@@ -376,12 +499,8 @@ class FunctionalSimulator:
         if isinstance(pad_destination, BufferRegion):
             pad_value = copy_details.get("pad_value")
             if not isinstance(pad_value, (bool, int, float)):
-                raise UnsupportedSimOpError(
-                    f"copy task {task.task_id!r} has non-literal pad value {pad_value!r}"
-                )
-            pad_shape = tuple(
-                _resolve_int(value, self.bindings) for value in pad_destination.shape
-            )
+                raise UnsupportedSimOpError(f"copy task {task.task_id!r} has non-literal pad value {pad_value!r}")
+            pad_shape = tuple(_resolve_int(value, self.bindings) for value in pad_destination.shape)
             self.write(
                 pad_destination,
                 np.full(pad_shape, pad_value, dtype=_numpy_dtype(pad_destination.dtype)),
@@ -389,34 +508,22 @@ class FunctionalSimulator:
             )
         source_regions = task.metadata.get("src_regions")
         if isinstance(source_regions, (tuple, list)):
-            fragments = [
-                self.read(region, task_core_id=task.core_id)
-                for region in source_regions
-            ]
-            values = np.concatenate(
-                fragments, axis=copy_details["source_region_axis"]
-            )
+            fragments = [self.read(region, task_core_id=task.core_id) for region in source_regions]
+            values = np.concatenate(fragments, axis=copy_details["source_region_axis"])
         else:
             values = self.read(source, task_core_id=task.core_id)
         if copy_details.get("layout_transform") is True:
             source_shape = tuple(copy_details["source_shape"])
             destination_shape = tuple(copy_details["destination_shape"])
-            if (
-                copy_details.get("source_window_direct") is True
-                or isinstance(source_regions, (tuple, list))
-            ):
+            if copy_details.get("source_window_direct") is True or isinstance(source_regions, (tuple, list)):
                 tile = values
             else:
-                logical = unpack_matrix(
-                    values, copy_details["source_layout"], source_shape
-                )
+                logical = unpack_matrix(values, copy_details["source_layout"], source_shape)
                 source_row, source_col = copy_details.get("source_origin", (0, 0))
-                window_shape = tuple(
-                    copy_details.get("source_window_shape", destination_shape)
-                )
+                window_shape = tuple(copy_details.get("source_window_shape", destination_shape))
                 tile = logical[
-                    source_row:source_row + window_shape[0],
-                    source_col:source_col + window_shape[1],
+                    source_row : source_row + window_shape[0],
+                    source_col : source_col + window_shape[1],
                 ]
             if copy_details.get("transpose_after_slice") is True:
                 tile = tile.T
@@ -431,9 +538,7 @@ class FunctionalSimulator:
         elif copy_details.get("layout") == "ub_to_ub":
             cast_mode = copy_details.get("cast_mode")
             destination_dtype = _numpy_dtype(destination.dtype)
-            if cast_mode == "CAST_RINT" and np.issubdtype(
-                destination_dtype, np.integer
-            ):
+            if cast_mode == "CAST_RINT" and np.issubdtype(destination_dtype, np.integer):
                 # Rounding to nearest-even applies to integer destinations;
                 # float destinations convert with IEEE nearest-even in
                 # np.asarray below.
@@ -455,11 +560,9 @@ class FunctionalSimulator:
                     (written_rows, physical_shape[1]),
                     dtype=_numpy_dtype(destination.dtype),
                 )
-                logical[:values.shape[0], :values.shape[1]] = values
+                logical[: values.shape[0], : values.shape[1]] = values
                 packed = pack_matrix(logical, "zN")
-                chunks = packed.reshape(
-                    len(destinations), packed.size // len(destinations)
-                )
+                chunks = packed.reshape(len(destinations), packed.size // len(destinations))
                 for region, chunk in zip(destinations, chunks):
                     self.write(
                         region,
@@ -467,10 +570,8 @@ class FunctionalSimulator:
                         task_core_id=task.core_id,
                     )
                 return
-            logical = np.zeros(
-                physical_shape, dtype=_numpy_dtype(destination.dtype)
-            )
-            logical[:values.shape[0], :values.shape[1]] = values
+            logical = np.zeros(physical_shape, dtype=_numpy_dtype(destination.dtype))
+            logical[: values.shape[0], : values.shape[1]] = values
             values = pack_matrix(logical, "zN")
         self.write(destination, values, task_core_id=task.core_id)
 
@@ -483,22 +584,14 @@ class FunctionalSimulator:
             right_values: Any = self.read(right, task_core_id=task.core_id)
         elif isinstance(task.metadata.get("scalar_src"), BufferRegion):
             scalar_source = task.metadata["scalar_src"]
-            right_values = self.read(
-                scalar_source, task_core_id=task.core_id
-            ).reshape(-1)[0]
+            right_values = self.read(scalar_source, task_core_id=task.core_id).reshape(-1)[0]
         elif "scalar" in task.metadata:
             right_values = task.metadata["scalar"]
             if isinstance(right_values, str) and right_values in self.bindings:
                 right_values = self.bindings[right_values]
         else:
-            raise ProgramValidationError(
-                f"task {task.task_id!r} requires a BufferRegion 'rhs' or scalar"
-            )
-        implementation = (
-            _BINARY_OPERATIONS[operation]
-            if operation in _BINARY_OPERATIONS
-            else _SCALAR_OPERATIONS[operation]
-        )
+            raise ProgramValidationError(f"task {task.task_id!r} requires a BufferRegion 'rhs' or scalar")
+        implementation = _BINARY_OPERATIONS[operation] if operation in _BINARY_OPERATIONS else _SCALAR_OPERATIONS[operation]
         result = implementation(left_values, right_values)
         self.write(destination, result, task_core_id=task.core_id)
 
@@ -515,9 +608,7 @@ class FunctionalSimulator:
         accumulator = _operand(task, "accumulator")
         scalar = task.metadata.get("scalar")
         if not isinstance(scalar, (bool, int, float)):
-            raise UnsupportedSimOpError(
-                f"functional axpy requires a literal scalar, got {scalar!r}"
-            )
+            raise UnsupportedSimOpError(f"functional axpy requires a literal scalar, got {scalar!r}")
         source_values = self.read(source, task_core_id=task.core_id)
         accumulator_values = self.read(accumulator, task_core_id=task.core_id)
         self.write(
@@ -531,10 +622,8 @@ class FunctionalSimulator:
         right = _operand(task, "rhs")
         destination = _operand(task, "dst")
         accumulator = _operand(task, "accumulator")
-        result = (
-            self.read(left, task_core_id=task.core_id)
-            * self.read(right, task_core_id=task.core_id)
-            + self.read(accumulator, task_core_id=task.core_id)
+        result = self.read(left, task_core_id=task.core_id) * self.read(right, task_core_id=task.core_id) + self.read(
+            accumulator, task_core_id=task.core_id
         )
         self.write(destination, result, task_core_id=task.core_id)
 
@@ -547,25 +636,17 @@ class FunctionalSimulator:
         shape_a = (details["rows"], details["inner"])
         shape_b = (details["inner"], actual_cols)
         shape_c = (details["rows"], actual_cols)
-        a_values = unpack_matrix(
-            self.read(left, task_core_id=task.core_id), "l0a", shape_a
-        )
-        b_values = unpack_matrix(
-            self.read(right, task_core_id=task.core_id), "l0b", shape_b
-        )
+        a_values = unpack_matrix(self.read(left, task_core_id=task.core_id), "l0a", shape_a)
+        b_values = unpack_matrix(self.read(right, task_core_id=task.core_id), "l0b", shape_b)
         compute_dtype = _numpy_dtype(destination.dtype)
-        result = np.matmul(
-            a_values.astype(compute_dtype), b_values.astype(compute_dtype)
-        )
+        result = np.matmul(a_values.astype(compute_dtype), b_values.astype(compute_dtype))
         bias = task.metadata.get("bias")
         if isinstance(bias, BufferRegion):
             bias_values = self.read(bias, task_core_id=task.core_id)
             result = result + bias_values.reshape(1, actual_cols)
         elif not details["init"]:
             accumulator = _operand(task, "accumulator")
-            previous = unpack_matrix(
-                self.read(accumulator, task_core_id=task.core_id), "l0c", shape_c
-            )
+            previous = unpack_matrix(self.read(accumulator, task_core_id=task.core_id), "l0c", shape_c)
             result = previous + result
         self.write(
             destination,
@@ -593,9 +674,7 @@ class FunctionalSimulator:
         if details["transpose_b"]:
             b_values = b_values.T
         compute_dtype = _numpy_dtype(destination.dtype)
-        result = np.matmul(
-            a_values.astype(compute_dtype), b_values.astype(compute_dtype)
-        )
+        result = np.matmul(a_values.astype(compute_dtype), b_values.astype(compute_dtype))
         if not details["init"]:
             accumulator = _operand(task, "accumulator")
             previous = unpack_matrix(
@@ -615,9 +694,7 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         details = task.metadata.get("im2col")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"im2col task {task.task_id!r} requires im2col metadata"
-            )
+            raise ProgramValidationError(f"im2col task {task.task_id!r} requires im2col metadata")
         hi, wi = details["image_shape"]
         kh, kw = details["kernel"]
         stride_h, stride_w = details["stride"]
@@ -633,22 +710,14 @@ class FunctionalSimulator:
             "zn",
             (hi * wi, channels),
         )
-        tile = np.zeros(
-            (valid_m, valid_k), dtype=_numpy_dtype(destination.dtype)
-        )
+        tile = np.zeros((valid_m, valid_k), dtype=_numpy_dtype(destination.dtype))
         for m in range(valid_m):
             output_row, output_col = divmod(m, output_w)
             for k in range(valid_k):
                 filter_point, channel = divmod(k, channels)
                 filter_row, filter_col = divmod(filter_point, kw)
-                image_row = (
-                    output_row * stride_h - pad_top
-                    + filter_row * dilation_h
-                )
-                image_col = (
-                    output_col * stride_w - pad_left
-                    + filter_col * dilation_w
-                )
+                image_row = output_row * stride_h - pad_top + filter_row * dilation_h
+                image_col = output_col * stride_w - pad_left + filter_col * dilation_w
                 if 0 <= image_row < hi and 0 <= image_col < wi:
                     tile[m, k] = feature[image_row * wi + image_col, channel]
         self.write(
@@ -681,18 +750,14 @@ class FunctionalSimulator:
         elif round_mode == "CAST_TRUNC":
             result = np.trunc(values)
         else:
-            raise UnsupportedSimOpError(
-                f"functional cast does not support round mode {round_mode!r}"
-            )
+            raise UnsupportedSimOpError(f"functional cast does not support round mode {round_mode!r}")
         self.write(destination, result, task_core_id=task.core_id)
 
     def _fill(self, task: Task) -> None:
         destination = _operand(task, "dst")
         scalar = task.metadata.get("scalar")
         if not isinstance(scalar, (bool, int, float)):
-            raise UnsupportedSimOpError(
-                f"functional fill requires a literal scalar, got {scalar!r}"
-            )
+            raise UnsupportedSimOpError(f"functional fill requires a literal scalar, got {scalar!r}")
         shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         result = np.full(shape, scalar, dtype=_numpy_dtype(destination.dtype))
         self.write(destination, result, task_core_id=task.core_id)
@@ -702,24 +767,17 @@ class FunctionalSimulator:
         source = _operand(task, "src")
         details = task.metadata.get("brcb")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"brcb task {task.task_id!r} requires brcb metadata"
-            )
+            raise ProgramValidationError(f"brcb task {task.task_id!r} requires brcb metadata")
         repeat = _resolve_int(details["repeat"], self.bindings)
         blk_stride = _resolve_int(details["blk_stride"], self.bindings)
         rep_stride = _resolve_int(details["rep_stride"], self.bindings)
         if repeat < 0 or blk_stride < 0 or rep_stride < 0:
-            raise ProgramValidationError(
-                "brcb repeat and strides must not be negative"
-            )
+            raise ProgramValidationError("brcb repeat and strides must not be negative")
         if repeat == 0:
             return
         values = self.read(source, task_core_id=task.core_id).reshape(-1)
         if values.size < repeat * 8:
-            raise ProgramValidationError(
-                f"brcb source provides {values.size} elements, requires "
-                f"{repeat * 8}"
-            )
+            raise ProgramValidationError(f"brcb source provides {values.size} elements, requires {repeat * 8}")
         itemsize = _numpy_dtype(destination.dtype).itemsize
         block_elements = 32 // itemsize
         block_bytes = block_elements * itemsize
@@ -748,9 +806,7 @@ class FunctionalSimulator:
         scalar_source = _operand(task, "scalar_src")
         details = task.metadata.get("row_expand")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"row-expand task {task.task_id!r} requires row_expand metadata"
-            )
+            raise ProgramValidationError(f"row-expand task {task.task_id!r} requires row_expand metadata")
         rows = _resolve_int(details["rows"], self.bindings)
         row_elements = _resolve_int(details["row_elements"], self.bindings)
         elements_per_block = row_elements // 8
@@ -760,15 +816,10 @@ class FunctionalSimulator:
             # With tmp the codegen expands brcb(src1 -> tmp) before the masked
             # op; reproduce that broadcast so the scratch end state matches.
             if scalars.size != rows:
-                raise ProgramValidationError(
-                    f"row-expand scalar source provides {scalars.size} elements, "
-                    f"requires {rows}"
-                )
+                raise ProgramValidationError(f"row-expand scalar source provides {scalars.size} elements, requires {rows}")
             self.write(
                 scratch,
-                np.repeat(scalars, elements_per_block).astype(
-                    _numpy_dtype(scratch.dtype)
-                ),
+                np.repeat(scalars, elements_per_block).astype(_numpy_dtype(scratch.dtype)),
                 task_core_id=task.core_id,
             )
         else:
@@ -778,13 +829,9 @@ class FunctionalSimulator:
                     f"requires {rows * elements_per_block} (one packed block per row)"
                 )
             scalars = scalars[::elements_per_block]
-        values = self.read(source, task_core_id=task.core_id).reshape(
-            rows, row_elements
-        )
+        values = self.read(source, task_core_id=task.core_id).reshape(rows, row_elements)
         implementation = _ROW_EXPAND_OPERATIONS[task.operation]
-        result = implementation(
-            values, scalars.astype(values.dtype)[:, None]
-        )
+        result = implementation(values, scalars.astype(values.dtype)[:, None])
         self.write(destination, result, task_core_id=task.core_id)
 
     def _bitwise_binary(self, task: Task, operation: str) -> None:
@@ -813,12 +860,8 @@ class FunctionalSimulator:
         shift = _resolve_int(task.metadata.get("shift"), self.bindings)
         bits = values.dtype.itemsize * 8
         if shift < 0 or shift > bits:
-            raise ProgramValidationError(
-                f"bitwise shift must be in [0, {bits}], got {shift}"
-            )
-        implementation = (
-            np.left_shift if operation == "bitwise_lshift" else np.right_shift
-        )
+            raise ProgramValidationError(f"bitwise shift must be in [0, {bits}], got {shift}")
+        implementation = np.left_shift if operation == "bitwise_lshift" else np.right_shift
         result = implementation(values, shift).astype(values.dtype, copy=False)
         self.write(destination, result, task_core_id=task.core_id)
 
@@ -839,9 +882,7 @@ class FunctionalSimulator:
         source = _operand(task, "src")
         count = _resolve_int(task.metadata.get("count"), self.bindings)
         if count < 0:
-            raise ProgramValidationError(
-                "reducesum_experiment count must not be negative"
-            )
+            raise ProgramValidationError("reducesum_experiment count must not be negative")
         values = self.read(source, task_core_id=task.core_id).reshape(-1)
         result = np.sum(values, dtype=values.dtype)
         self.write(
@@ -855,22 +896,16 @@ class FunctionalSimulator:
         source = _operand(task, "src")
         details = task.metadata.get("sum_experiment")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"sum_experiment task {task.task_id!r} requires metadata"
-            )
+            raise ProgramValidationError(f"sum_experiment task {task.task_id!r} requires metadata")
         outer = _resolve_int(details["outer"], self.bindings)
         inner = _resolve_int(details["inner"], self.bindings)
         valid = _resolve_int(details["valid"], self.bindings)
         if min(outer, inner, valid) < 0:
             raise ProgramValidationError("sum_experiment extents must not be negative")
         if valid > inner:
-            raise ProgramValidationError(
-                "sum_experiment valid width must not exceed inner width"
-            )
+            raise ProgramValidationError("sum_experiment valid width must not exceed inner width")
         if inner * _numpy_dtype(source.dtype).itemsize % 32:
-            raise ProgramValidationError(
-                "sum_experiment inner rows must be 32-byte aligned"
-            )
+            raise ProgramValidationError("sum_experiment inner rows must be 32-byte aligned")
         values = self.read(source, task_core_id=task.core_id)
         result = np.sum(values[:, :valid], axis=1, dtype=values.dtype)
         self.write(
@@ -887,24 +922,18 @@ class FunctionalSimulator:
         offset_values = self.read(offsets, task_core_id=task.core_id).reshape(-1)
         base = _resolve_int(task.metadata.get("base"), self.bindings)
         if base < 0:
-            raise ProgramValidationError(
-                f"gather base byte address must not be negative, got {base}"
-            )
+            raise ProgramValidationError(f"gather base byte address must not be negative, got {base}")
         itemsize = source_values.dtype.itemsize
         byte_addresses = offset_values.astype(np.int64) + base
         misaligned = byte_addresses % itemsize != 0
         if np.any(misaligned):
             bad = int(byte_addresses[np.flatnonzero(misaligned)[0]])
-            raise ProgramValidationError(
-                f"gather byte address must align with element size {itemsize}, got {bad}"
-            )
+            raise ProgramValidationError(f"gather byte address must align with element size {itemsize}, got {bad}")
         indices = byte_addresses // itemsize
         invalid = (indices < 0) | (indices >= source_values.size)
         if np.any(invalid):
             bad = int(indices[np.flatnonzero(invalid)[0]])
-            raise ProgramValidationError(
-                f"gather source index out of range: {bad} for {source_values.size} elements"
-            )
+            raise ProgramValidationError(f"gather source index out of range: {bad} for {source_values.size} elements")
         self.write(
             destination,
             source_values[indices].astype(source_values.dtype, copy=False),
@@ -916,38 +945,24 @@ class FunctionalSimulator:
         source = _operand(task, "src")
         offsets = _operand(task, "offsets")
         repeat = _resolve_int(task.metadata.get("repeat"), self.bindings)
-        dst_block_stride = _resolve_int(
-            task.metadata.get("dst_block_stride"), self.bindings
-        )
-        dst_repeat_stride = _resolve_int(
-            task.metadata.get("dst_repeat_stride"), self.bindings
-        )
+        dst_block_stride = _resolve_int(task.metadata.get("dst_block_stride"), self.bindings)
+        dst_repeat_stride = _resolve_int(task.metadata.get("dst_repeat_stride"), self.bindings)
         if min(repeat, dst_block_stride, dst_repeat_stride) < 0:
             raise ProgramValidationError("gatherb repeat/strides must not be negative")
         if repeat > 255:
-            raise ProgramValidationError(
-                f"gatherb repeat must not exceed 255, got {repeat}"
-            )
+            raise ProgramValidationError(f"gatherb repeat must not exceed 255, got {repeat}")
         source_values = self.read(source, task_core_id=task.core_id).reshape(-1)
         offset_values = self.read(offsets, task_core_id=task.core_id)
-        block_elements = _resolve_int(
-            task.metadata.get("elements_per_block"), self.bindings
-        )
-        blocks = np.empty(
-            offset_values.shape + (block_elements,), dtype=source_values.dtype
-        )
+        block_elements = _resolve_int(task.metadata.get("elements_per_block"), self.bindings)
+        blocks = np.empty(offset_values.shape + (block_elements,), dtype=source_values.dtype)
         for index in np.ndindex(offset_values.shape):
             byte_offset = int(offset_values[index])
             if byte_offset < 0 or byte_offset % 32:
-                raise ProgramValidationError(
-                    f"gatherb byte offset must be non-negative and 32-byte aligned, got {byte_offset}"
-                )
+                raise ProgramValidationError(f"gatherb byte offset must be non-negative and 32-byte aligned, got {byte_offset}")
             source_index = byte_offset // source_values.dtype.itemsize
             if source_index + block_elements > source_values.size:
-                raise ProgramValidationError(
-                    f"gatherb source block out of range at byte offset {byte_offset}"
-                )
-            blocks[index] = source_values[source_index:source_index + block_elements]
+                raise ProgramValidationError(f"gatherb source block out of range at byte offset {byte_offset}")
+            blocks[index] = source_values[source_index : source_index + block_elements]
         self.write(destination, blocks, task_core_id=task.core_id)
 
     def _gather_mask(self, task: Task) -> None:
@@ -966,28 +981,20 @@ class FunctionalSimulator:
                 "P1000": (3,),
                 "P1111": (0, 1, 2, 3),
             }[pattern]
-            indices = np.flatnonzero(
-                np.isin(np.arange(source_values.size) % 4, residues)
-            )
+            indices = np.flatnonzero(np.isin(np.arange(source_values.size) % 4, residues))
         elif mode == "custom":
             offsets = _operand(task, "offsets")
-            indices = self.read(
-                offsets, task_core_id=task.core_id
-            ).reshape(-1).astype(np.int64)
+            indices = self.read(offsets, task_core_id=task.core_id).reshape(-1).astype(np.int64)
             invalid = indices >= source_values.size
             if np.any(invalid):
                 bad = int(indices[np.flatnonzero(invalid)[0]])
-                raise ProgramValidationError(
-                    f"gather_mask source index out of range: {bad}"
-                )
+                raise ProgramValidationError(f"gather_mask source index out of range: {bad}")
         else:
             raise UnsupportedSimOpError(f"unsupported gather_mask mode {mode!r}")
         result = np.zeros(destination.shape, dtype=source_values.dtype).reshape(-1)
         if indices.size > result.size:
-            raise ProgramValidationError(
-                "gather_mask destination cannot hold all selected elements"
-            )
-        result[:indices.size] = source_values[indices]
+            raise ProgramValidationError("gather_mask destination cannot hold all selected elements")
+        result[: indices.size] = source_values[indices]
         self.write(
             destination,
             result.reshape(destination.shape),
@@ -1008,9 +1015,7 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         source = _operand(task, "src")
         if task.metadata.get("materialize_view"):
-            source_values = np.ascontiguousarray(
-                self.read(source, task_core_id=task.core_id)
-            )
+            source_values = np.ascontiguousarray(self.read(source, task_core_id=task.core_id))
             destination_dtype = _numpy_dtype(destination.dtype)
             self.write(
                 destination,
@@ -1030,9 +1035,7 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         details = task.metadata.get("topk")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"topk task {task.task_id!r} requires topk metadata"
-            )
+            raise ProgramValidationError(f"topk task {task.task_id!r} requires topk metadata")
         k = _resolve_int(details["k"], self.bindings)
         values = self.read(source, task_core_id=task.core_id).reshape(-1)
         order = np.argsort(-values.astype(np.float64), kind="stable")[:k]
@@ -1045,40 +1048,24 @@ class FunctionalSimulator:
         source = _operand(task, "src")
         indices = _operand(task, "offsets")
         destination = _operand(task, "dst")
-        repeat_times = _resolve_int(
-            task.metadata.get("repeat_times"), self.bindings
-        )
+        repeat_times = _resolve_int(task.metadata.get("repeat_times"), self.bindings)
         if not (1 <= repeat_times <= 255):
-            raise ProgramValidationError(
-                f"sort32 repeatTimes must be in [1, 255], got {repeat_times}"
-            )
-        source_values = self.read(
-            source, task_core_id=task.core_id
-        ).reshape(repeat_times, 32)
-        index_values = self.read(
-            indices, task_core_id=task.core_id
-        ).reshape(repeat_times, 32)
-        multiplier = _resolve_int(
-            task.metadata.get("output_multiplier"), self.bindings
-        )
+            raise ProgramValidationError(f"sort32 repeatTimes must be in [1, 255], got {repeat_times}")
+        source_values = self.read(source, task_core_id=task.core_id).reshape(repeat_times, 32)
+        index_values = self.read(indices, task_core_id=task.core_id).reshape(repeat_times, 32)
+        multiplier = _resolve_int(task.metadata.get("output_multiplier"), self.bindings)
         result = np.zeros(
             repeat_times * 32 * multiplier,
             dtype=_numpy_dtype(destination.dtype),
         ).reshape(repeat_times, 32, multiplier)
         for repeat in range(repeat_times):
-            order = np.argsort(
-                -source_values[repeat].astype(np.float64), kind="stable"
-            )
+            order = np.argsort(-source_values[repeat].astype(np.float64), kind="stable")
             result[repeat, :, 0] = source_values[repeat, order]
-            encoded_indices = np.ascontiguousarray(
-                index_values[repeat, order]
-            )
+            encoded_indices = np.ascontiguousarray(index_values[repeat, order])
             if destination.dtype == "float32":
                 result[repeat, :, 1] = encoded_indices.view(np.float32)
             else:
-                result[repeat, :, 2:4] = encoded_indices.view(np.float16).reshape(
-                    32, 2
-                )
+                result[repeat, :, 2:4] = encoded_indices.view(np.float16).reshape(32, 2)
         self.write(
             destination,
             result.reshape(-1),
@@ -1099,15 +1086,10 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         details = task.metadata.get("init_sort_buf")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"init_sort_buf task {task.task_id!r} requires init_sort_buf metadata"
-            )
+            raise ProgramValidationError(f"init_sort_buf task {task.task_id!r} requires init_sort_buf metadata")
         covered = _resolve_int(details["covered_elements"], self.bindings)
         if covered < 0:
-            raise ProgramValidationError(
-                "init_sort_buf covered element count must not be negative, "
-                f"got {covered}"
-            )
+            raise ProgramValidationError(f"init_sort_buf covered element count must not be negative, got {covered}")
         if covered == 0:
             return
         region = replace(destination, shape=(covered,))
@@ -1120,31 +1102,19 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         details = task.metadata.get("merge_sort")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"merge_sort task {task.task_id!r} requires merge_sort metadata"
-            )
+            raise ProgramValidationError(f"merge_sort task {task.task_id!r} requires merge_sort metadata")
         record_width = _resolve_int(details["record_width"], self.bindings)
         sources = task.metadata.get("src_regions")
-        if not isinstance(sources, (tuple, list)) or not all(
-            isinstance(source, BufferRegion) for source in sources
-        ):
-            raise ProgramValidationError(
-                f"merge_sort task {task.task_id!r} requires source regions"
-            )
+        if not isinstance(sources, (tuple, list)) or not all(isinstance(source, BufferRegion) for source in sources):
+            raise ProgramValidationError(f"merge_sort task {task.task_id!r} requires source regions")
         values = []
         indices = []
         for source_number, source in enumerate(sources):
-            records = self.read(
-                source, task_core_id=task.core_id
-            ).reshape(-1, record_width)
+            records = self.read(source, task_core_id=task.core_id).reshape(-1, record_width)
             if np.any(np.isnan(records[:, 0])):
-                raise ProgramValidationError(
-                    "merge_sort NaN ordering has no confirmed A2/A3 contract"
-                )
+                raise ProgramValidationError("merge_sort NaN ordering has no confirmed A2/A3 contract")
             if np.any(records[:-1, 0] < records[1:, 0]):
-                raise ProgramValidationError(
-                    f"merge_sort source{source_number} is not descending"
-                )
+                raise ProgramValidationError(f"merge_sort source{source_number} is not descending")
             values.append(records[:, 0])
             indices.append(records[:, 1:])
         merged_values = np.concatenate(values)
@@ -1174,9 +1144,7 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         details = task.metadata.get("atomic")
         if not isinstance(details, Mapping):
-            raise ProgramValidationError(
-                f"atomic task {task.task_id!r} requires atomic metadata"
-            )
+            raise ProgramValidationError(f"atomic task {task.task_id!r} requires atomic metadata")
         logical = unpack_matrix(
             self.read(source, task_core_id=task.core_id),
             "l0c",
@@ -1184,9 +1152,7 @@ class FunctionalSimulator:
         )
         rows = _resolve_int(details["rows"], self.bindings)
         cols = _resolve_int(details["cols"], self.bindings)
-        converted = logical[:rows, :cols].astype(
-            _numpy_dtype(destination.dtype)
-        )
+        converted = logical[:rows, :cols].astype(_numpy_dtype(destination.dtype))
         previous = self.read(destination, task_core_id=task.core_id)
         self.write(
             destination,
@@ -1200,9 +1166,7 @@ class FunctionalSimulator:
         values = self.read(source, task_core_id=task.core_id)
         result = self.read(destination, task_core_id=task.core_id)
         mask = _resolve_int(task.metadata.get("mask"), self.bindings)
-        elements_per_block = _resolve_int(
-            task.metadata.get("elements_per_block"), self.bindings
-        )
+        elements_per_block = _resolve_int(task.metadata.get("elements_per_block"), self.bindings)
         kind = task.metadata.get("reduce_kind")
         for block_index in range(values.shape[1]):
             active = min(elements_per_block, mask - block_index * elements_per_block)
@@ -1217,9 +1181,7 @@ class FunctionalSimulator:
             elif kind == "reduce_min":
                 result[:, block_index] = np.min(compute, axis=1)
             else:
-                raise UnsupportedSimOpError(
-                    f"functional block reduction does not support kind {kind!r}"
-                )
+                raise UnsupportedSimOpError(f"functional block reduction does not support kind {kind!r}")
         self.write(destination, result, task_core_id=task.core_id)
 
     def _whole_reduce(self, task: Task) -> None:
@@ -1231,9 +1193,7 @@ class FunctionalSimulator:
         if mask == 0:
             self.write(destination, result, task_core_id=task.core_id)
             return
-        elements_per_block = _resolve_int(
-            task.metadata.get("elements_per_block"), self.bindings
-        )
+        elements_per_block = _resolve_int(task.metadata.get("elements_per_block"), self.bindings)
         kind = task.metadata.get("reduce_kind")
         order = task.metadata.get("reduce_order")
         for repeat_index in range(values.shape[0]):
@@ -1253,13 +1213,9 @@ class FunctionalSimulator:
                 result[repeat_index, 0] = compute[index]
                 if order == "ORDER_VALUE_INDEX":
                     index_dtype = np.uint16 if result.dtype.itemsize == 2 else np.uint32
-                    result[repeat_index, 1] = np.asarray(
-                        [index], dtype=index_dtype
-                    ).view(result.dtype)[0]
+                    result[repeat_index, 1] = np.asarray([index], dtype=index_dtype).view(result.dtype)[0]
             else:
-                raise UnsupportedSimOpError(
-                    f"functional whole reduction does not support kind {kind!r}"
-                )
+                raise UnsupportedSimOpError(f"functional whole reduction does not support kind {kind!r}")
         self.write(destination, result, task_core_id=task.core_id)
 
     def _clamp(self, task: Task, operation: str) -> None:
@@ -1269,43 +1225,27 @@ class FunctionalSimulator:
         if operation == "clamp":
             minimum = task.metadata.get("min_value")
             maximum = task.metadata.get("max_value")
-            if not isinstance(minimum, (bool, int, float)) or not isinstance(
-                maximum, (bool, int, float)
-            ):
-                raise UnsupportedSimOpError(
-                    f"functional clamp requires literal bounds, got {minimum!r}, {maximum!r}"
-                )
+            if not isinstance(minimum, (bool, int, float)) or not isinstance(maximum, (bool, int, float)):
+                raise UnsupportedSimOpError(f"functional clamp requires literal bounds, got {minimum!r}, {maximum!r}")
             if minimum > maximum:
-                raise ProgramValidationError(
-                    f"clamp minimum {minimum} exceeds maximum {maximum}"
-                )
+                raise ProgramValidationError(f"clamp minimum {minimum} exceeds maximum {maximum}")
             result = np.clip(values, minimum, maximum)
         else:
             scalar = task.metadata.get("scalar")
             if not isinstance(scalar, (bool, int, float)):
-                raise UnsupportedSimOpError(
-                    f"functional {operation} requires a literal bound, got {scalar!r}"
-                )
-            result = (
-                np.minimum(values, scalar)
-                if operation == "clamp_max"
-                else np.maximum(values, scalar)
-            )
+                raise UnsupportedSimOpError(f"functional {operation} requires a literal bound, got {scalar!r}")
+            result = np.minimum(values, scalar) if operation == "clamp_max" else np.maximum(values, scalar)
         self.write(destination, result, task_core_id=task.core_id)
 
     def _broadcast(self, task: Task) -> None:
         source = _operand(task, "src")
         destination = _operand(task, "dst")
         values = self.read(source, task_core_id=task.core_id)
-        destination_shape = tuple(
-            _resolve_int(value, self.bindings) for value in destination.shape
-        )
+        destination_shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         try:
             result = np.broadcast_to(values, destination_shape)
         except ValueError as error:
-            raise ProgramValidationError(
-                f"cannot broadcast source shape {values.shape} to {destination_shape}"
-            ) from error
+            raise ProgramValidationError(f"cannot broadcast source shape {values.shape} to {destination_shape}") from error
         self.write(destination, result, task_core_id=task.core_id)
 
     def _compare(self, task: Task) -> None:
@@ -1317,31 +1257,23 @@ class FunctionalSimulator:
             right_values: Any = self.read(right, task_core_id=task.core_id)
         elif isinstance(task.metadata.get("scalar_src"), BufferRegion):
             scalar_source = _operand(task, "scalar_src")
-            right_values = self.read(
-                scalar_source, task_core_id=task.core_id
-            ).reshape(-1)[0]
+            right_values = self.read(scalar_source, task_core_id=task.core_id).reshape(-1)[0]
         elif "scalar" in task.metadata:
             right_values = task.metadata["scalar"]
         else:
-            raise ProgramValidationError(
-                f"compare task {task.task_id!r} requires rhs or scalar metadata"
-            )
+            raise ProgramValidationError(f"compare task {task.task_id!r} requires rhs or scalar metadata")
         mode = task.metadata.get("compare_mode")
         implementation = _COMPARE_OPERATIONS.get(mode)
         if implementation is None:
             raise UnsupportedSimOpError(f"unsupported compare mode {mode!r}")
         predicate = np.asarray(implementation(left_values, right_values)).reshape(-1)
         packed = np.packbits(predicate, bitorder="little")
-        destination_shape = tuple(
-            _resolve_int(value, self.bindings) for value in destination.shape
-        )
+        destination_shape = tuple(_resolve_int(value, self.bindings) for value in destination.shape)
         required = int(np.prod(destination_shape))
         if packed.size > required:
-            raise ProgramValidationError(
-                f"packed compare result needs {packed.size} bytes, destination has {required}"
-            )
+            raise ProgramValidationError(f"packed compare result needs {packed.size} bytes, destination has {required}")
         result = np.zeros(required, dtype=_numpy_dtype(destination.dtype))
-        result[:packed.size] = packed
+        result[: packed.size] = packed
         self.write(
             destination,
             result.reshape(destination_shape),
@@ -1354,29 +1286,20 @@ class FunctionalSimulator:
         destination = _operand(task, "dst")
         mask_values = self.read(mask, task_core_id=task.core_id)
         left_values = self.read(left, task_core_id=task.core_id)
-        unpacked = np.unpackbits(
-            np.asarray(mask_values, dtype=np.uint8).reshape(-1), bitorder="little"
-        )
+        unpacked = np.unpackbits(np.asarray(mask_values, dtype=np.uint8).reshape(-1), bitorder="little")
         if unpacked.size < left_values.size:
-            raise ProgramValidationError(
-                f"select mask provides {unpacked.size} bits for {left_values.size} values"
-            )
-        predicate = unpacked[:left_values.size].reshape(left_values.shape).astype(bool)
+            raise ProgramValidationError(f"select mask provides {unpacked.size} bits for {left_values.size} values")
+        predicate = unpacked[: left_values.size].reshape(left_values.shape).astype(bool)
         right = task.metadata.get("rhs")
         if isinstance(right, BufferRegion):
             right_values: Any = self.read(right, task_core_id=task.core_id)
         elif isinstance(task.metadata.get("scalar_src"), BufferRegion):
             scalar_source = _operand(task, "scalar_src")
-            right_values = self.read(
-                scalar_source, task_core_id=task.core_id
-            ).reshape(-1)[0]
+            right_values = self.read(scalar_source, task_core_id=task.core_id).reshape(-1)[0]
         elif "scalar" in task.metadata:
             right_values = task.metadata["scalar"]
         else:
-            raise ProgramValidationError(
-                f"select task {task.task_id!r} requires rhs, scalar_src, "
-                "or scalar metadata"
-            )
+            raise ProgramValidationError(f"select task {task.task_id!r} requires rhs, scalar_src, or scalar metadata")
         self.write(
             destination,
             np.where(predicate, left_values, right_values),
@@ -1393,18 +1316,14 @@ class FunctionalSimulator:
         elif "scalar" in task.metadata:
             right_values = task.metadata["scalar"]
         else:
-            raise ProgramValidationError(
-                f"tail compare task {task.task_id!r} requires rhs or scalar metadata"
-            )
+            raise ProgramValidationError(f"tail compare task {task.task_id!r} requires rhs or scalar metadata")
         mode = task.metadata.get("compare_mode")
         implementation = _COMPARE_OPERATIONS.get(mode)
         if implementation is None:
             raise UnsupportedSimOpError(f"unsupported tail compare mode {mode!r}")
         predicate = np.asarray(implementation(left_values, right_values))
         if predicate.ndim != 2:
-            raise ProgramValidationError(
-                f"tail compare requires a 2D valid rectangle, got {predicate.shape}"
-            )
+            raise ProgramValidationError(f"tail compare requires a 2D valid rectangle, got {predicate.shape}")
         self.write(
             destination,
             np.packbits(predicate, axis=1, bitorder="little"),
@@ -1418,27 +1337,18 @@ class FunctionalSimulator:
         mask_values = self.read(mask, task_core_id=task.core_id)
         left_values = self.read(left, task_core_id=task.core_id)
         if mask_values.ndim != 2 or left_values.ndim != 2:
-            raise ProgramValidationError(
-                "tail select requires 2D mask and source valid rectangles"
-            )
-        unpacked = np.unpackbits(
-            np.asarray(mask_values, dtype=np.uint8), axis=1, bitorder="little"
-        )
+            raise ProgramValidationError("tail select requires 2D mask and source valid rectangles")
+        unpacked = np.unpackbits(np.asarray(mask_values, dtype=np.uint8), axis=1, bitorder="little")
         if unpacked.shape[1] < left_values.shape[1]:
-            raise ProgramValidationError(
-                f"tail select mask row provides {unpacked.shape[1]} bits for "
-                f"{left_values.shape[1]} values"
-            )
-        predicate = unpacked[:, :left_values.shape[1]].astype(bool)
+            raise ProgramValidationError(f"tail select mask row provides {unpacked.shape[1]} bits for {left_values.shape[1]} values")
+        predicate = unpacked[:, : left_values.shape[1]].astype(bool)
         right = task.metadata.get("rhs")
         if isinstance(right, BufferRegion):
             right_values: Any = self.read(right, task_core_id=task.core_id)
         elif "scalar" in task.metadata:
             right_values = task.metadata["scalar"]
         else:
-            raise ProgramValidationError(
-                f"tail select task {task.task_id!r} requires rhs or scalar metadata"
-            )
+            raise ProgramValidationError(f"tail select task {task.task_id!r} requires rhs or scalar metadata")
         self.write(
             destination,
             np.where(predicate, left_values, right_values),
@@ -1484,11 +1394,7 @@ class FunctionalSimulator:
         )
         shape = tuple(_resolve_int(value, self.bindings) for value in region.shape)
         byte_offset = _resolve_int(region.byte_offset, self.bindings)
-        strides = (
-            None
-            if region.strides_bytes is None
-            else tuple(_resolve_int(value, self.bindings) for value in region.strides_bytes)
-        )
+        strides = None if region.strides_bytes is None else tuple(_resolve_int(value, self.bindings) for value in region.strides_bytes)
         return allocation.view(
             byte_offset=byte_offset,
             shape=shape,
@@ -1500,10 +1406,26 @@ class FunctionalSimulator:
 def _operand(task: Task, name: str) -> BufferRegion:
     value = task.metadata.get(name)
     if not isinstance(value, BufferRegion):
-        raise ProgramValidationError(
-            f"task {task.task_id!r} requires BufferRegion metadata {name!r}"
-        )
+        raise ProgramValidationError(f"task {task.task_id!r} requires BufferRegion metadata {name!r}")
     return value
+
+
+def _metadata_regions(metadata: Mapping[str, Any], names: tuple[str, ...]) -> tuple[BufferRegion, ...]:
+    """Collect region operands while preferring precise segmented regions."""
+    regions = []
+    has_source_regions = isinstance(metadata.get("src_regions"), (tuple, list))
+    has_destination_regions = isinstance(metadata.get("dst_regions"), (tuple, list))
+    for name in names:
+        if name == "src" and has_source_regions:
+            continue
+        if name == "dst" and has_destination_regions:
+            continue
+        value = metadata.get(name)
+        if isinstance(value, BufferRegion):
+            regions.append(value)
+        elif isinstance(value, (tuple, list)):
+            regions.extend(region for region in value if isinstance(region, BufferRegion))
+    return tuple(regions)
 
 
 def _numpy_dtype(dtype: str) -> np.dtype[Any]:
@@ -1518,16 +1440,12 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
         try:
             import ml_dtypes
         except ImportError as error:
-            raise UnsupportedSimOpError(
-                "bfloat16 simulation requires the ml_dtypes package"
-            ) from error
+            raise UnsupportedSimOpError("bfloat16 simulation requires the ml_dtypes package") from error
         return np.dtype(ml_dtypes.bfloat16)
     try:
         return np.dtype(normalized)
     except TypeError as error:
-        raise UnsupportedSimOpError(
-            f"NumPy cannot represent simulator dtype {dtype!r}"
-        ) from error
+        raise UnsupportedSimOpError(f"NumPy cannot represent simulator dtype {dtype!r}") from error
 
 
 def _resolve_int(value: Any, bindings: Mapping[str, int | float]) -> int:

@@ -2,12 +2,16 @@
 # Licensed under the MIT License.
 """Byte-addressed A2/A3 functional memory model."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
+from functools import cache
 from itertools import product
 from numbers import Integral
 import re
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any
+from collections.abc import Iterable, Mapping, Sequence
 
 from .errors import (
     MemoryAccessError,
@@ -43,6 +47,7 @@ _SHARED_SCOPES = frozenset({MemoryScope.GM, MemoryScope.WORKSPACE})
 _DTYPE_PATTERN = re.compile(r"^(?:u?int|float|bfloat)(\d+)(?:x(\d+))?$")
 
 
+@cache
 def dtype_size_bytes(dtype: str) -> int:
     """Return the byte width of one scalar/vector element."""
     normalized = dtype.strip().lower()
@@ -57,7 +62,7 @@ def dtype_size_bytes(dtype: str) -> int:
     return bits // 8 * lanes
 
 
-def contiguous_strides_bytes(shape: Sequence[int], itemsize: int) -> Tuple[int, ...]:
+def contiguous_strides_bytes(shape: Sequence[int], itemsize: int) -> tuple[int, ...]:
     """Return C-contiguous byte strides for ``shape``."""
     stride = itemsize
     result = []
@@ -82,7 +87,7 @@ class AddressRange:
     def size(self) -> int:
         return self.end - self.start
 
-    def overlaps(self, other: "AddressRange") -> bool:
+    def overlaps(self, other: AddressRange) -> bool:
         return self.start < other.end and other.start < self.end
 
 
@@ -90,11 +95,11 @@ class AddressRange:
 class MemoryView:
     """A typed, strided view into a named allocation."""
 
-    allocation: "MemoryAllocation"
+    allocation: MemoryAllocation
     byte_offset: int
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     dtype: str
-    strides_bytes: Tuple[int, ...]
+    strides_bytes: tuple[int, ...]
 
     @property
     def itemsize(self) -> int:
@@ -106,8 +111,7 @@ class MemoryView:
         start = self.allocation.address + self.byte_offset
         if any(extent == 0 for extent in self.shape):
             return AddressRange(start, start)
-        last = sum((extent - 1) * stride
-                   for extent, stride in zip(self.shape, self.strides_bytes))
+        last = sum((extent - 1) * stride for extent, stride in zip(self.shape, self.strides_bytes))
         return AddressRange(start, start + last + self.itemsize)
 
     @property
@@ -119,18 +123,56 @@ class MemoryView:
         return elements * self.itemsize
 
     @property
-    def address_ranges(self) -> Tuple[AddressRange, ...]:
+    def address_ranges(self) -> tuple[AddressRange, ...]:
         """Return exact merged physical ranges touched by the view."""
         if any(extent == 0 for extent in self.shape):
             return ()
         start = self.allocation.address + self.byte_offset
+        if self.strides_bytes == contiguous_strides_bytes(self.shape, self.itemsize):
+            return (self.byte_range,)
+        if self.shape and self.strides_bytes[-1] == self.itemsize:
+            ranges = []
+            outer_shape = self.shape[:-1]
+            outer_strides = self.strides_bytes[:-1]
+            for indices in product(*(range(extent) for extent in outer_shape)):
+                row_start = start + sum(index * stride for index, stride in zip(indices, outer_strides))
+                current = AddressRange(row_start, row_start + self.shape[-1] * self.itemsize)
+                if ranges and ranges[-1].end == current.start:
+                    ranges[-1] = AddressRange(ranges[-1].start, current.end)
+                else:
+                    ranges.append(current)
+            return tuple(ranges)
         ranges = []
         for indices in product(*(range(extent) for extent in self.shape)):
-            element_start = start + sum(index * stride
-                                        for index, stride in zip(indices, self.strides_bytes))
+            element_start = start + sum(index * stride for index, stride in zip(indices, self.strides_bytes))
             current = AddressRange(element_start, element_start + self.itemsize)
             if ranges and ranges[-1].end == current.start:
                 ranges[-1] = AddressRange(ranges[-1].start, current.end)
+            else:
+                ranges.append(current)
+        return tuple(ranges)
+
+    @property
+    def physical_address_ranges(self) -> tuple[AddressRange, ...]:
+        """Return the touched byte union without preserving logical element order."""
+        if any(extent == 0 for extent in self.shape):
+            return ()
+        expected_stride = self.itemsize
+        dense = True
+        for extent, stride in sorted(zip(self.shape, self.strides_bytes), key=lambda item: item[1]):
+            if extent <= 1:
+                continue
+            if stride != expected_stride:
+                dense = False
+                break
+            expected_stride *= extent
+        if dense:
+            return (self.byte_range,)
+
+        ranges = []
+        for current in sorted(self.address_ranges):
+            if ranges and current.start <= ranges[-1].end:
+                ranges[-1] = AddressRange(ranges[-1].start, max(ranges[-1].end, current.end))
             else:
                 ranges.append(current)
         return tuple(ranges)
@@ -158,7 +200,7 @@ class MemoryAllocation:
         spec: BufferSpec,
         size_bytes: int,
         address: int,
-        core_id: Optional[int],
+        core_id: int | None,
         reporter: HazardReporter,
         backing: _AddressSpace,
     ) -> None:
@@ -178,15 +220,14 @@ class MemoryAllocation:
         self,
         *,
         byte_offset: int = 0,
-        shape: Optional[Sequence[int]] = None,
-        dtype: Optional[str] = None,
-        strides_bytes: Optional[Sequence[int]] = None,
+        shape: Sequence[int] | None = None,
+        dtype: str | None = None,
+        strides_bytes: Sequence[int] | None = None,
     ) -> MemoryView:
         """Create a view after validating rank and physical byte bounds."""
         view_dtype = dtype or self.spec.dtype
         view_shape = _concrete_shape(shape if shape is not None else self.spec.shape)
-        strides = (contiguous_strides_bytes(view_shape, dtype_size_bytes(view_dtype))
-                   if strides_bytes is None else tuple(strides_bytes))
+        strides = contiguous_strides_bytes(view_shape, dtype_size_bytes(view_dtype)) if strides_bytes is None else tuple(strides_bytes)
         if len(strides) != len(view_shape):
             raise MemoryBoundsError("view shape and strides must have the same rank")
         if byte_offset < 0 or any(stride < 0 for stride in strides):
@@ -194,63 +235,82 @@ class MemoryAllocation:
         view = MemoryView(self, byte_offset, view_shape, view_dtype, strides)
         if view.byte_range.end > self.address + self.size_bytes:
             relative_end = view.byte_range.end - self.address
-            raise MemoryBoundsError(
-                f"view of buffer {self.spec.name!r} reaches byte {relative_end}, "
-                f"allocation size is {self.size_bytes}"
-            )
+            raise MemoryBoundsError(f"view of buffer {self.spec.name!r} reaches byte {relative_end}, allocation size is {self.size_bytes}")
         return view
 
-    def read(self, target: Union[MemoryView, AddressRange]) -> bytes:
+    def read(self, target: MemoryView | AddressRange) -> bytes:
         """Read a contiguous physical range and report uninitialized bytes."""
         ranges = self._resolve_ranges(target)
-        missing = [i for interval in ranges for i in range(interval.start, interval.end)
-                   if not self._backing.initialized[i]]
-        if missing:
-            first, end = missing[0], missing[-1] + 1
-            self._reporter.report(
-                HazardDiagnostic(
-                    "read-before-write",
-                    f"read-before-write in buffer {self.spec.name!r}, bytes [{first}, {end})",
-                    self.spec.name,
-                    self.core_id,
-                    first,
-                    end,
-                ),
-                error_type=UninitializedMemoryError,
-            )
-        return b"".join(
-            bytes(self._backing.data[interval.start:interval.end]) for interval in ranges
-        )
+        self._check_initialized_ranges(ranges)
+        return b"".join(bytes(self._backing.data[interval.start : interval.end]) for interval in ranges)
 
-    def write(self, target: Union[MemoryView, AddressRange], data: bytes) -> None:
+    def check_initialized(self, target: MemoryView | AddressRange) -> bool:
+        """Check poison metadata without reading or materializing payload bytes."""
+        return self._check_initialized_ranges(self._resolve_physical_ranges(target))
+
+    def mark_initialized(self, target: MemoryView | AddressRange, initialized: bool = True) -> None:
+        """Set initialization metadata without modifying payload bytes."""
+        marker = b"\x01" if initialized else b"\x00"
+        for interval in self._resolve_physical_ranges(target):
+            self._backing.initialized[interval.start : interval.end] = marker * interval.size
+
+    def write(self, target: MemoryView | AddressRange, data: bytes) -> None:
         """Write a contiguous physical range and mark it initialized."""
         ranges = self._resolve_ranges(target)
         payload = bytes(data)
         expected = sum(interval.size for interval in ranges)
         if len(payload) != expected:
-            raise MemoryBoundsError(
-                f"write to buffer {self.spec.name!r} expects {expected} bytes, "
-                f"got {len(payload)}"
-            )
+            raise MemoryBoundsError(f"write to buffer {self.spec.name!r} expects {expected} bytes, got {len(payload)}")
         offset = 0
         for interval in ranges:
             next_offset = offset + interval.size
-            self._backing.data[interval.start:interval.end] = payload[offset:next_offset]
-            self._backing.initialized[interval.start:interval.end] = b"\x01" * interval.size
+            self._backing.data[interval.start : interval.end] = payload[offset:next_offset]
+            self._backing.initialized[interval.start : interval.end] = b"\x01" * interval.size
             offset = next_offset
 
-    def initialized(self, target: Optional[Union[MemoryView, AddressRange]] = None) -> bool:
+    def initialized(self, target: MemoryView | AddressRange | None = None) -> bool:
         """Return whether all bytes in ``target`` have been written."""
-        ranges = ((self.address_range,) if target is None
-                  else self._resolve_ranges(target))
-        return all(
-            all(self._backing.initialized[interval.start:interval.end]) for interval in ranges
-        )
+        ranges = (self.address_range,) if target is None else self._resolve_physical_ranges(target)
+        return all(all(self._backing.initialized[interval.start : interval.end]) for interval in ranges)
 
-    def _resolve_ranges(
-        self, target: Union[MemoryView, AddressRange]
-    ) -> Tuple[AddressRange, ...]:
+    def _check_initialized_ranges(self, ranges: tuple[AddressRange, ...]) -> bool:
+        missing = [
+            (first, last + 1)
+            for interval in ranges
+            if (first := self._backing.initialized.find(b"\x00", interval.start, interval.end)) >= 0
+            for last in (self._backing.initialized.rfind(b"\x00", interval.start, interval.end),)
+        ]
+        if not missing:
+            return True
+        first = missing[0][0]
+        end = missing[-1][1]
+        self._reporter.report(
+            HazardDiagnostic(
+                "read-before-write",
+                f"read-before-write in buffer {self.spec.name!r}, bytes [{first}, {end})",
+                self.spec.name,
+                self.core_id,
+                first,
+                end,
+            ),
+            error_type=UninitializedMemoryError,
+        )
+        return False
+
+    def _resolve_ranges(self, target: MemoryView | AddressRange) -> tuple[AddressRange, ...]:
         absolute_ranges = target.address_ranges if isinstance(target, MemoryView) else (target,)
+        result = []
+        for absolute in absolute_ranges:
+            if absolute.start < self.address or absolute.end > self.address + self.size_bytes:
+                raise MemoryBoundsError(
+                    f"access [{absolute.start}, {absolute.end}) escapes buffer "
+                    f"{self.spec.name!r} at [{self.address}, {self.address + self.size_bytes})"
+                )
+            result.append(absolute)
+        return tuple(result)
+
+    def _resolve_physical_ranges(self, target: MemoryView | AddressRange) -> tuple[AddressRange, ...]:
+        absolute_ranges = target.physical_address_ranges if isinstance(target, MemoryView) else (target,)
         result = []
         for absolute in absolute_ranges:
             if absolute.start < self.address or absolute.end > self.address + self.size_bytes:
@@ -270,7 +330,7 @@ class MemoryRuntime:
         core_ids: Iterable[int],
         *,
         hazard_check: str = "error",
-        local_capacities: Optional[Mapping[MemoryScope, int]] = None,
+        local_capacities: Mapping[MemoryScope, int] | None = None,
     ) -> None:
         ids = tuple(sorted(set(core_ids)))
         if any(core_id < 0 for core_id in ids):
@@ -280,14 +340,12 @@ class MemoryRuntime:
         # Keep the public core IDs physical and use an internal, collision-free
         # owner ID for Vector lane 1.
         self._vector1_owner_offset = (max(ids) + 1) if ids else 1
-        self._local_owner_ids = ids + tuple(
-            self._vector1_owner_offset + core_id for core_id in ids
-        )
+        self._local_owner_ids = ids + tuple(self._vector1_owner_offset + core_id for core_id in ids)
         self.reporter = HazardReporter(hazard_check)
         self.local_capacities = dict(local_capacities or A2_A3_LOCAL_CAPACITIES)
-        self._allocations: Dict[Tuple[MemoryScope, Optional[int], str], MemoryAllocation] = {}
-        self._next_address: Dict[Tuple[MemoryScope, Optional[int]], int] = {}
-        self._address_spaces: Dict[Tuple[MemoryScope, Optional[int]], _AddressSpace] = {}
+        self._allocations: dict[tuple[MemoryScope, int | None, str], MemoryAllocation] = {}
+        self._next_address: dict[tuple[MemoryScope, int | None], int] = {}
+        self._address_spaces: dict[tuple[MemoryScope, int | None], _AddressSpace] = {}
 
     @classmethod
     def from_program(
@@ -295,8 +353,8 @@ class MemoryRuntime:
         program: KernelProgram,
         *,
         hazard_check: str = "error",
-        bindings: Optional[Mapping[str, int | float]] = None,
-    ) -> "MemoryRuntime":
+        bindings: Mapping[str, int | float] | None = None,
+    ) -> MemoryRuntime:
         """Instantiate program buffers according to their sharing scope."""
         runtime = cls((core.core_id for core in program.cores), hazard_check=hazard_check)
         for spec in program.buffers:
@@ -315,8 +373,8 @@ class MemoryRuntime:
         self,
         spec: BufferSpec,
         *,
-        core_id: Optional[int] = None,
-        address: Optional[int] = None,
+        core_id: int | None = None,
+        address: int | None = None,
     ) -> MemoryAllocation:
         """Allocate a buffer, enforcing local capacity and overlap policy."""
         owner = self._normalize_owner(spec.scope, core_id)
@@ -326,10 +384,7 @@ class MemoryRuntime:
         size_bytes = _buffer_size_bytes(spec)
         space = (spec.scope, owner)
         if address is not None and spec.address is not None and address != spec.address:
-            raise ProgramValidationError(
-                f"allocation address {address} disagrees with BufferSpec address "
-                f"{spec.address} for {spec.name!r}"
-            )
+            raise ProgramValidationError(f"allocation address {address} disagrees with BufferSpec address {spec.address} for {spec.name!r}")
         explicit_address = spec.address if address is None else address
         base = self._next_address.get(space, 0) if explicit_address is None else explicit_address
         interval = AddressRange(base, base + size_bytes)
@@ -340,35 +395,35 @@ class MemoryRuntime:
                 f"{spec.name!r} ends at {interval.end}, capacity is {capacity} bytes"
             )
         for (scope, existing_owner, _), existing in self._allocations.items():
-            if (scope == spec.scope and existing_owner == owner
-                    and interval.overlaps(existing.address_range)
-                    and not _overlap_is_declared_reuse(spec, existing.spec)):
-                self.reporter.report(HazardDiagnostic(
-                    "overlapping-allocation",
-                    f"allocation {spec.name!r} overlaps {existing.spec.name!r} in "
-                    f"{spec.scope.value} on core {owner}",
-                    spec.name,
-                    owner,
-                    interval.start,
-                    interval.end,
-                ))
+            if (
+                scope == spec.scope
+                and existing_owner == owner
+                and interval.overlaps(existing.address_range)
+                and not _overlap_is_declared_reuse(spec, existing.spec)
+            ):
+                self.reporter.report(
+                    HazardDiagnostic(
+                        "overlapping-allocation",
+                        f"allocation {spec.name!r} overlaps {existing.spec.name!r} in {spec.scope.value} on core {owner}",
+                        spec.name,
+                        owner,
+                        interval.start,
+                        interval.end,
+                    )
+                )
         backing = self._address_spaces.setdefault(space, _AddressSpace())
         allocation = MemoryAllocation(spec, size_bytes, base, owner, self.reporter, backing)
         self._allocations[key] = allocation
         self._next_address[space] = max(self._next_address.get(space, 0), interval.end)
         return allocation
 
-    def get(
-        self, name: str, *, scope: MemoryScope, core_id: Optional[int] = None
-    ) -> MemoryAllocation:
+    def get(self, name: str, *, scope: MemoryScope, core_id: int | None = None) -> MemoryAllocation:
         """Resolve an allocation by name and address-space owner."""
         owner = self._normalize_owner(scope, core_id)
         try:
             return self._allocations[(scope, owner, name)]
         except KeyError as error:
-            raise MemoryAccessError(
-                f"unknown simulator allocation {name!r} in {scope.value} on core {owner}"
-            ) from error
+            raise MemoryAccessError(f"unknown simulator allocation {name!r} in {scope.value} on core {owner}") from error
 
     def alias(
         self,
@@ -376,28 +431,21 @@ class MemoryRuntime:
         target: str,
         *,
         scope: MemoryScope,
-        core_id: Optional[int] = None,
+        core_id: int | None = None,
     ) -> None:
         """Rebind a logical buffer name to an existing physical allocation."""
         owner = self._normalize_owner(scope, core_id)
         key = (scope, owner, name)
         target_key = (scope, owner, target)
         if key not in self._allocations or target_key not in self._allocations:
-            raise MemoryAccessError(
-                f"cannot alias {name!r} to {target!r} in {scope.value} on core {owner}"
-            )
+            raise MemoryAccessError(f"cannot alias {name!r} to {target!r} in {scope.value} on core {owner}")
         destination = self._allocations[key]
         source = self._allocations[target_key]
         if destination.size_bytes > source.size_bytes:
-            raise MemoryBoundsError(
-                f"alias {name!r} requires {destination.size_bytes} bytes, "
-                f"but {target!r} has {source.size_bytes} bytes"
-            )
+            raise MemoryBoundsError(f"alias {name!r} requires {destination.size_bytes} bytes, but {target!r} has {source.size_bytes} bytes")
         self._allocations[key] = source
 
-    def _normalize_owner(
-        self, scope: MemoryScope, core_id: Optional[int]
-    ) -> Optional[int]:
+    def _normalize_owner(self, scope: MemoryScope, core_id: int | None) -> int | None:
         if not isinstance(scope, MemoryScope):
             scope = MemoryScope.parse(str(scope))
         if scope in _SHARED_SCOPES:
@@ -424,26 +472,20 @@ class MemoryRuntime:
         high watermark across owners rather than their sum. The address-space
         backing already reflects planned aliases, reuse, alignment, and holes.
         """
-        usage: Dict[str, int] = {}
+        usage: dict[str, int] = {}
         for (scope, owner), backing in self._address_spaces.items():
             if scope in _SHARED_SCOPES or owner is None:
                 continue
             usage[scope.value] = max(usage.get(scope.value, 0), len(backing.data))
         return MappingProxyType(usage)
 
-    def local_memory_live_bytes(
-        self, records: Iterable[Any]
-    ) -> Tuple[Tuple[int, Mapping[str, int]], ...]:
+    def local_memory_live_bytes(self, records: Iterable[Any]) -> tuple[tuple[int, Mapping[str, int]], ...]:
         """Return per-scope live allocation bytes at memory-use transitions."""
-        lifetimes: Dict[int, Tuple[MemoryAllocation, int, int]] = {}
+        lifetimes: dict[int, tuple[MemoryAllocation, int, int]] = {}
         for record in records:
             if getattr(record, "category", None) != "operation":
                 continue
-            owner = (
-                self.vector1_owner(record.core_id)
-                if getattr(record.lane, "value", None) == "vector1"
-                else record.core_id
-            )
+            owner = self.vector1_owner(record.core_id) if getattr(record.lane, "value", None) == "vector1" else record.core_id
             for region in _buffer_regions(record.metadata):
                 if region.scope in _SHARED_SCOPES:
                     continue
@@ -451,9 +493,7 @@ class MemoryRuntime:
                 identity = id(allocation)
                 previous = lifetimes.get(identity)
                 if previous is None:
-                    lifetimes[identity] = (
-                        allocation, record.start_cycle, record.end_cycle
-                    )
+                    lifetimes[identity] = (allocation, record.start_cycle, record.end_cycle)
                 else:
                     lifetimes[identity] = (
                         allocation,
@@ -461,12 +501,12 @@ class MemoryRuntime:
                         max(previous[2], record.end_cycle),
                     )
 
-        transitions: Dict[int, list[Tuple[bool, MemoryAllocation]]] = {}
+        transitions: dict[int, list[tuple[bool, MemoryAllocation]]] = {}
         for allocation, start, end in lifetimes.values():
             transitions.setdefault(start, []).append((True, allocation))
             transitions.setdefault(end, []).append((False, allocation))
 
-        active: Dict[int, MemoryAllocation] = {}
+        active: dict[int, MemoryAllocation] = {}
         timeline = []
         for cycle in sorted(transitions):
             for entering, allocation in transitions[cycle]:
@@ -475,12 +515,10 @@ class MemoryRuntime:
             for entering, allocation in transitions[cycle]:
                 if entering:
                     active[id(allocation)] = allocation
-            ranges: Dict[Tuple[MemoryScope, int], list[AddressRange]] = {}
+            ranges: dict[tuple[MemoryScope, int], list[AddressRange]] = {}
             for allocation in active.values():
-                ranges.setdefault(
-                    (allocation.spec.scope, int(allocation.core_id)), []
-                ).append(allocation.address_range)
-            by_scope: Dict[str, int] = {}
+                ranges.setdefault((allocation.spec.scope, int(allocation.core_id)), []).append(allocation.address_range)
+            by_scope: dict[str, int] = {}
             for (scope, _owner), intervals in ranges.items():
                 occupied = _merged_range_size(intervals)
                 by_scope[scope.value] = max(by_scope.get(scope.value, 0), occupied)
@@ -488,7 +526,7 @@ class MemoryRuntime:
         return tuple(timeline)
 
 
-def _concrete_shape(shape: Sequence[object]) -> Tuple[int, ...]:
+def _concrete_shape(shape: Sequence[object]) -> tuple[int, ...]:
     if any(not isinstance(extent, Integral) for extent in shape):
         raise ProgramValidationError("memory allocation/view shape must be concrete")
     result = tuple(int(extent) for extent in shape)
@@ -497,13 +535,11 @@ def _concrete_shape(shape: Sequence[object]) -> Tuple[int, ...]:
     return result
 
 
-def _buffer_regions(value: Any) -> Tuple[BufferRegion, ...]:
+def _buffer_regions(value: Any) -> tuple[BufferRegion, ...]:
     if isinstance(value, BufferRegion):
         return (value,)
     if isinstance(value, Mapping):
-        return tuple(
-            region for item in value.values() for region in _buffer_regions(item)
-        )
+        return tuple(region for item in value.values() for region in _buffer_regions(item))
     if isinstance(value, (tuple, list)):
         return tuple(region for item in value for region in _buffer_regions(item))
     return ()
@@ -529,9 +565,7 @@ def _resolve_extent(value: object, bindings: Mapping[str, int | float]) -> int:
         return value.evaluate(bindings)
     if isinstance(value, Integral) and not isinstance(value, bool):
         return int(value)
-    raise ProgramValidationError(
-        f"memory allocation extent is not executable: {value!r}"
-    )
+    raise ProgramValidationError(f"memory allocation extent is not executable: {value!r}")
 
 
 def _buffer_size_bytes(spec: BufferSpec) -> int:

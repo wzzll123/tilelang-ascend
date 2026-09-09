@@ -1,6 +1,6 @@
 # TileLang Ascend A2/A3 Simulator Roadmap
 
-更新时间：2026-09-05
+更新时间：2026-09-09
 
 本路线图当前主线只覆盖 Ascend A2/A3（C220）的单设备功能语义。`shmem` 在当前版本
 仍必须 fail fast，禁止以空操作或近似语义静默执行；但 SHMEM 是长期 roadmap，待单设备
@@ -12,7 +12,7 @@
 
 ## 进度口径
 
-- **完整 roadmap：约 71%**。checkbox 裸计数约 76%，但未完成的完整
+- **完整 roadmap：约 72%**。checkbox 裸计数约 76%，但未完成的完整
   operation families、pipeline、atomic/persistent、convolution 和 A2/A3 timing calibration
   权重更高，因此采用保守工作量加权值。
 - **可用功能模拟 MVP：100%**。已有 TIR→NumPy、CPU Torch/NumPy tensor adapter、
@@ -30,7 +30,9 @@
 
 1. **功能仿真**：在 CPU 上执行 kernel，验证数值、地址、容量、初始化、alias、tail
    和同步语义。
-2. **性能 trace**：通过离散事件调度模拟 AIC/AIV pipe overlap、依赖和等待，输出
+2. **同步骨架仿真**：`sync_only=True` 时保留同一 Task DAG、地址 region、pipe、flag、
+   barrier、hazard 和 poison 状态机，只跳过 tensor 数值计算，用于同步调试的快速内环。
+3. **性能 trace**：通过离散事件调度模拟 AIC/AIV pipe overlap、依赖和等待，输出
    Chrome/Perfetto trace 和统计数据。
 
 功能结果必须正确，性能模型必须可解释。当前 timing profile 是未校准单位成本，不能
@@ -80,7 +82,7 @@ bridge 必须 fail-closed：无法确定 operation、scope、shape、offset、la
 | `tilelang/simulator/program.py` | `BufferSpec/Region`、Task、lane/pipe、DAG | 保持 backend-neutral 和不可变 |
 | `tilelang/simulator/memory.py` | byte-addressed scope、view、capacity、poison | GM/workspace 共享，本地 scope 逐 core |
 | `tilelang/simulator/hazard.py` | alias、越界和未初始化诊断策略 | `off/warn/error` 行为要一致 |
-| `tilelang/simulator/executor.py` | NumPy 功能语义和 operation dispatch | 不支持的 variant 必须报错 |
+| `tilelang/simulator/executor.py` | NumPy 功能语义、sync-only 元数据语义和 operation dispatch | 不支持的 variant 必须报错 |
 | `tilelang/simulator/scheduler.py` | dependency、pipe FIFO、overlap、timeout | 调度顺序必须确定性 |
 | `tilelang/simulator/sync.py` | local/cross flags 和 barriers | 等待必须成为显式 event |
 | `tilelang/simulator/trace.py`、`stats.py` | trace 导出和 overlap-aware 统计 | 禁止简单累加并行 duration |
@@ -700,6 +702,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   修复版 `e9f9456` 在 A2/A3 数值通过；避免 NumPy DAG 静默替编译器补同步。~~
 - [x] ~~从真实 TIR 的同名重叠 `BufferRegion` 自动生成 RAW、WAR 和 WAW dependency。~~
 - [x] ~~将 dependency 扩展到 storage alias、跨 buffer 物理地址和保守动态 region。~~
+- [x] ~~实现 `SimulatorConfig.sync_only` 同步骨架模式：完整执行 flag/barrier/cross-flag、
+  pipe 调度、地址 region、initialized/poison 与 hazard，跳过 copy/vector/MMA 等 tensor
+  数值计算；数值输出明确为 N/A，未知 operation 和数值读取继续 fail-closed。正确同步、
+  缺失 flag 变异、poison 传播和 compute-heavy MMA 提速均有独立回归。~~
 - [ ] 将 hazard 诊断扩展到带 source span 的动态精确 address range。
 - [ ] 执行 software-pipeline prologue、steady state、epilogue、stage/ring index 和 wrap。
 - [ ] 检查 ring-slot reuse、in-flight memory hazard 和 flag 配对协议。
@@ -768,7 +774,7 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前 simulator 核心测试基线：576 passed，覆盖 memory、scheduler、sync、trace、
+- [x] ~~当前 simulator 核心测试基线：587 passed，覆盖 memory、scheduler、sync、trace、
   functional executor、真实 TIR bridge、跨 pipe 同步 hazard 和 shmem rejection；另有
   2 个依赖 native module 的 JIT 集成测试文件，覆盖自动同步回滚以及 FA 使用的二维
   row broadcast/runtime float scalar。~~
@@ -795,3 +801,7 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
    验收。剩余 copy variants 以真实 final TIR 出现为准；`copy_l0c_to_ub` 须先确认被
    workspace reduction 改写前后的实际 contract，再实现 CV handoff。
 5. 在可获得 A2/A3 测量数据后校准 `gemm_v0` stage timing，并验证显式 flag contract。
+6. sync-only 已进入 executor 快速路径；继续用 GQA 真实矩阵核对全量/骨架同步结论。
+   当前归档设计的 `decode`/`decode_causal` 会在两种模式共同经过的 bridge 中因非
+   fractal-row-aligned zN 子块目的偏移 fail-closed，需先修正或确认该 copy contract；
+   `multitask` 还需在内存充足的隔离环境完成编译/执行对照。

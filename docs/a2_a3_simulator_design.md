@@ -45,9 +45,9 @@ by A2 and A3. A2 and A3 share functional semantics but use separate timing profi
 
 ### Explicitly out of scope
 
-- **shmem is not supported and is not planned.** This includes any device-side shared-memory
-  or cross-core shmem API and its visibility/coherence protocol. The simulator must fail with
-  `UnsupportedSimOpError` if such an operation reaches the bridge.
+- **shmem is not supported in the current single-device phase.** It remains a long-term roadmap
+  item; until its multi-PE visibility and completion protocol are implemented, every shmem
+  operation must fail with `UnsupportedSimOpError` rather than being approximated as a GM copy.
 - A5/C310, CPU, CUDA, and HIP simulation.
 - Bisheng, PTO, or AscendC source interpretation.
 - Exact instruction issue, cache, NoC, DDR contention, thermal, or frequency simulation.
@@ -137,9 +137,18 @@ kernel = tilelang.compile(
     sim_config=SimulatorConfig(
         trace_path="trace.json",
         hazard_check="error",
+        sync_only=False,
     ),
 )
 ```
+
+`sync_only=True` selects the synchronization skeleton backend. It executes the same lowered
+task stream, address/region evaluation, pipe scheduling, local and cross flags, barriers,
+initialized/poison propagation, and hazard checks as full functional simulation, while skipping
+tensor payload copies and NumPy arithmetic. Numeric outputs are therefore unavailable and the JIT
+adapter returns `None`; `last_stats`, trace data, diagnostics, and `last_execution` remain
+available. Unknown operations and tensor-value-dependent control flow remain fail-closed. The
+default is `False`, so existing functional behavior and output conventions are unchanged.
 
 The same options should be accepted by `@tilelang.jit`. `platform` must resolve to `A2` or `A3`;
 all other platforms fail before simulation begins.

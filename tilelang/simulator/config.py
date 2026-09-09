@@ -2,9 +2,10 @@
 # Licensed under the MIT License.
 """Configuration for the A2/A3 CPU simulator."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
 
 from .errors import SimulatorConfigError
 from .profile import (
@@ -21,17 +22,20 @@ class SimulatorConfig:
     """User-visible simulator settings independent of JIT integration."""
 
     platform: str = "A2"
-    trace_path: Optional[Union[str, Path]] = None
+    trace_path: str | Path | None = None
     hazard_check: str = "error"
+    sync_only: bool = False
     execution_timeout_s: float = 120.0
-    max_cycles: Optional[int] = None
-    timing_profile: Optional[TimingProfile] = None
+    max_cycles: int | None = None
+    timing_profile: TimingProfile | None = None
 
     def __post_init__(self) -> None:
         platform = normalize_platform(self.platform)
         object.__setattr__(self, "platform", platform)
         if self.hazard_check not in {"off", "warn", "error"}:
             raise SimulatorConfigError("hazard_check must be one of: off, warn, error")
+        if not isinstance(self.sync_only, bool):
+            raise SimulatorConfigError("sync_only must be a boolean")
         if self.execution_timeout_s <= 0:
             raise SimulatorConfigError("execution_timeout_s must be positive")
         if self.max_cycles is not None and self.max_cycles <= 0:
@@ -41,8 +45,7 @@ class SimulatorConfig:
         timing_profile = self.timing_profile or default_timing_profile(platform)
         if timing_profile.platform != platform:
             raise SimulatorConfigError(
-                "timing profile platform does not match simulator platform: "
-                f"{timing_profile.platform} != {platform}"
+                f"timing profile platform does not match simulator platform: {timing_profile.platform} != {platform}"
             )
         object.__setattr__(self, "timing_profile", timing_profile)
 

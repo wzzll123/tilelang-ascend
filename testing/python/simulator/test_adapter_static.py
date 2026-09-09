@@ -36,9 +36,7 @@ class _FakeParam:
 
 def test_static_adapter_schedules_and_exports_trace(tmp_path: Path) -> None:
     load = Task("load", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 4)
-    add = Task(
-        "add", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 5, dependencies=("load",)
-    )
+    add = Task("add", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 5, dependencies=("load",))
     program = KernelProgram("add", "A2", (CoreProgram(0, (load, add)),))
     adapter = SimulatorKernelAdapter(
         optimized_mod=_FakeModule(),
@@ -81,22 +79,39 @@ def _adapter_add_primfunc():
     ub_output = tvm.tir.decl_buffer((8,), "float32", name="ub_output", scope="shared.ub")
 
     def copy(name, source, destination):
-        return tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle", name, source.access_ptr("r"),
-            destination.access_ptr("w"), 8,
-        ))
+        return tvm.tir.Evaluate(
+            tvm.tir.call_extern(
+                "handle",
+                name,
+                source.access_ptr("r"),
+                destination.access_ptr("w"),
+                8,
+            )
+        )
 
-    body = tvm.tir.SeqStmt([
-        copy("copy_gm_to_ub", left, ub_left),
-        copy("copy_gm_to_ub", right, ub_right),
-        tvm.tir.Evaluate(tvm.tir.call_extern(
-            "handle", "tl.ascend_add", ub_output.access_ptr("w"),
-            ub_left.access_ptr("r"), ub_right.access_ptr("r"), 8,
-        )),
-        copy("copy_ub_to_gm", ub_output, output),
-    ])
+    body = tvm.tir.SeqStmt(
+        [
+            copy("copy_gm_to_ub", left, ub_left),
+            copy("copy_gm_to_ub", right, ub_right),
+            tvm.tir.Evaluate(
+                tvm.tir.call_extern(
+                    "handle",
+                    "tl.ascend_add",
+                    ub_output.access_ptr("w"),
+                    ub_left.access_ptr("r"),
+                    ub_right.access_ptr("r"),
+                    8,
+                )
+            ),
+            copy("copy_ub_to_gm", ub_output, output),
+        ]
+    )
     root = tvm.tir.Block(
-        [], [], [], "root", body,
+        [],
+        [],
+        [],
+        "root",
+        body,
         alloc_buffers=[ub_left, ub_right, ub_output],
     )
     return tvm.tir.PrimFunc(
@@ -106,11 +121,12 @@ def _adapter_add_primfunc():
     )
 
 
-def _functional_adapter(tmp_path: Path | None = None) -> SimulatorKernelAdapter:
+def _functional_adapter(tmp_path: Path | None = None, *, sync_only: bool = False) -> SimulatorKernelAdapter:
     function = _adapter_add_primfunc()
     config = SimulatorConfig(
         platform="A2",
         trace_path=None if tmp_path is None else tmp_path / "functional.json",
+        sync_only=sync_only,
     )
     return SimulatorKernelAdapter(
         optimized_mod=function,
@@ -137,10 +153,7 @@ def test_functional_adapter_executes_numpy_inputs_and_returns_output(
     assert adapter.last_schedule is adapter.last_execution.schedule
     assert adapter.last_trace == (tmp_path / "functional.json").resolve()
     trace = json.loads(adapter.last_trace.read_text(encoding="utf-8"))
-    live_memory = [
-        event for event in trace["traceEvents"]
-        if event.get("name") == "live_local_memory_bytes"
-    ]
+    live_memory = [event for event in trace["traceEvents"] if event.get("name") == "live_local_memory_bytes"]
     assert live_memory
     assert any(event["args"].get("ub", 0) > 0 for event in live_memory)
 
@@ -156,3 +169,15 @@ def test_functional_adapter_preserves_cpu_torch_interface() -> None:
     assert isinstance(output, torch.Tensor)
     assert output.device.type == "cpu"
     torch.testing.assert_close(output, left + right)
+
+
+def test_functional_adapter_returns_no_numeric_output_in_sync_only_mode() -> None:
+    adapter = _functional_adapter(sync_only=True)
+    left = np.arange(8, dtype=np.float32)
+    right = np.arange(8, dtype=np.float32)
+
+    output = adapter.func(left, right)
+
+    assert output is None
+    assert adapter.last_execution is not None
+    assert adapter.last_execution.numeric_results_available is False

@@ -6,7 +6,8 @@ from __future__ import annotations
 
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -42,24 +43,18 @@ class SimulatorKernelAdapter:
         self.program = program
         self.artifact = None
         self.dynamic_symbolic_map = self._dynamic_symbolic_map()
-        self.last_schedule: Optional[ScheduleResult] = None
+        self.last_schedule: ScheduleResult | None = None
         self.last_stats = None
-        self.last_trace: Optional[Path] = None
-        self.last_execution: Optional[FunctionalExecutionResult] = None
+        self.last_trace: Path | None = None
+        self.last_execution: FunctionalExecutionResult | None = None
         self._parameter_names = self._extract_parameter_names()
         self._buffer_specs = {buffer.name: buffer for buffer in self.program.buffers}
         self.sync_diagnostics = (
-            validate_memory_synchronization(
-                self.program, hazard_check=self.config.hazard_check
-            )
-            if validate_sync
-            else ()
+            validate_memory_synchronization(self.program, hazard_check=self.config.hazard_check) if validate_sync else ()
         )
         self.func = self._functional_execute
 
-    def _normalize_indices(
-        self, indices: list[int] | int | None, name: str
-    ) -> list[int]:
+    def _normalize_indices(self, indices: list[int] | int | None, name: str) -> list[int]:
         if indices is None:
             return []
         values = [indices] if isinstance(indices, int) else list(indices)
@@ -70,10 +65,7 @@ class SimulatorKernelAdapter:
             if index < 0:
                 index += len(self.params)
             if index < 0 or index >= len(self.params):
-                raise ValueError(
-                    f"{name} index must be between {-len(self.params)} and "
-                    f"{len(self.params) - 1}"
-                )
+                raise ValueError(f"{name} index must be between {-len(self.params)} and {len(self.params) - 1}")
             normalized.append(index)
         return normalized
 
@@ -109,10 +101,7 @@ class SimulatorKernelAdapter:
                 self.config.platform,
                 self.config.timing_profile.calibration,
             )
-            timeline = (
-                self.last_execution.memory.local_memory_live_bytes(result.records)
-                if self.last_execution is not None else ()
-            )
+            timeline = self.last_execution.memory.local_memory_live_bytes(result.records) if self.last_execution is not None else ()
             self.last_trace = exporter.write(
                 self.config.trace_path,
                 result.records,
@@ -128,23 +117,20 @@ class SimulatorKernelAdapter:
         """Return the validated backend-neutral simulator program."""
         return self.program
 
-    def _extract_parameter_names(self) -> list[Optional[str]]:
+    def _extract_parameter_names(self) -> list[str | None]:
         try:
             import tvm
         except (ImportError, OSError):
             return []
         value = self.optimized_mod
         if isinstance(value, tvm.IRModule):
-            functions = [
-                function for _, function in value.functions_items()
-                if isinstance(function, tvm.tir.PrimFunc)
-            ]
+            functions = [function for _, function in value.functions_items() if isinstance(function, tvm.tir.PrimFunc)]
             if len(functions) != 1:
                 return []
             value = functions[0]
         if not isinstance(value, tvm.tir.PrimFunc):
             return []
-        names: list[Optional[str]] = []
+        names: list[str | None] = []
         for parameter in value.params:
             if parameter in value.buffer_map:
                 names.append(str(value.buffer_map[parameter].name))
@@ -154,21 +140,14 @@ class SimulatorKernelAdapter:
 
     def _functional_execute(self, *arguments: Any) -> Any:
         if len(self._parameter_names) != len(self.params):
-            raise UnsupportedSimOpError(
-                "functional simulator requires final PrimFunc parameter metadata"
-            )
-        supplied_indices = [
-            index for index in range(len(self.params))
-            if index not in self.result_idx and index not in self.workspace_idx
-        ]
+            raise UnsupportedSimOpError("functional simulator requires final PrimFunc parameter metadata")
+        supplied_indices = [index for index in range(len(self.params)) if index not in self.result_idx and index not in self.workspace_idx]
         dynamic_count = len(self.dynamic_symbolic_map)
         if len(arguments) not in {
-            len(supplied_indices), len(supplied_indices) + dynamic_count,
+            len(supplied_indices),
+            len(supplied_indices) + dynamic_count,
         }:
-            raise ValueError(
-                f"expected {len(supplied_indices)} simulator inputs, got "
-                f"{len(arguments)}"
-            )
+            raise ValueError(f"expected {len(supplied_indices)} simulator inputs, got {len(arguments)}")
         parameter_values: list[Any] = [None] * len(self.params)
         for index, value in zip(supplied_indices, arguments):
             parameter_values[index] = value
@@ -177,13 +156,8 @@ class SimulatorKernelAdapter:
         for variable, (parameter_index, shape_index) in self.dynamic_symbolic_map.items():
             value = parameter_values[parameter_index]
             if value is None or not hasattr(value, "shape"):
-                raise ProgramValidationError(
-                    f"cannot bind dynamic extent {variable} from parameter "
-                    f"{parameter_index}"
-                )
-            bindings[str(getattr(variable, "name", variable))] = int(
-                value.shape[shape_index]
-            )
+                raise ProgramValidationError(f"cannot bind dynamic extent {variable} from parameter {parameter_index}")
+            bindings[str(getattr(variable, "name", variable))] = int(value.shape[shape_index])
         for index, name in enumerate(self._parameter_names):
             if name in self._buffer_specs or parameter_values[index] is None:
                 continue
@@ -191,12 +165,8 @@ class SimulatorKernelAdapter:
             if isinstance(value, np.generic):
                 value = value.item()
             if isinstance(value, bool) or not isinstance(value, (Integral, Real)):
-                raise ProgramValidationError(
-                    f"simulator scalar parameter {name!r} must be numeric"
-                )
-            bindings[name or ""] = (
-                int(value) if isinstance(value, Integral) else float(value)
-            )
+                raise ProgramValidationError(f"simulator scalar parameter {name!r} must be numeric")
+            bindings[name or ""] = int(value) if isinstance(value, Integral) else float(value)
 
         simulator = FunctionalSimulator(self.program, self.config, bindings=bindings)
         framework = "numpy"
@@ -213,31 +183,26 @@ class SimulatorKernelAdapter:
         execution = simulator.run()
         self.last_execution = execution
         self._record_schedule(execution.schedule)
-        outputs = [
-            simulator.read(self._full_region(self._result_buffer(index)))
-            for index in self.result_idx
-        ]
+        if not execution.numeric_results_available:
+            return None
+        outputs = [simulator.read(self._full_region(self._result_buffer(index))) for index in self.result_idx]
         converted = [self._from_numpy(output, framework) for output in outputs]
         return converted[0] if len(converted) == 1 else converted
 
     def _result_buffer(self, parameter_index: int) -> BufferSpec:
         name = self._parameter_names[parameter_index]
         if name not in self._buffer_specs:
-            raise ProgramValidationError(
-                f"simulator result parameter {parameter_index} is not a buffer"
-            )
+            raise ProgramValidationError(f"simulator result parameter {parameter_index} is not a buffer")
         return self._buffer_specs[name]
 
     @staticmethod
     def _full_region(spec: BufferSpec) -> BufferRegion:
         if spec.scope is not MemoryScope.GM:
-            raise ProgramValidationError(
-                f"simulator parameter buffer {spec.name!r} must use GM scope"
-            )
+            raise ProgramValidationError(f"simulator parameter buffer {spec.name!r} must use GM scope")
         return BufferRegion(spec.name, spec.scope, spec.shape, spec.dtype)
 
     @staticmethod
-    def _as_numpy(value: Any, name: Optional[str]) -> tuple[np.ndarray, str]:
+    def _as_numpy(value: Any, name: str | None) -> tuple[np.ndarray, str]:
         if isinstance(value, np.ndarray):
             return np.ascontiguousarray(value), "numpy"
         try:
@@ -246,27 +211,19 @@ class SimulatorKernelAdapter:
             torch = None
         if torch is not None and isinstance(value, torch.Tensor):
             if value.device.type != "cpu":
-                raise ProgramValidationError(
-                    f"simulator input {name!r} must be a CPU tensor, got {value.device}"
-                )
+                raise ProgramValidationError(f"simulator input {name!r} must be a CPU tensor, got {value.device}")
             if value.dtype == torch.bfloat16:
                 # NumPy cannot view torch.bfloat16; round-trip the raw bits
                 # through uint16 into ml_dtypes.bfloat16 (no value change).
                 import ml_dtypes
 
                 bits = value.detach().contiguous().view(torch.uint16).numpy()
-                return np.ascontiguousarray(
-                    bits.view(ml_dtypes.bfloat16)
-                ), "torch"
+                return np.ascontiguousarray(bits.view(ml_dtypes.bfloat16)), "torch"
             try:
                 return np.ascontiguousarray(value.detach().numpy()), "torch"
             except TypeError as error:
-                raise UnsupportedSimOpError(
-                    f"simulator cannot convert tensor dtype {value.dtype} to NumPy"
-                ) from error
-        raise TypeError(
-            f"simulator input {name!r} must be a NumPy array or CPU torch.Tensor"
-        )
+                raise UnsupportedSimOpError(f"simulator cannot convert tensor dtype {value.dtype} to NumPy") from error
+        raise TypeError(f"simulator input {name!r} must be a NumPy array or CPU torch.Tensor")
 
     @staticmethod
     def _from_numpy(value: np.ndarray, framework: str) -> Any:
@@ -277,9 +234,7 @@ class SimulatorKernelAdapter:
         array = np.ascontiguousarray(value)
         if array.dtype == np.dtype("bfloat16") or array.dtype.name == "bfloat16":
             # torch.from_numpy has no bfloat16; rebuild from the raw bits.
-            return torch.from_numpy(
-                np.ascontiguousarray(array.view(np.uint16))
-            ).view(torch.bfloat16).reshape(array.shape)
+            return torch.from_numpy(np.ascontiguousarray(array.view(np.uint16))).view(torch.bfloat16).reshape(array.shape)
         return torch.from_numpy(array)
 
 
@@ -303,9 +258,7 @@ def create_simulator_adapter(
         from tilelang import tvm
         from tilelang.engine.lower import lower_ascend_ir
     except (ImportError, OSError) as error:
-        raise UnsupportedSimOpError(
-            "creating a simulator adapter requires the TileLang TVM runtime"
-        ) from error
+        raise UnsupportedSimOpError("creating a simulator adapter requires the TileLang TVM runtime") from error
 
     with tvm.transform.PassContext(opt_level=3, config=pass_configs):
         optimized_mod, params = lower_ascend_ir(
@@ -334,17 +287,12 @@ def _resolve_config(platform: str, value: Any | None) -> SimulatorConfig:
         return SimulatorConfig(platform=platform)
     if isinstance(value, SimulatorConfig):
         if value.platform != platform.upper():
-            raise SimulatorConfigError(
-                f"sim_config platform {value.platform} does not match JIT platform {platform}"
-            )
+            raise SimulatorConfigError(f"sim_config platform {value.platform} does not match JIT platform {platform}")
         return value
     if isinstance(value, Mapping):
         options = dict(value)
         configured_platform = str(options.pop("platform", platform))
         if configured_platform.upper() != platform.upper():
-            raise SimulatorConfigError(
-                f"sim_config platform {configured_platform} does not match JIT platform "
-                f"{platform}"
-            )
+            raise SimulatorConfigError(f"sim_config platform {configured_platform} does not match JIT platform {platform}")
         return SimulatorConfig(platform=platform, **options)
     raise SimulatorConfigError("sim_config must be SimulatorConfig, mapping, or None")
