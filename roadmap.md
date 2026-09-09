@@ -550,11 +550,11 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   hazard footprint。~~
 - [x] ~~将跨 C0 sliced L1→L0 拆成多段 strided source regions，并用于功能读取和
   dependency footprint。~~
-- [x] ~~实现非对齐/子 tile GM→L1：非整 tile 偏移的 copy_gm_to_l1 按 codegen
-  splice / vertical-merge 语义建模——锚点须为同一 (dstM, dstN) zN 视图的分形行边界，
-  逐 fractal 列带分段写入有效矩形触碰的分形行（`dst_regions` 参与 RAW/WAR/WAW），
-  不清零先前 DMA 数据；整 tile 偏移（含环形槽 base）保持 primary clear 语义。覆盖
-  单带/多带 golden、无 clobber、未写行 poison、错位偏移和容量错误路径。~~
+- [x] ~~实现非对齐/子 tile GM→L1：整 tile 偏移（含环形槽 base）保持 primary clear
+  语义；分形行对齐 splice 按同一 zN view 的分形列带分段写入；其余 codegen 合法的
+  32B 对齐 offset 按 rebased zN view 的 `base + physical_index(row, col)` 精确 scatter
+  写入。所有子块路径都不清零先前 DMA 数据，`dst_regions` 参与 RAW/WAR/WAW/poison。
+  覆盖单带/多带 golden、无 clobber、未写行 poison、32B rebased offset 与错误对齐/容量路径。~~
 - [ ] 实现其它 L0C→GM variants。
 - [x] ~~实现 half→float32 `gemm_v0` 功能语义，覆盖 A/B transpose、K-tail、
   init/accumulate 和无 BiSheng 端到端路径。~~
@@ -774,7 +774,7 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前 simulator 核心测试基线：587 passed，覆盖 memory、scheduler、sync、trace、
+- [x] ~~当前 simulator 核心测试基线：589 passed，覆盖 memory、scheduler、sync、trace、
   functional executor、真实 TIR bridge、跨 pipe 同步 hazard 和 shmem rejection；另有
   2 个依赖 native module 的 JIT 集成测试文件，覆盖自动同步回滚以及 FA 使用的二维
   row broadcast/runtime float scalar。~~

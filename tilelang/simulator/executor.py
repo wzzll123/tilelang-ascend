@@ -549,6 +549,23 @@ class FunctionalSimulator:
                 _resolve_int(copy_details["physical_rows"], self.bindings),
                 _resolve_int(copy_details["physical_cols"], self.bindings),
             )
+            if copy_details.get("rebased_zN") is True:
+                flattened = np.ascontiguousarray(values).reshape(-1)
+                offset = 0
+                for region in destinations:
+                    count = int(np.prod(region.shape))
+                    self.write(
+                        region,
+                        flattened[offset : offset + count],
+                        task_core_id=task.core_id,
+                    )
+                    offset += count
+                if offset != flattened.size:
+                    raise ProgramValidationError(
+                        f"rebased zN copy task {task.task_id!r} covers {offset} "
+                        f"elements for {flattened.size} source elements"
+                    )
+                return
             written_rows = copy_details.get("written_rows")
             if written_rows is not None:
                 # Spliced sub-tile copy: only the fractal rows touched by the
