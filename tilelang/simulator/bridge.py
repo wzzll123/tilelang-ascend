@@ -3623,7 +3623,7 @@ class _TirBridge:
                 byte_offset=_add_runtime_int(scalar_source.byte_offset, scalar_offset),
             )
         else:
-            scalar = self._literal(self.analyzer.simplify(arguments[2]))
+            scalar = self._numeric_scalar(arguments[2], context)
             if not isinstance(scalar, (bool, int, float)):
                 raise UnsupportedSimOpError(f"functional compare_scalar requires a literal scalar, got {scalar!r}")
             metadata["scalar"] = scalar
@@ -4080,7 +4080,13 @@ class _TirBridge:
         }
 
     def _numeric_scalar(self, value: Any, context: _Context) -> Any:
-        simplified = self.analyzer.simplify(value)
+        substituted = value
+        if context.environment:
+            substituted = self.tir.stmt_functor.substitute(
+                value,
+                self._environment_replacements(context.environment),
+            )
+        simplified = self.analyzer.simplify(substituted)
         literal = self._literal(simplified)
         if isinstance(literal, (int, float)) and not isinstance(literal, bool):
             return literal
@@ -4657,11 +4663,37 @@ class _TirBridge:
             return value
         substituted = value
         if environment:
-            replacements = {var: self.tir.IntImm(getattr(var, "dtype", "int32"), number) for var, number in environment.items()}
+            replacements = self._environment_replacements(environment)
             substituted = self.tir.stmt_functor.substitute(value, replacements)
         simplified = self.analyzer.simplify(substituted)
         literal = getattr(simplified, "value", None)
-        return int(literal) if isinstance(literal, (bool, int)) else None
+        if isinstance(literal, (bool, int)):
+            return int(literal)
+        # Final Ascend TIR sometimes introduces a floating-point Cast around
+        # an integer loop/index expression before binding it with LetStmt.
+        # The bridge stores Let values in its integer environment because they
+        # are later used for offsets, extents, or scalar intrinsic arguments.
+        # Preserve that exact integer expression instead of rejecting the
+        # harmless representation-only cast.  Do not coerce arbitrary float
+        # expressions: only an integral literal or a Cast can take this path.
+        if isinstance(literal, float) and literal.is_integer():
+            return int(literal)
+        if isinstance(simplified, self.tir.Cast):
+            return self._const_int(simplified.value, {})
+        return None
+
+    def _environment_replacements(self, environment: Mapping[Any, int]) -> dict[Any, Any]:
+        """Materialize integer-valued Let bindings with their TIR dtype."""
+        replacements = {}
+        for var, number in environment.items():
+            dtype = str(getattr(var, "dtype", "int32"))
+            if dtype.startswith(("int", "uint", "bool")):
+                replacements[var] = self.tir.IntImm(dtype, number)
+            elif dtype.startswith(("float", "bfloat")):
+                replacements[var] = self.tir.FloatImm(dtype, number)
+            else:
+                raise UnsupportedSimOpError(f"unsupported Let binding dtype {dtype!r}")
+        return replacements
 
     def _affine_int(self, value: Any, environment: Mapping[Any, int]) -> Any | None:
         constant = self._const_int(value, environment)
@@ -4669,7 +4701,7 @@ class _TirBridge:
             return constant
         substituted = value
         if environment:
-            replacements = {var: self.tir.IntImm(getattr(var, "dtype", "int32"), number) for var, number in environment.items()}
+            replacements = self._environment_replacements(environment)
             substituted = self.tir.stmt_functor.substitute(value, replacements)
         simplified = self.analyzer.simplify(substituted)
         if isinstance(simplified, self.tir.Var):
@@ -4708,7 +4740,7 @@ class _TirBridge:
             return affine
         substituted = value
         if environment:
-            replacements = {var: self.tir.IntImm(getattr(var, "dtype", "int32"), number) for var, number in environment.items()}
+            replacements = self._environment_replacements(environment)
             substituted = self.tir.stmt_functor.substitute(value, replacements)
         simplified = self.analyzer.simplify(substituted)
         if isinstance(simplified, self.tir.BufferLoad):
