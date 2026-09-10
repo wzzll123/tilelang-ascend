@@ -702,10 +702,14 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~跟进主线 `e9f9456` 对自动同步优化的回滚：真实两核 IfThenElse lowering 在每个
   core 恢复 if 前后 `auto_barrier(PIPE_ALL)`；bridge 保留该任务，scheduler 按 lane
   drain 前序 pipe 并阻止后续任务越过。A2/A3 数值与 barrier schedule 回归均通过。~~
-- [x] ~~区分“用于确定性功能执行的内存 dependency”和“硬件真实同步”：对同 lane
-  跨 pipe 的 RAW/WAR/WAW 边，要求存在匹配 local set/wait flag 或 `PIPE_ALL`。使用同一份
-  实际 FA 对比验证：buggy `90bb652` 在 A2/A3 均报告 MTE2→MTE1 missing synchronization，
-  修复版 `e9f9456` 在 A2/A3 数值通过；避免 NumPy DAG 静默替编译器补同步。~~
+- [x] ~~区分“静态诊断 memory dependency”和“硬件真实同步”：对同 lane 跨 pipe 的
+  RAW/WAR/WAW 边，要求存在匹配 local set/wait flag 或 `PIPE_ALL`；scheduler 不再把
+  `memory_dependencies` 当作执行边，避免功能 DAG 静默替编译器补同步。主线
+  `90bb652`/`e9f9456` 仅用于 if 前后 barrier lowering 回归，不宣称复现原业务 bug。~~
+- [x] ~~同步契约按“CANN 官方文档 > PTO A2/A3 lowering > PTO perf-sim > EasyASC”审计：
+  set 落 source pipe、local wait 落 destination pipe、A2/A3 cross wait 阻塞当前 lane
+  后续发射；保留官方 local 0/1 latch，明确不照搬 PTO perf-sim 的 local counter 和
+  unbounded pre-filled queue 简化。~~
 - [x] ~~从真实 TIR 的同名重叠 `BufferRegion` 自动生成 RAW、WAR 和 WAW dependency。~~
 - [x] ~~将 dependency 扩展到 storage alias、跨 buffer 物理地址和保守动态 region。~~
 - [x] ~~实现 `SimulatorConfig.sync_only` 同步骨架模式：完整执行 flag/barrier/cross-flag、

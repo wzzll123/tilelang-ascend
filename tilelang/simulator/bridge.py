@@ -4409,6 +4409,15 @@ class _TirBridge:
             # deterministic, but are not hardware synchronization by
             # themselves; the adapter separately verifies cross-pipe edges.
             task_metadata["memory_dependencies"] = memory_dependencies
+        hardware_dependencies = set(extra_dependencies)
+        # An atomic GM update is a hardware serialization point for the one
+        # shared destination it touches.  The bridge derives the fixed order
+        # below for deterministic CPU execution; retain it in the timing model
+        # too instead of discarding it as an ordinary RAW/WAR/WAW edge.
+        if "atomic_add" in normalized:
+            hardware_dependencies.update(memory_dependencies)
+        if hardware_dependencies:
+            task_metadata["hardware_dependencies"] = tuple(sorted(hardware_dependencies))
         dependencies = tuple(sorted(set(memory_dependencies).union(extra_dependencies)))
         task = Task(
             task_id,

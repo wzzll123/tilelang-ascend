@@ -332,8 +332,12 @@ left by `AscendSyncInsert` and `AscendSyncInsertVS`:
 - `pipe_barrier`, including `ALL`;
 - synchronization produced by `CrossCorePipeline` and `CombineCV`.
 
-For A2/A3, synchronization follows the EasyASC reference state machine rather than a shared
-flag counter:
+For A2/A3, synchronization authority is ordered as follows: the official CANN architecture and
+API documentation defines hardware semantics; the official PTO A2/A3 lowering defines which
+pipe executes each marker; PTO perf-sim is a differential implementation reference; EasyASC is
+secondary evidence.  A lower-ranked model must not override a documented hardware contract.
+
+The current conformance matrix is:
 
 | Primitive | State and release rule | Ordering scope |
 |---|---|---|
@@ -345,6 +349,24 @@ flag counter:
 | mode-2 Vector→Cube cross flag | each vector lane publishes to a separate queue; Cube atomically consumes one credit from both lanes | the set is ordered after its named producer pipe; the wait fences the Cube lane |
 | non-`ALL` pipe barrier | relies on the selected pipe's FIFO and fences only later work on that pipe | one `(core, lane, pipe)` |
 | `ALL` barrier | drains prior work and fences later work in the current AIC/AIV lane | one `(core, lane)`; it is not a Cube-plus-both-Vector global barrier |
+
+PTO lowering agrees that a local/cross set is ordered on its named source pipe, a local wait is
+queued on its named destination pipe, a same-pipe PTO event lowers to a pipe barrier, and an
+A2/A3 cross wait lowers to scalar `wait_flag_dev`.  PTO perf-sim deliberately uses a counter for
+local channels and pre-fills unbounded pipe queues.  Those are cost-model simplifications, not
+authority over the official A2/A3 local-flag latch or finite instruction-queue contracts.
+
+Inferred `memory_dependencies` are diagnostic metadata only.  They feed RAW/WAR/WAW validation
+but never serialize hardware scheduling: distinct pipes are ordered only by pipe FIFO and real
+flag/barrier instructions.  This matches PTO perf-sim's explicit "no structural auto-dep rules"
+policy and prevents a functional DAG from silently repairing an invalid synchronization phase.
+The CPU functional interpreter uses the complete dependency DAG to materialize NumPy values, with
+the validated schedule order as the tie-breaker for independent nodes (thereby preserving explicit
+flag/barrier happens-before).  That interpreter-only order never changes the schedule, trace,
+deadlock result, or performance statistics.
+`hardware_dependencies` is reserved for a real modelled serialization resource; currently the
+bridge uses it for contending atomic GM updates, rather than treating that case as an ordinary
+RAW/WAR/WAW edge.
 
 Cross-flag state is isolated by mode, flag ID, participant kind, group, direction, and lane as
 applicable, and is bounded to 15 outstanding phases. Using two Vector 0 publications cannot

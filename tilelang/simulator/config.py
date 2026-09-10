@@ -29,14 +29,11 @@ class SimulatorConfig:
     deadlock_detect: bool = True
     deadlock_history_limit: int = 8
     flag_balance_check: str = "off"
-    # Flag credit depth fidelity (HS29 motivation): on real silicon a flag's
-    # outstanding SET credits occupy a bounded hardware queue; a SET issued at
-    # full depth STALLS the issuing pipe until a WAIT frees a slot (blocking
-    # semantics), which can deadlock a kernel whose accounting is level-balanced
-    # but depth-unbalanced. The default (flag_blocking=False) keeps the legacy
-    # idealized semantics (local: error on double-set; cross: error at 15
-    # outstanding credits). flag_blocking=True turns overflow into a blocking
-    # wait so the scheduler's deadlock detector can report the cycle.
+    # Experimental HS29 hypothesis: model a bounded outstanding-credit queue
+    # and block SET at its configured depth.  Official material establishes
+    # finite instruction queues, but does not specify a flag-credit capacity;
+    # this mode is therefore opt-in and not an A2/A3 hardware contract.  The
+    # default retains idealized local-latch/cross-credit diagnostics.
     flag_blocking: bool = False
     local_flag_depth: int = 1
     cross_flag_depth: int = 15

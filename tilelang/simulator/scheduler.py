@@ -65,6 +65,9 @@ class DiscreteEventScheduler:
         tasks = program.tasks
         task_by_id = {task.task_id: task for task in tasks}
         self._validate_dependencies(tasks, task_by_id)
+        execution_dependencies = {
+            task.task_id: self._execution_dependencies(task) for task in tasks
+        }
         fifo_predecessor = self._fifo_predecessors(tasks)
         self.synchronization.reset(program)
 
@@ -82,7 +85,7 @@ class DiscreteEventScheduler:
             for task in tasks:
                 if task.task_id not in pending:
                     continue
-                dependency_required = set(task.dependencies)
+                dependency_required = set(execution_dependencies[task.task_id])
                 required = set(dependency_required)
                 predecessor = fifo_predecessor.get(task.task_id)
                 if predecessor is not None:
@@ -152,7 +155,13 @@ class DiscreteEventScheduler:
                 if not config.deadlock_detect:
                     continue
                 details = "; ".join(f"{task_id}: {blocked_details.get(task_id, 'blocked')}" for task_id in sorted(pending))
-                cycle = self._wait_cycle(pending, tasks, fifo_predecessor, completed)
+                cycle = self._wait_cycle(
+                    pending,
+                    tasks,
+                    fifo_predecessor,
+                    execution_dependencies,
+                    completed,
+                )
                 cycle_detail = (
                     "; wait-for cycle: " + " -> ".join(cycle)
                     if cycle
@@ -184,13 +193,14 @@ class DiscreteEventScheduler:
         pending: set[str],
         tasks: tuple[Task, ...],
         fifo_predecessor: Mapping[str, str],
+        execution_dependencies: Mapping[str, tuple[str, ...]],
         completed: Mapping[str, ExecutionRecord],
     ) -> tuple[str, ...]:
         edges: dict[str, tuple[str, ...]] = {}
         for task in tasks:
             if task.task_id not in pending:
                 continue
-            required = list(task.dependencies)
+            required = list(execution_dependencies[task.task_id])
             predecessor = fifo_predecessor.get(task.task_id)
             if predecessor is not None:
                 required.append(predecessor)
@@ -218,6 +228,34 @@ class DiscreteEventScheduler:
             if cycle:
                 return cycle
         return ()
+
+    @staticmethod
+    def _execution_dependencies(task: Task) -> tuple[str, ...]:
+        """Return actual execution edges, excluding inferred memory hazards.
+
+        ``memory_dependencies`` are retained in metadata for static hazard
+        validation and diagnostics.  They are not hardware synchronization:
+        A2/A3 orders distinct pipes only through their FIFO queues and explicit
+        flag/barrier instructions.  PTO perf-sim follows the same rule and
+        intentionally has no structural auto-dependency edges.
+        """
+        memory_dependencies = task.metadata.get("memory_dependencies", ())
+        diagnostic_edges = (
+            {str(dependency) for dependency in memory_dependencies}
+            if isinstance(memory_dependencies, (tuple, list))
+            else set()
+        )
+        hardware_dependencies = task.metadata.get("hardware_dependencies", ())
+        hardware_edges = (
+            {str(dependency) for dependency in hardware_dependencies}
+            if isinstance(hardware_dependencies, (tuple, list))
+            else set()
+        )
+        return tuple(
+            dependency
+            for dependency in task.dependencies
+            if dependency not in diagnostic_edges or dependency in hardware_edges
+        )
 
     @staticmethod
     def _recent_history(records: list[ExecutionRecord], limit: int) -> str:

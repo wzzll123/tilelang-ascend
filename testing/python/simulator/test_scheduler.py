@@ -59,6 +59,106 @@ def test_independent_pipes_and_lanes_overlap() -> None:
     assert result.stats.task_count == 3
 
 
+def test_memory_dependencies_are_diagnostics_not_hardware_ordering() -> None:
+    """Match PTO perf-sim: inferred memory edges must not serialize pipes.
+
+    The bridge retains these edges so the static hazard validator can demand a
+    real flag/barrier, but hardware has no implicit MTE2->MTE1 dependency.
+    """
+    producer = Task("load", "copy", 0, Lane.CUBE, Pipe.MTE2, 9)
+    consumer = Task(
+        "consume",
+        "copy",
+        0,
+        Lane.CUBE,
+        Pipe.MTE1,
+        3,
+        dependencies=("load",),
+        metadata={"memory_dependencies": ("load",)},
+    )
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler().run(_program(producer, consumer)).records
+    }
+
+    assert records["load"].start_cycle == 0
+    assert records["consume"].start_cycle == 0
+
+
+def test_real_local_flag_orders_memory_edge_after_structural_edge_is_removed() -> None:
+    producer = Task("load", "copy", 0, Lane.CUBE, Pipe.MTE2, 9)
+    set_flag = Task(
+        "set",
+        "set_flag",
+        0,
+        Lane.CUBE,
+        Pipe.MTE2,
+        1,
+        metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 3},
+    )
+    wait_flag = Task(
+        "wait",
+        "wait_flag",
+        0,
+        Lane.CUBE,
+        Pipe.MTE1,
+        1,
+        metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 3},
+    )
+    consumer = Task(
+        "consume",
+        "copy",
+        0,
+        Lane.CUBE,
+        Pipe.MTE1,
+        3,
+        dependencies=("load",),
+        metadata={"memory_dependencies": ("load",)},
+    )
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_program(producer, set_flag, wait_flag, consumer)).records
+    }
+
+    assert records["set"].start_cycle == records["load"].end_cycle
+    assert records["wait"].start_cycle == records["set"].end_cycle
+    assert records["consume"].start_cycle == records["wait"].end_cycle
+
+
+def test_explicit_hardware_dependency_survives_memory_edge_filtering() -> None:
+    producer = Task("atomic-0", "atomic_add_ub_to_gm", 0, Lane.VECTOR_0, Pipe.MTE3, 5)
+    consumer = Task(
+        "atomic-1",
+        "atomic_add_ub_to_gm",
+        1,
+        Lane.VECTOR_0,
+        Pipe.MTE3,
+        3,
+        dependencies=("atomic-0",),
+        metadata={
+            "memory_dependencies": ("atomic-0",),
+            "hardware_dependencies": ("atomic-0",),
+        },
+    )
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler().run(
+            KernelProgram(
+                "atomic-serialization",
+                "A3",
+                (CoreProgram(0, (producer,)), CoreProgram(1, (consumer,))),
+            )
+        ).records
+    }
+
+    assert records["atomic-1"].start_cycle == records["atomic-0"].end_cycle
+
+
 def test_dependency_can_cross_core_and_lane() -> None:
     producer = Task("producer", "mma", 0, Lane.CUBE, Pipe.MATRIX, 8)
     consumer = Task(

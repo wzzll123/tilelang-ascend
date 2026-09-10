@@ -94,7 +94,7 @@ def validate_memory_synchronization(
 ) -> tuple[HazardDiagnostic, ...]:
     """Verify that inferred cross-pipe memory edges have hardware fences.
 
-    The bridge's memory dependencies are an execution aid, not an Ascend
+    The bridge's memory dependencies are diagnostic metadata, not an Ascend
     synchronization primitive.  Accept an edge only when pipe FIFO suffices,
     a full ``PIPE_ALL`` lies between the accesses, or a matching local
     set/wait flag pair connects the producer and consumer pipes.

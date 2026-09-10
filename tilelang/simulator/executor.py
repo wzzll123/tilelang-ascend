@@ -276,11 +276,7 @@ class FunctionalSimulator:
                 cross_flag_depth=self.config.cross_flag_depth,
             ),
         ).run(program, bindings=self.bindings)
-        task_by_id = {task.task_id: task for task in program.tasks}
-        for record in schedule.records:
-            if record.category == "wait":
-                continue
-            task = task_by_id[record.task_id]
+        for task in self._functional_execution_order(program, schedule):
             self._active_lane = task.lane
             try:
                 self._execute(task)
@@ -300,6 +296,54 @@ class FunctionalSimulator:
             memory=self.memory,
             numeric_results_available=not self.config.sync_only,
         )
+
+    @staticmethod
+    def _functional_execution_order(
+        program: KernelProgram,
+        schedule: ScheduleResult,
+    ) -> tuple[Task, ...]:
+        """Return a stable dataflow order for CPU value interpretation.
+
+        The schedule models hardware issue: a RAW/WAR/WAW metadata edge must
+        *not* serialize independent A2/A3 pipes unless an actual flag/barrier
+        does so.  NumPy interpretation is different: it must materialize each
+        producer value before a dependent Python operation reads it.  Retain
+        the bridge's complete ``Task.dependencies`` graph for that semantic
+        evaluation order, while leaving the emitted schedule and trace free of
+        inferred memory ordering.
+        """
+        schedule_rank = {
+            record.task_id: index
+            for index, record in enumerate(schedule.records)
+            if record.category != "wait"
+        }
+        pending = {task.task_id: task for task in program.tasks}
+        completed: set[str] = set()
+        ordered: list[Task] = []
+        while pending:
+            ready = [
+                task
+                for task in pending.values()
+                if set(task.dependencies).issubset(completed)
+            ]
+            if not ready:
+                unresolved = "; ".join(
+                    f"{task.task_id}: {', '.join(task.dependencies)}"
+                    for task in pending.values()
+                )
+                raise ProgramValidationError(
+                    "functional interpreter cannot topologically order task dependencies: "
+                    + unresolved
+                )
+            # The timing scheduler already represents explicit flag/barrier
+            # happens-before (including cross-lane waits).  Use its stable
+            # event order as the tie-breaker between otherwise independent
+            # value-DAG nodes, without promoting a memory edge into timing.
+            task = min(ready, key=lambda candidate: schedule_rank[candidate.task_id])
+            ordered.append(task)
+            completed.add(task.task_id)
+            del pending[task.task_id]
+        return tuple(ordered)
 
     def _program_for_dynamic_control(self) -> KernelProgram:
         if self._resolved_dynamic_program is not None:

@@ -36,7 +36,9 @@ from tilelang.simulator import (
 )
 
 
-def _set(tid, flag_id, pipe=Pipe.SCALAR, core=0):
+def _set(tid, flag_id, src="mte1", dst="mte2", pipe=None, core=0):
+    if pipe is None:
+        pipe = Pipe(src)
     return Task(
         tid,
         "set_flag",
@@ -44,11 +46,13 @@ def _set(tid, flag_id, pipe=Pipe.SCALAR, core=0):
         Lane.CUBE,
         pipe,
         1,
-        metadata={"src_pipe": "mte1", "dst_pipe": "mte2", "flag_id": flag_id},
+        metadata={"src_pipe": src, "dst_pipe": dst, "flag_id": flag_id},
     )
 
 
-def _wait(tid, flag_id, pipe=Pipe.SCALAR, core=0):
+def _wait(tid, flag_id, src="mte1", dst="mte2", pipe=None, core=0):
+    if pipe is None:
+        pipe = Pipe(dst)
     return Task(
         tid,
         "wait_flag",
@@ -56,7 +60,7 @@ def _wait(tid, flag_id, pipe=Pipe.SCALAR, core=0):
         Lane.CUBE,
         pipe,
         1,
-        metadata={"src_pipe": "mte1", "dst_pipe": "mte2", "flag_id": flag_id},
+        metadata={"src_pipe": src, "dst_pipe": dst, "flag_id": flag_id},
     )
 
 
@@ -75,8 +79,8 @@ def _task_cycle(prefix):
     set free (level-balanced, mirrors the GQA K-slot lifecycle)."""
     return [
         _wait(f"{prefix}-wait-free", 0),
-        _set(f"{prefix}-set-ready", 4),      # mte2->mte1 "ready" channel
-        _wait(f"{prefix}-wait-ready", 4),
+        _set(f"{prefix}-set-ready", 4, "mte2", "mte1"),
+        _wait(f"{prefix}-wait-ready", 4, "mte2", "mte1"),
         _set(f"{prefix}-set-free", 0),
     ]
 
