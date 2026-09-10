@@ -282,7 +282,7 @@ class FlagBarrierSynchronizationModel:
         self._tokens: dict[FlagKey, deque[tuple[int, str]]] = defaultdict(deque)
         self._collective_ready: dict[CollectiveKey, dict[Participant, list[tuple[int, str]]]] = defaultdict(lambda: defaultdict(list))
         self._collective_wait_phase: dict[tuple[CollectiveKey, Participant], int] = defaultdict(int)
-        self._cross_wait_modes: dict[tuple[int, str], int] = {}
+        self._cross_wait_modes: dict[tuple[int, str, int | None], int] = {}
         self._audited_cross_keys: set[FlagKey] = set()
         self._audited_collective_participants: set[tuple[CollectiveKey, Participant]] = set()
         self._core_ids: tuple[int, ...] = ()
@@ -303,7 +303,7 @@ class FlagBarrierSynchronizationModel:
         self._core_ids = tuple(sorted(core.core_id for core in program.cores))
         self._barrier_dependencies.clear()
         self._ordering_dependencies.clear()
-        wait_modes: dict[tuple[int, str], set[int]] = defaultdict(set)
+        wait_modes: dict[tuple[int, str, int | None], set[int]] = defaultdict(set)
         for task in program.tasks:
             operation = self._operation(task)
             self._validate_sync_task(task, operation)
@@ -311,12 +311,30 @@ class FlagBarrierSynchronizationModel:
                 continue
             mode = self._cross_mode(task)
             target_kind = self._cross_target_kind(mode, task)
-            wait_modes[(self._flag_id(task), target_kind)].add(mode)
+            # Mode 0 is a global all-AIC/all-AIV namespace.  Modes 1 and 2 are
+            # scoped to one AI Core group.  The hardware permits the same
+            # flagId to be used with different modes on different cores, so
+            # do not collapse those local namespaces into one global key.
+            target_core = None if mode == 0 else task.core_id
+            wait_modes[(self._flag_id(task), target_kind, target_core)].add(mode)
         for signature, modes in wait_modes.items():
             if len(modes) != 1:
-                flag_id, target_kind = signature
-                raise ProgramValidationError(f"cross flag id={flag_id} targeting {target_kind} has ambiguous modes {sorted(modes)}")
+                flag_id, target_kind, target_core = signature
+                scope = "globally" if target_core is None else f"on core={target_core}"
+                raise ProgramValidationError(
+                    f"cross flag id={flag_id} targeting {target_kind} {scope} "
+                    f"has ambiguous modes {sorted(modes)}"
+                )
             self._cross_wait_modes[signature] = next(iter(modes))
+        for (flag_id, target_kind, target_core), modes in wait_modes.items():
+            if target_core is None:
+                continue
+            global_modes = wait_modes.get((flag_id, target_kind, None), set())
+            if global_modes and global_modes != modes:
+                raise ProgramValidationError(
+                    f"cross flag id={flag_id} targeting {target_kind} on core={target_core} "
+                    f"has ambiguous modes {sorted(global_modes | modes)}"
+                )
         for task in program.tasks:
             if self._operation(task) not in self._WAIT_CROSS:
                 continue
@@ -618,7 +636,16 @@ class FlagBarrierSynchronizationModel:
         raise ProgramValidationError(f"invalid collective cross flag key {key!r}")
 
     def _cross_wait_mode(self, task: Task) -> int | None:
-        return self._cross_wait_modes.get((self._flag_id(task), self._lane_kind(task)))
+        flag_id = self._flag_id(task)
+        lane_kind = self._lane_kind(task)
+        local = self._cross_wait_modes.get((flag_id, lane_kind, task.core_id))
+        global_mode = self._cross_wait_modes.get((flag_id, lane_kind, None))
+        if local is not None and global_mode is not None and local != global_mode:
+            raise ProgramValidationError(
+                f"cross flag id={flag_id} targeting {lane_kind} on core={task.core_id} "
+                f"has ambiguous modes {sorted({local, global_mode})}"
+            )
+        return local if local is not None else global_mode
 
     @classmethod
     def _cross_target_kind(cls, mode: int, task: Task) -> str:
@@ -673,7 +700,11 @@ class FlagBarrierSynchronizationModel:
             cls._validate_lane_pipe(task, src_pipe, "source")
             cls._validate_lane_pipe(task, dst_pipe, "destination")
         if operation in cls._SET_CROSS:
-            cls._flag_id(task)
+            flag_id = cls._flag_id(task)
+            if not 0 <= flag_id <= 15:
+                raise ProgramValidationError(
+                    f"cross flag task {task.task_id!r} requires flag_id in [0, 15], got {flag_id}"
+                )
             mode = cls._cross_mode(task)
             lane_kind = cls._lane_kind(task)
             if mode == 1 and lane_kind != "vector":
@@ -683,7 +714,11 @@ class FlagBarrierSynchronizationModel:
                 raise ProgramValidationError(f"cross flag set task {task.task_id!r} requires a non-scalar src_pipe, got {source_pipe!r}")
             cls._validate_lane_pipe(task, source_pipe, "source")
         elif operation in cls._WAIT_CROSS:
-            cls._flag_id(task)
+            flag_id = cls._flag_id(task)
+            if not 0 <= flag_id <= 15:
+                raise ProgramValidationError(
+                    f"cross flag task {task.task_id!r} requires flag_id in [0, 15], got {flag_id}"
+                )
             cls._lane_kind(task)
         if operation in cls._PIPE_BARRIER:
             target_pipe = cls._pipe_name(task.metadata.get("target_pipe", task.pipe.value))

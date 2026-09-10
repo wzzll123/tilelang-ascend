@@ -609,6 +609,48 @@ def test_cross_flag_rejects_ambiguous_modes_for_the_same_wait_namespace() -> Non
         ).run(_program(*tasks))
 
 
+def test_cross_flag_allows_same_id_in_different_modes_on_different_cores() -> None:
+    core_0 = CoreProgram(0, (
+        Task(
+            "c0-v0-set", "set_cross_flag", 0, Lane.VECTOR_0, Pipe.VECTOR, 1,
+            metadata={"src_pipe": "v", "flag_id": 9, "mode": 1},
+        ),
+        Task(
+            "c0-v1-set", "set_cross_flag", 0, Lane.VECTOR_1, Pipe.VECTOR, 2,
+            metadata={"src_pipe": "v", "flag_id": 9, "mode": 1},
+        ),
+        Task(
+            "c0-v0-wait", "wait_cross_flag", 0, Lane.VECTOR_0, Pipe.SCALAR, 1,
+            metadata={"flag_id": 9},
+        ),
+    ))
+    core_1 = CoreProgram(1, (
+        Task(
+            "c1-cube-set", "set_cross_flag", 1, Lane.CUBE, Pipe.FIX, 3,
+            metadata={"src_pipe": "fix", "flag_id": 9, "mode": 2},
+        ),
+        Task(
+            "c1-v0-wait", "wait_cross_flag", 1, Lane.VECTOR_0, Pipe.SCALAR, 1,
+            metadata={"flag_id": 9},
+        ),
+        Task(
+            "c1-v1-wait", "wait_cross_flag", 1, Lane.VECTOR_1, Pipe.SCALAR, 1,
+            metadata={"flag_id": 9},
+        ),
+    ))
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(KernelProgram("cross-mode-per-core", "A3", (core_0, core_1))).records
+    }
+
+    assert records["c0-v0-wait"].start_cycle == records["c0-v1-set"].end_cycle
+    assert records["c1-v0-wait"].start_cycle == records["c1-cube-set"].end_cycle
+    assert records["c1-v1-wait"].start_cycle == records["c1-cube-set"].end_cycle
+
+
 def test_cross_flag_mode_one_rejects_cube_participants() -> None:
     task = Task(
         "set", "set_cross_flag", 0, Lane.CUBE, Pipe.FIX, 1,
@@ -629,6 +671,19 @@ def test_cross_flag_rejects_invalid_modes(mode: object) -> None:
     )
 
     with pytest.raises(ProgramValidationError, match="requires mode 0, 1, or 2"):
+        DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_program(task))
+
+
+@pytest.mark.parametrize("flag_id", [-1, 16])
+def test_cross_flag_rejects_ids_outside_a2_a3_hardware_range(flag_id: int) -> None:
+    task = Task(
+        "set", "set_cross_flag", 0, Lane.CUBE, Pipe.FIX, 1,
+        metadata={"src_pipe": "fix", "flag_id": flag_id, "mode": 2},
+    )
+
+    with pytest.raises(ProgramValidationError, match=r"flag_id"):
         DiscreteEventScheduler(
             synchronization=FlagBarrierSynchronizationModel()
         ).run(_program(task))
