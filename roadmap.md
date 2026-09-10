@@ -714,7 +714,7 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   缺失 flag 变异、poison 传播和 compute-heavy MMA 提速均有独立回归。~~
 - [x] ~~根据 A2 真机 D53/D54 二分补充 GM/workspace RAW visibility window：无 collective
   的同相位 `MTE3_MTE2` flag 可放行；跨 mode-0 collective 后必须在读侧执行
-  `PIPE_MTE2`/`PIPE_ALL`。新增独立 `gm_visibility=error|warn|off` 策略和 T1–T7 回归，
+  `PIPE_MTE2`/`PIPE_ALL`。诊断统一服从 `hazard_check=error|warn|off`，并增加 T1–T7 回归，
   不改变 UB/L1/L0 的原有 fence 判据；A3 暂按保守共同语义执行。~~
 - [ ] 将 hazard 诊断扩展到带 source span 的动态精确 address range。
 - [ ] 执行 software-pipeline prologue、steady state、epilogue、stage/ring index 和 wrap。

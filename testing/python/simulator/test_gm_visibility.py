@@ -1,6 +1,6 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""A2/A3 GM visibility-window synchronization regressions."""
+"""A2 GM visibility-window synchronization regressions."""
 
 import pytest
 
@@ -14,7 +14,7 @@ from tilelang.simulator import (
     SimulatorConfig,
     Task,
 )
-from tilelang.simulator.errors import MemoryHazardError, SimulatorConfigError
+from tilelang.simulator.errors import MemoryHazardError
 from tilelang.simulator.hazard import SimulatorHazardWarning
 from tilelang.simulator.sync import validate_memory_synchronization
 
@@ -23,13 +23,13 @@ GM = BufferRegion("workspace", MemoryScope.WORKSPACE, (8,), "float32")
 UB = BufferRegion("ub", MemoryScope.UB, (8,), "float32", core_id=0)
 
 
-def _program(*tasks: Task) -> KernelProgram:
+def _program(*tasks: Task, platform="A2") -> KernelProgram:
     by_core = {}
     for task in tasks:
         by_core.setdefault(task.core_id, []).append(task)
     return KernelProgram(
         "gm_visibility",
-        "A2",
+        platform,
         tuple(CoreProgram(core_id, tuple(core_tasks)) for core_id, core_tasks in sorted(by_core.items())),
     )
 
@@ -97,16 +97,14 @@ def _barrier(target, *, core=0, suffix="") -> Task:
     )
 
 
-def test_gm_visibility_config_validation() -> None:
-    assert SimulatorConfig(gm_visibility="warn").gm_visibility == "warn"
-    with pytest.raises(SimulatorConfigError, match="gm_visibility"):
-        SimulatorConfig(gm_visibility="invalid")
+def test_gm_visibility_uses_unified_hazard_policy() -> None:
+    assert SimulatorConfig(hazard_check="warn").hazard_check == "warn"
 
 
 def test_d53_gm_raw_rejects_unrelated_pipe_barrier() -> None:
     program = _program(_write(), _barrier("v"), _read())
     with pytest.raises(MemoryHazardError, match="GM visibility"):
-        validate_memory_synchronization(program, gm_visibility="error")
+        validate_memory_synchronization(program, hazard_check="error")
 
 
 def test_gm_visibility_policy_and_diagnostic_metadata() -> None:
@@ -114,8 +112,7 @@ def test_gm_visibility_policy_and_diagnostic_metadata() -> None:
     with pytest.warns(SimulatorHazardWarning, match="GM visibility"):
         diagnostics = validate_memory_synchronization(
             program,
-            hazard_check="off",
-            gm_visibility="warn",
+            hazard_check="warn",
         )
     assert len(diagnostics) == 1
     diagnostic = diagnostics[0]
@@ -127,7 +124,6 @@ def test_gm_visibility_policy_and_diagnostic_metadata() -> None:
         validate_memory_synchronization(
             program,
             hazard_check="off",
-            gm_visibility="off",
         )
         == ()
     )
@@ -140,7 +136,7 @@ def test_d53_gm_raw_accepts_same_phase_mte3_mte2_flag() -> None:
         _local("auto_wait_flag", "mte3", "mte2", 2),
         _read(),
     )
-    assert validate_memory_synchronization(program, gm_visibility="error") == ()
+    assert validate_memory_synchronization(program, hazard_check="error") == ()
 
 
 def test_d54_collective_alone_does_not_make_gm_raw_visible() -> None:
@@ -153,7 +149,7 @@ def test_d54_collective_alone_does_not_make_gm_raw_visible() -> None:
         _read(),
     )
     with pytest.raises(MemoryHazardError, match="GM visibility"):
-        validate_memory_synchronization(program, gm_visibility="error")
+        validate_memory_synchronization(program, hazard_check="error")
 
 
 def test_d54_read_side_mte2_barrier_makes_gm_raw_visible() -> None:
@@ -164,7 +160,7 @@ def test_d54_read_side_mte2_barrier_makes_gm_raw_visible() -> None:
         _barrier("mte2"),
         _read(),
     )
-    assert validate_memory_synchronization(program, gm_visibility="error") == ()
+    assert validate_memory_synchronization(program, hazard_check="error") == ()
 
 
 def test_d54_flag_pair_across_collective_is_not_a_visibility_fence() -> None:
@@ -177,7 +173,20 @@ def test_d54_flag_pair_across_collective_is_not_a_visibility_fence() -> None:
         _read(),
     )
     with pytest.raises(MemoryHazardError, match="GM visibility"):
-        validate_memory_synchronization(program, gm_visibility="error")
+        validate_memory_synchronization(program, hazard_check="error")
+
+
+def test_d54_rule_is_not_extrapolated_to_unverified_a3() -> None:
+    program = _program(
+        _write(),
+        _local("auto_set_flag", "mte3", "mte2", 7),
+        _cross("set_cross_flag", 3),
+        _cross("wait_cross_flag", 3),
+        _local("auto_wait_flag", "mte3", "mte2", 7),
+        _read(),
+        platform="A3",
+    )
+    assert validate_memory_synchronization(program, hazard_check="error") == ()
 
 
 def test_ub_raw_keeps_existing_local_flag_semantics() -> None:
@@ -206,7 +215,7 @@ def test_ub_raw_keeps_existing_local_flag_semantics() -> None:
         _local("auto_wait_flag", "mte2", "v", 2),
         consumer,
     )
-    assert validate_memory_synchronization(program, gm_visibility="error") == ()
+    assert validate_memory_synchronization(program, hazard_check="error") == ()
 
 
 @pytest.mark.parametrize("with_read_drain", [False, True])
@@ -224,10 +233,10 @@ def test_cross_core_gm_raw_requires_collective_then_read_drain(with_read_drain) 
     program = _program(*tasks)
 
     if with_read_drain:
-        assert validate_memory_synchronization(program, gm_visibility="error") == ()
+        assert validate_memory_synchronization(program, hazard_check="error") == ()
     else:
         with pytest.raises(MemoryHazardError, match="GM visibility"):
-            validate_memory_synchronization(program, gm_visibility="error")
+            validate_memory_synchronization(program, hazard_check="error")
 
 
 def _cube_flag(operation, src, dst, flag_id) -> Task:

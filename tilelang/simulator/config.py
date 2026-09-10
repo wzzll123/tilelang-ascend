@@ -24,7 +24,6 @@ class SimulatorConfig:
     platform: str = "A2"
     trace_path: str | Path | None = None
     hazard_check: str = "error"
-    gm_visibility: str = "error"
     sync_only: bool = False
     dynamic_if: str = "error"
     deadlock_detect: bool = True
@@ -39,8 +38,6 @@ class SimulatorConfig:
         object.__setattr__(self, "platform", platform)
         if self.hazard_check not in {"off", "warn", "error"}:
             raise SimulatorConfigError("hazard_check must be one of: off, warn, error")
-        if self.gm_visibility not in {"off", "warn", "error"}:
-            raise SimulatorConfigError("gm_visibility must be one of: off, warn, error")
         if not isinstance(self.sync_only, bool):
             raise SimulatorConfigError("sync_only must be a boolean")
         if self.dynamic_if not in {"error", "then", "else"}:

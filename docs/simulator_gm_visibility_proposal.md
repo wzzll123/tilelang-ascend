@@ -5,12 +5,19 @@
 **范围**：`tilelang/simulator/sync.py` 的静态校验（`validate_memory_synchronization`），可选扩展 `executor.py` 执行期语义
 **背景代码基线**：本仓 `ascendc_pto` 分支 HEAD（≥ da774be4）
 
-**实施结果**：新增独立 `gm_visibility=error|warn|off` 策略、GM/workspace RAW
+**实施结果**：在统一的 `hazard_check=error|warn|off` 策略下新增 GM/workspace RAW
 窗口诊断、同相位 `MTE3_MTE2` 特例、跨 phase 读侧 MTE2/ALL drain 规则及 T1–T7
-测试。全量 simulator 回归 602 passed。C1 三分支 clean；归档 MSD 设计仍保留 D54
-旧态（仅 SIG_VALL_Q、缺读侧 MTE2 barrier），因此 `xmax_sum` 负例会被正确检出。
+测试。全量 simulator 回归 612 passed。C1 三分支 clean；归档 MSD 设计已包含 D54
+读侧 MTE2 barrier，测试中回退该 barrier 后 `xmax_sum` 负例会被正确检出。
 跨核规则可校验显式诊断边；bridge 为避免把不同 core 的执行顺序错误串行化，仍不把
 跨核 GM 访问加入 scheduler dependency。
+
+2026-09-10 在 NPU3 `wzz_cann` 的 Ascend 910B3（逻辑卡 0、物理卡 2）重新进行了
+独立 A/B：两份扩展从同一归档源码重新编译，broken 版本只删除 D54 读前的一个
+`PipeBarrier<PIPE_MTE2>()`。输入为 M=256/N=7168/K=14336 的全 1 fp16 x、int8
+weight、scale 和 offset，精确期望为 28672。fixed 连续 10/10 次所有元素均为
+28672；broken 连续 10/10 次均出现 14336，输出均值在 21068–21632 间波动。
+因此 A2 规则保留，但不设独立公开开关，并且在 A3 未有同等实证前不向 A3 外推。
 
 ---
 
@@ -98,7 +105,7 @@ sync_only 静态校验目前对**同核跨 pipe 内存边**的 fence 判据是�
 ### 4.4 已知良性边的抑制通道
 
 D53 记录：DSL 生成码存在真机有序的 GM 边（T.copy 数据流天然有序），新规则会保守误报。提供两级抑制：
-- `sim_config` 新增 `gm_visibility: "error" | "warn" | "off"`（默认 `"error"`，遵循 fail-closed 纪律）；
+- 不新增公开配置；诊断服从既有 `hazard_check: "error" | "warn" | "off"`。
 - 诊断 metadata 中带 producer/consumer task_id 与 buffer 名，允许测试按 buffer 名 allowlist（测试用，不进生产配置）。
 
 ### 4.5 （可选，P2）执行期语义
@@ -125,7 +132,7 @@ D53 记录：DSL 生成码存在真机有序的 GM 边（T.copy 数据流天然�
 ## 6. 验收标准
 
 1. T1-T8 全绿；既有 `testing/python/simulator/` 套件无未解释回归。
-2. wqbm 参考设计全量对拍：对 `weight_quant_batch_matmul` 的 MSD DSL 5 分支 + C1 DSL 3 分支跑 sync_only（hazard=error, gm_visibility=error）：
+2. wqbm 参考设计全量对拍：对 `weight_quant_batch_matmul` 的 MSD DSL 5 分支 + C1 DSL 3 分支跑 sync_only（hazard=error）：
    - 含 D53/D54 修复（MTE3_MTE2(2) flag、读侧 PIPE_MTE2）的当前态必须 clean；
    - **回退掉 D54 的读侧 PIPE_MTE2 后必须报 gm-visibility-window**（负例验证，证明规则咬住了真 bug 形态）。
 3. 不修改 `ascend_sync_insert.cc` 等编译器同步插入 pass（纪律：该文件冻结）。
@@ -142,4 +149,4 @@ D53 记录：DSL 生成码存在真机有序的 GM 边（T.copy 数据流天然�
 
 - **误报面**：规则是保守过近似（sound over-approximation），DSL 生成码可能新增少量 warn/error——用 §4.4 的 allowlist 逐个审，不许为消报而改宽规则。
 - **scope 分类正确性**：`BufferRegion.scope` 的 GM 判定以 `memory.py::_SHARED_SCOPES` 与 bridge 实际标注为准；先在 T6/T7 里验证 scope 流转无损，再依赖它做规则分流。
-- 证据全部来自 A2 (910B3) 真机；A3 (910c) 未单独验证——规则按两平台共同语义编写，注释中标注此前提。
+- 证据全部来自 A2 (910B3) 真机；A3 (910C) 未单独验证，因此实现只在 A2 启用该经验规则。

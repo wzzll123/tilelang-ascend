@@ -137,7 +137,6 @@ kernel = tilelang.compile(
     sim_config=SimulatorConfig(
         trace_path="trace.json",
         hazard_check="error",
-        gm_visibility="error",
         sync_only=False,
     ),
 )
@@ -365,9 +364,9 @@ an adjacent matching `MTE3_MTE2` set/wait pair. If a mode-0 cross-core collectiv
 the write and read, neither that collective nor a flag spanning it makes a previously cached GM
 line visible: the consumer must execute a read-side `PIPE_MTE2` or `PIPE_ALL` barrier after the
 last collective and before the read. The rule applies to both GM parameters and workspace, is
-configured independently with `gm_visibility="error" | "warn" | "off"`, and currently diagnoses
-RAW only; GM WAR/WAW remain future work. A3 uses the same conservative rule pending a separate
-on-device confirmation.
+uses the existing `hazard_check="error" | "warn" | "off"` policy and currently diagnoses RAW
+only; GM WAR/WAW remain future work. This rule is enabled only for A2 because the D53/D54
+phenomenon has not yet been independently reproduced on A3.
 
 `T.Pipelined` is not interpreted as a high-level construct in authoritative simulation. The
 `PipelinePlanning` and `InjectSoftwarePipeline` passes have already expanded it. The simulator

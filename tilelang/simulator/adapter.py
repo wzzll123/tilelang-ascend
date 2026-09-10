@@ -54,10 +54,10 @@ class SimulatorKernelAdapter:
         self.sync_diagnostics = (
             validate_memory_synchronization(
                 self.program,
-                hazard_check=(self.config.hazard_check if validate_sync else "off"),
-                gm_visibility=self.config.gm_visibility,
+                hazard_check=self.config.hazard_check,
+                validate_local=validate_sync,
             )
-            if (validate_sync or self.config.gm_visibility != "off") and not self._has_dynamic_control
+            if self.config.hazard_check != "off" and not self._has_dynamic_control
             else ()
         )
         self.func = self._functional_execute
@@ -192,8 +192,8 @@ class SimulatorKernelAdapter:
             active_program = simulator._program_for_dynamic_control()
             self.sync_diagnostics = validate_memory_synchronization(
                 active_program,
-                hazard_check=(self.config.hazard_check if self._validate_sync else "off"),
-                gm_visibility=self.config.gm_visibility,
+                hazard_check=self.config.hazard_check,
+                validate_local=self._validate_sync,
             )
 
         execution = simulator.run()

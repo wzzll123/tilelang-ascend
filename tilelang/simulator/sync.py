@@ -91,7 +91,7 @@ def validate_memory_synchronization(
     program: KernelProgram,
     *,
     hazard_check: str = "error",
-    gm_visibility: str = "error",
+    validate_local: bool = True,
 ) -> tuple[HazardDiagnostic, ...]:
     """Verify that inferred cross-pipe memory edges have hardware fences.
 
@@ -100,8 +100,8 @@ def validate_memory_synchronization(
     a full ``PIPE_ALL`` lies between the accesses, or a matching local
     set/wait flag pair connects the producer and consumer pipes.
     """
-    reporter = HazardReporter(hazard_check)
-    gm_reporter = HazardReporter(gm_visibility)
+    reporter = HazardReporter(hazard_check if validate_local else "off")
+    gm_reporter = HazardReporter(hazard_check)
     task_by_id = {task.task_id: task for task in program.tasks}
     for core in program.cores:
         tasks = core.tasks
@@ -114,7 +114,7 @@ def validate_memory_synchronization(
                 producer = task_by_id.get(str(dependency_id))
                 if producer is None or producer.pipe == consumer.pipe:
                     continue
-                gm_buffer = _gm_raw_buffer(producer, consumer)
+                gm_buffer = _gm_raw_buffer(producer, consumer) if program.platform == "A2" else None
                 if producer.core_id != consumer.core_id:
                     if gm_buffer is not None:
                         consumer_prefix = tasks[:consumer_index]
@@ -242,11 +242,11 @@ def _report_gm_visibility(
                 f"{producer.task_id} ({producer.operation}/{producer.pipe.value}) -> "
                 f"{consumer.task_id} ({consumer.operation}/{consumer.pipe.value}) "
                 f"on buffer {buffer_name!r}, core {producer.core_id} -> "
-                f"{consumer.core_id}: after a mode-0 collective an A2/A3 GM "
+                f"{consumer.core_id}: after a mode-0 collective an A2 GM "
                 "read requires a read-side PIPE_MTE2 or PIPE_ALL drain; a "
                 "cross-phase flag/collective alone is insufficient. Without a "
                 "collective, only an adjacent matching MTE3_MTE2 flag is "
-                "accepted (D53/D54)"
+                "accepted (A2 D53/D54 hardware evidence; not extrapolated to A3)"
             ),
             buffer=buffer_name,
             core_id=consumer.core_id,
