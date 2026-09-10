@@ -50,7 +50,13 @@ class SimulatorKernelAdapter:
         self._parameter_names = self._extract_parameter_names()
         self._buffer_specs = {buffer.name: buffer for buffer in self.program.buffers}
         self.sync_diagnostics = (
-            validate_memory_synchronization(self.program, hazard_check=self.config.hazard_check) if validate_sync else ()
+            validate_memory_synchronization(
+                self.program,
+                hazard_check=(self.config.hazard_check if validate_sync else "off"),
+                gm_visibility=self.config.gm_visibility,
+            )
+            if validate_sync or self.config.gm_visibility != "off"
+            else ()
         )
         self.func = self._functional_execute
 

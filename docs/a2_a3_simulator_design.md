@@ -137,6 +137,7 @@ kernel = tilelang.compile(
     sim_config=SimulatorConfig(
         trace_path="trace.json",
         hazard_check="error",
+        gm_visibility="error",
         sync_only=False,
     ),
 )
@@ -357,6 +358,16 @@ An asynchronous write progresses through `issued`, `in_flight`, `completed`, and
 states. Completion frees an execution resource; visibility permits a dependent reader. These
 states must remain distinct because a flag or barrier can alter visibility without changing the
 functional result.
+
+GM and workspace RAW dependencies additionally follow an A2 (910B3) visibility rule established
+by the D53/D54 on-device bisect. An MTE3 write followed by an MTE2 read in the same phase may use
+an adjacent matching `MTE3_MTE2` set/wait pair. If a mode-0 cross-core collective occurs between
+the write and read, neither that collective nor a flag spanning it makes a previously cached GM
+line visible: the consumer must execute a read-side `PIPE_MTE2` or `PIPE_ALL` barrier after the
+last collective and before the read. The rule applies to both GM parameters and workspace, is
+configured independently with `gm_visibility="error" | "warn" | "off"`, and currently diagnoses
+RAW only; GM WAR/WAW remain future work. A3 uses the same conservative rule pending a separate
+on-device confirmation.
 
 `T.Pipelined` is not interpreted as a high-level construct in authoritative simulation. The
 `PipelinePlanning` and `InjectSoftwarePipeline` passes have already expanded it. The simulator
