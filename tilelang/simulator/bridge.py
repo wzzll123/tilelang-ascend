@@ -167,6 +167,7 @@ class _Context:
     lane: Lane = Lane.CONTROL
     vector_index: int | None = None
     environment: Mapping[Any, int] = None
+    predicates: tuple[tuple[int, Any, bool], ...] = ()
 
     def __post_init__(self) -> None:
         if self.environment is None:
@@ -332,6 +333,7 @@ class _TirBridge:
         self.last_reads: list[tuple[BufferRegion, str, Lane, int]] = []
         self.active_aliases: dict[tuple[MemoryScope, int | None, str], str] = {}
         self.task_counter = 0
+        self.predicate_counter = 0
         self.kernel_name = "main"
         self.loop_break_count = 0
 
@@ -469,8 +471,27 @@ class _TirBridge:
                     break
             return
         if isinstance(stmt, tir.IfThenElse):
-            condition = self._require_int(stmt.condition, context.environment, "if condition")
-            self._visit(stmt.then_case if condition else stmt.else_case, context)
+            condition = self._const_int(stmt.condition, context.environment)
+            if condition is not None:
+                self._visit(stmt.then_case if condition else stmt.else_case, context)
+                return
+            dynamic_condition = self._dynamic_condition(stmt.condition, context.environment)
+            predicate_id = self.predicate_counter
+            self.predicate_counter += 1
+            self._visit(
+                stmt.then_case,
+                replace(
+                    context,
+                    predicates=context.predicates + ((predicate_id, dynamic_condition, True),),
+                ),
+            )
+            self._visit(
+                stmt.else_case,
+                replace(
+                    context,
+                    predicates=context.predicates + ((predicate_id, dynamic_condition, False),),
+                ),
+            )
             return
         if isinstance(stmt, tir.LetStmt):
             value = self._require_int(stmt.value, context.environment, "let binding")
@@ -4377,6 +4398,8 @@ class _TirBridge:
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
         self.task_counter += 1
         task_metadata = dict(metadata)
+        if context.predicates:
+            task_metadata["dynamic_predicates"] = context.predicates
         timing_key = str(task_metadata.get("timing_key", normalized))
         task_metadata.setdefault("timing_key", timing_key)
         task_metadata.setdefault("timing_calibration", self.timing_profile.calibration)
@@ -4400,6 +4423,19 @@ class _TirBridge:
         self.tasks[context.core_id].append(task)
         self._record_memory_accesses(task, context.core_id, context.lane)
         return task
+
+    def _dynamic_condition(self, value: Any, environment: Mapping[Any, int]) -> Any:
+        """Keep a scalar TIR predicate for execution after its producer has run."""
+        replacements = self._environment_replacements(environment) if environment else {}
+        condition = self.tir.stmt_functor.substitute(value, replacements)
+        if not any(isinstance(node, self.tir.BufferLoad) for node in self._post_order_nodes(condition)):
+            raise UnsupportedSimOpError(f"dynamic if condition is not executable: {value}")
+        return condition
+
+    def _post_order_nodes(self, value: Any) -> list[Any]:
+        nodes: list[Any] = []
+        self.tir.stmt_functor.post_order_visit(value, nodes.append)
+        return nodes
 
     @staticmethod
     def _sync_task_pipe(operation: str, metadata: Mapping[str, Any], fallback: Pipe) -> Pipe:

@@ -2,10 +2,12 @@
 # Licensed under the MIT License.
 """Deterministic discrete-event scheduler for A2/A3 simulator tasks."""
 
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Dict, List, Mapping, Optional, Set, Tuple
+from collections.abc import Mapping
 
 from .config import SimulatorConfig
 from .errors import (
@@ -20,14 +22,14 @@ from .sync import NoOpSynchronizationModel, SynchronizationModel, readonly_recor
 from .trace import ExecutionRecord
 
 
-ResourceKey = Tuple[int, str, str]
+ResourceKey = tuple[int, str, str]
 
 
 @dataclass(frozen=True)
 class ScheduleResult:
     """Immutable records and derived statistics from one scheduling run."""
 
-    records: Tuple[ExecutionRecord, ...]
+    records: tuple[ExecutionRecord, ...]
     stats: SimulationStats
 
 
@@ -41,8 +43,8 @@ class DiscreteEventScheduler:
 
     def __init__(
         self,
-        config: Optional[SimulatorConfig] = None,
-        synchronization: Optional[SynchronizationModel] = None,
+        config: SimulatorConfig | None = None,
+        synchronization: SynchronizationModel | None = None,
     ) -> None:
         self.config = config
         self.synchronization = synchronization or NoOpSynchronizationModel()
@@ -51,14 +53,13 @@ class DiscreteEventScheduler:
         self,
         program: KernelProgram,
         *,
-        bindings: Optional[Mapping[str, int | float]] = None,
+        bindings: Mapping[str, int | float] | None = None,
     ) -> ScheduleResult:
         """Schedule ``program`` and return trace-ready records plus summary statistics."""
         config = self.config or SimulatorConfig(platform=program.platform)
         if config.platform != program.platform:
             raise SimulatorConfigError(
-                "scheduler config platform does not match program platform: "
-                f"{config.platform} != {program.platform}"
+                f"scheduler config platform does not match program platform: {config.platform} != {program.platform}"
             )
 
         tasks = program.tasks
@@ -67,15 +68,15 @@ class DiscreteEventScheduler:
         fifo_predecessor = self._fifo_predecessors(tasks)
         self.synchronization.reset(program)
 
-        pending: Set[str] = set(task_by_id)
-        completed: Dict[str, ExecutionRecord] = {}
-        records: List[ExecutionRecord] = []
+        pending: set[str] = set(task_by_id)
+        completed: dict[str, ExecutionRecord] = {}
+        records: list[ExecutionRecord] = []
         started_at = time.monotonic()
 
         while pending:
             self._check_wall_timeout(started_at, config.execution_timeout_s, pending)
             made_progress = False
-            blocked_details: Dict[str, str] = {}
+            blocked_details: dict[str, str] = {}
 
             # Stable source order makes equal-cycle schedules reproducible.
             for task in tasks:
@@ -102,33 +103,32 @@ class DiscreteEventScheduler:
                     (completed[task_id].end_cycle for task_id in dependency_required),
                     default=0,
                 )
-                resource_cycle = (
-                    completed[predecessor].end_cycle if predecessor is not None else 0
-                )
+                resource_cycle = completed[predecessor].end_cycle if predecessor is not None else 0
                 synchronization_cycle = decision.ready_cycle or 0
                 ready_cycle = max(dependency_cycle, synchronization_cycle)
                 start_cycle = max(ready_cycle, resource_cycle)
                 if synchronization_cycle > max(dependency_cycle, resource_cycle):
-                    records.append(ExecutionRecord(
-                        task_id=f"{task.task_id}#wait",
-                        operation="wait",
-                        core_id=task.core_id,
-                        lane=task.lane,
-                        pipe=task.pipe,
-                        start_cycle=max(dependency_cycle, resource_cycle),
-                        end_cycle=synchronization_cycle,
-                        category="wait",
-                        stall_reason=decision.reason or "synchronization",
-                        metadata={
-                            "blocked_task": task.task_id,
-                            "detail": decision.detail,
-                        },
-                    ))
+                    records.append(
+                        ExecutionRecord(
+                            task_id=f"{task.task_id}#wait",
+                            operation="wait",
+                            core_id=task.core_id,
+                            lane=task.lane,
+                            pipe=task.pipe,
+                            start_cycle=max(dependency_cycle, resource_cycle),
+                            end_cycle=synchronization_cycle,
+                            category="wait",
+                            stall_reason=decision.reason or "synchronization",
+                            metadata={
+                                "blocked_task": task.task_id,
+                                "detail": decision.detail,
+                            },
+                        )
+                    )
                 end_cycle = start_cycle + task.duration_cycles
                 if config.max_cycles is not None and end_cycle > config.max_cycles:
                     raise SimulationLimitError(
-                        f"task {task.task_id!r} would finish at cycle {end_cycle}, "
-                        f"exceeding max_cycles={config.max_cycles}"
+                        f"task {task.task_id!r} would finish at cycle {end_cycle}, exceeding max_cycles={config.max_cycles}"
                     )
 
                 trace_metadata = {}
@@ -149,13 +149,24 @@ class DiscreteEventScheduler:
                 made_progress = True
 
             if not made_progress:
-                details = "; ".join(
-                    f"{task_id}: {blocked_details.get(task_id, 'blocked')}"
-                    for task_id in sorted(pending)
+                if not config.deadlock_detect:
+                    continue
+                details = "; ".join(f"{task_id}: {blocked_details.get(task_id, 'blocked')}" for task_id in sorted(pending))
+                cycle = self._wait_cycle(pending, tasks, fifo_predecessor, completed)
+                cycle_detail = (
+                    "; wait-for cycle: " + " -> ".join(cycle)
+                    if cycle
+                    else "; wait-for graph has no cycle; all remaining tasks are blocked and no future event can fire"
                 )
+                history = self._recent_history(records, config.deadlock_history_limit)
                 raise SimulationDeadlockError(
-                    f"simulation deadlock with {len(pending)} blocked task(s): {details}"
+                    f"DEADLOCK (global no-progress): {len(pending)} blocked task(s): {details}{cycle_detail}; recent events: {history}"
                 )
+
+        if config.flag_balance_check != "off":
+            audit = getattr(self.synchronization, "audit_flag_balance", None)
+            if callable(audit):
+                audit(config.flag_balance_check)
 
         ordered_records = tuple(
             sorted(
@@ -169,21 +180,64 @@ class DiscreteEventScheduler:
         )
 
     @staticmethod
-    def _validate_dependencies(
-        tasks: Tuple[Task, ...], task_by_id: Mapping[str, Task]
-    ) -> None:
+    def _wait_cycle(
+        pending: set[str],
+        tasks: tuple[Task, ...],
+        fifo_predecessor: Mapping[str, str],
+        completed: Mapping[str, ExecutionRecord],
+    ) -> tuple[str, ...]:
+        edges: dict[str, tuple[str, ...]] = {}
+        for task in tasks:
+            if task.task_id not in pending:
+                continue
+            required = list(task.dependencies)
+            predecessor = fifo_predecessor.get(task.task_id)
+            if predecessor is not None:
+                required.append(predecessor)
+            edges[task.task_id] = tuple(dependency for dependency in required if dependency not in completed)
+        visiting: list[str] = []
+        visited: set[str] = set()
+
+        def visit(task_id: str) -> tuple[str, ...]:
+            if task_id in visiting:
+                start = visiting.index(task_id)
+                return tuple(visiting[start:] + [task_id])
+            if task_id in visited:
+                return ()
+            visiting.append(task_id)
+            for dependency in edges.get(task_id, ()):
+                cycle = visit(dependency)
+                if cycle:
+                    return cycle
+            visiting.pop()
+            visited.add(task_id)
+            return ()
+
+        for task_id in sorted(pending):
+            cycle = visit(task_id)
+            if cycle:
+                return cycle
+        return ()
+
+    @staticmethod
+    def _recent_history(records: list[ExecutionRecord], limit: int) -> str:
+        recent = records[-limit:]
+        if not recent:
+            return "none"
+        return ", ".join(f"{record.task_id}@{record.end_cycle}" for record in recent)
+
+    @staticmethod
+    def _validate_dependencies(tasks: tuple[Task, ...], task_by_id: Mapping[str, Task]) -> None:
         known = set(task_by_id)
         for task in tasks:
             missing = sorted(set(task.dependencies) - known)
             if missing:
-                raise UnknownDependencyError(
-                    f"task {task.task_id!r} has unknown dependencies: {', '.join(missing)}"
-                )
+                raise UnknownDependencyError(f"task {task.task_id!r} has unknown dependencies: {', '.join(missing)}")
 
     @staticmethod
-    def _fifo_predecessors(tasks: Tuple[Task, ...]) -> Mapping[str, str]:
-        previous_by_resource: Dict[ResourceKey, str] = {}
-        predecessors: Dict[str, str] = {}
+    def _fifo_predecessors(tasks: tuple[Task, ...]) -> Mapping[str, str]:
+        previous_by_resource: dict[ResourceKey, str] = {}
+        predecessors: dict[str, str] = {}
         for task in tasks:
             resource = (task.core_id, task.lane.value, task.pipe.value)
             previous = previous_by_resource.get(resource)
@@ -193,11 +247,7 @@ class DiscreteEventScheduler:
         return MappingProxyType(predecessors)
 
     @staticmethod
-    def _check_wall_timeout(
-        started_at: float, timeout_s: float, pending: Set[str]
-    ) -> None:
+    def _check_wall_timeout(started_at: float, timeout_s: float, pending: set[str]) -> None:
         if time.monotonic() - started_at > timeout_s:
             names = ", ".join(sorted(pending))
-            raise SimulationLimitError(
-                f"simulation exceeded execution_timeout_s={timeout_s}; pending tasks: {names}"
-            )
+            raise SimulationLimitError(f"simulation exceeded execution_timeout_s={timeout_s}; pending tasks: {names}")

@@ -1,5 +1,10 @@
 # 模拟器动态标量控制流支持提案
 
+> 实现状态（2026-09-10）：一期已完成。全量模式通过一次控制流发现预执行，按
+> UB/GM 标量真实值筛选互斥 task 后再正式调度；sync-only 支持
+> `dynamic_if="then"/"else"`，默认 `"error"`。分支入口条件只求值一次，删除
+> 分支的依赖边会重连到其有效前驱。`dynamic_if="both"` 仍属于二期。
+
 > 2026-09-10，GQA 战役 HS29（FAI 对齐同步瘦身）期间沉淀。现状：模拟器 bridge
 > 对**数据依赖标量 if** fail-closed 报 `UnsupportedSimOpError`，全量与
 > sync_only 双模式都不支持，迫使 design 层加逃逸开关（GQA_SIM=1 剔除 HS23

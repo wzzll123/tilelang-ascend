@@ -13,7 +13,7 @@ import numpy as np
 from .config import SimulatorConfig
 from .errors import ProgramValidationError, UnsupportedSimOpError
 from .layout import pack_matrix, unpack_matrix
-from .memory import MemoryRuntime, MemoryView
+from .memory import MemoryRuntime, MemoryView, contiguous_strides_bytes, dtype_size_bytes
 from .program import (
     AffineInt,
     BufferRegion,
@@ -219,6 +219,7 @@ class FunctionalSimulator:
             bindings=self.bindings,
         )
         self._active_lane = None
+        self._resolved_dynamic_program: KernelProgram | None = None
 
     def _validate_runtime_contracts(self) -> None:
         for task in self.program.tasks:
@@ -266,11 +267,12 @@ class FunctionalSimulator:
 
     def run(self) -> FunctionalExecutionResult:
         """Schedule the program, then apply operations in deterministic event order."""
+        program = self._program_for_dynamic_control()
         schedule = DiscreteEventScheduler(
             self.config,
             synchronization=FlagBarrierSynchronizationModel(),
-        ).run(self.program, bindings=self.bindings)
-        task_by_id = {task.task_id: task for task in self.program.tasks}
+        ).run(program, bindings=self.bindings)
+        task_by_id = {task.task_id: task for task in program.tasks}
         for record in schedule.records:
             if record.category == "wait":
                 continue
@@ -294,6 +296,123 @@ class FunctionalSimulator:
             memory=self.memory,
             numeric_results_available=not self.config.sync_only,
         )
+
+    def _program_for_dynamic_control(self) -> KernelProgram:
+        if self._resolved_dynamic_program is not None:
+            return self._resolved_dynamic_program
+        dynamic = [task for task in self.program.tasks if task.metadata.get("dynamic_predicates")]
+        if not dynamic:
+            return self.program
+        if self.config.sync_only:
+            if self.config.dynamic_if == "error":
+                raise UnsupportedSimOpError(
+                    "data-dependent if condition has no numeric value when sync_only=True; set dynamic_if='then' or 'else' to select a path"
+                )
+            choose_then = self.config.dynamic_if == "then"
+            active = {
+                task.task_id
+                for task in self.program.tasks
+                if all(expected is choose_then for _, _, expected in task.metadata.get("dynamic_predicates", ()))
+            }
+        else:
+            probe = FunctionalSimulator(self.program, self.config, bindings=self.bindings)
+            for space, source in self.memory._address_spaces.items():
+                destination = probe.memory._address_spaces[space]
+                destination.data[:] = source.data
+                destination.initialized[:] = source.initialized
+            active = set()
+            decisions: dict[int, bool] = {}
+            for task in self.program.tasks:
+                probe._active_lane = task.lane
+                predicates = task.metadata.get("dynamic_predicates", ())
+                selected = True
+                for predicate_id, condition, expected in predicates:
+                    if predicate_id not in decisions:
+                        decisions[predicate_id] = bool(probe._evaluate_tir_scalar(condition, task.core_id))
+                    if decisions[predicate_id] is not expected:
+                        selected = False
+                        break
+                if selected:
+                    active.add(task.task_id)
+                    probe._execute(task)
+            probe._active_lane = None
+        cores = []
+        task_by_id = {task.task_id: task for task in self.program.tasks}
+
+        def active_dependency_ids(dependencies: tuple[str, ...]) -> tuple[str, ...]:
+            pending = list(dependencies)
+            resolved = set()
+            while pending:
+                dependency = pending.pop()
+                candidate = task_by_id[dependency]
+                if candidate.metadata.get("dynamic_predicates") and dependency not in active:
+                    pending.extend(candidate.dependencies)
+                else:
+                    resolved.add(dependency)
+            return tuple(sorted(resolved))
+
+        for core in self.program.cores:
+            tasks = []
+            for task in core.tasks:
+                if task.task_id not in active and task.metadata.get("dynamic_predicates"):
+                    continue
+                metadata = dict(task.metadata)
+                memory_dependencies = metadata.get("memory_dependencies")
+                if isinstance(memory_dependencies, (tuple, list)):
+                    metadata["memory_dependencies"] = active_dependency_ids(tuple(memory_dependencies))
+                tasks.append(
+                    replace(
+                        task,
+                        dependencies=active_dependency_ids(task.dependencies),
+                        metadata=metadata,
+                    )
+                )
+            cores.append(replace(core, tasks=tuple(tasks)))
+        resolved = replace(self.program, cores=tuple(cores))
+        self._resolved_dynamic_program = resolved
+        return resolved
+
+    def _evaluate_tir_scalar(self, expression: Any, core_id: int) -> int | float:
+        """Evaluate the scalar TIR subset used by data-dependent predicates."""
+        name = type(expression).__name__
+        literal = getattr(expression, "value", None)
+        if isinstance(literal, (bool, int, float)):
+            return literal
+        if name == "BufferLoad":
+            indices = tuple(int(self._evaluate_tir_scalar(index, core_id)) for index in expression.indices)
+            spec = next((item for item in self.program.buffers if item.name == str(expression.buffer.name)), None)
+            if spec is None:
+                raise UnsupportedSimOpError(f"dynamic if references unknown buffer {expression.buffer.name!s}")
+            region = BufferRegion(
+                spec.name,
+                spec.scope,
+                tuple(1 for _ in indices),
+                spec.dtype,
+                byte_offset=sum(
+                    index * stride for index, stride in zip(indices, contiguous_strides_bytes(spec.shape, dtype_size_bytes(spec.dtype)))
+                ),
+            )
+            return self.read(region, task_core_id=core_id).reshape(-1)[0].item()
+        if name == "Cast":
+            return self._evaluate_tir_scalar(expression.value, core_id)
+        binary = {
+            "EQ": lambda a, b: a == b,
+            "NE": lambda a, b: a != b,
+            "LT": lambda a, b: a < b,
+            "LE": lambda a, b: a <= b,
+            "GT": lambda a, b: a > b,
+            "GE": lambda a, b: a >= b,
+            "Add": lambda a, b: a + b,
+            "Sub": lambda a, b: a - b,
+            "Mul": lambda a, b: a * b,
+            "And": lambda a, b: bool(a) and bool(b),
+            "Or": lambda a, b: bool(a) or bool(b),
+        }
+        if name in binary:
+            return binary[name](self._evaluate_tir_scalar(expression.a, core_id), self._evaluate_tir_scalar(expression.b, core_id))
+        if name == "Not":
+            return not self._evaluate_tir_scalar(expression.a, core_id)
+        raise UnsupportedSimOpError(f"unsupported dynamic if scalar expression: {expression}")
 
     def _execute(self, task: Task) -> None:
         if task.metadata.get("trace_only") is True:
@@ -562,8 +681,7 @@ class FunctionalSimulator:
                     offset += count
                 if offset != flattened.size:
                     raise ProgramValidationError(
-                        f"rebased zN copy task {task.task_id!r} covers {offset} "
-                        f"elements for {flattened.size} source elements"
+                        f"rebased zN copy task {task.task_id!r} covers {offset} elements for {flattened.size} source elements"
                     )
                 return
             written_rows = copy_details.get("written_rows")

@@ -1,5 +1,13 @@
 # 模拟器死锁检测提案（从"超时兜底"升级为"死锁证明"）
 
+> 实现状态（2026-09-10）：L1 已完成并默认开启，scheduler 在全局无 task 可推进时
+> 立即报告 `DEADLOCK (global no-progress)`；L2 已完成 task/FIFO 依赖的 wait-for
+> 环证明，并附有限长度最近事件。flag/cross-flag 阻塞会报告具体 id、方向和参与
+> lane，跨 flag producer 的 lane 级闭环重建仍可继续增强。L3 已实现为独立
+> `flag_balance_check="off"|"warn"|"error"`，默认 off。GQA 实证表明正确的循环
+> 流水会在 kernel 结束时合法保留 slot-free 信用，因此原提案“所有 flag 必须归零”
+> 会误报，不能作为默认正确性条件。
+
 > 2026-09-10，GQA 战役 HS29 死锁定位期间沉淀。现状：模拟器只有
 > `execution_timeout_s` 兜底——转够时间抛 `SimulationLimitError` 附 pending
 > 任务清单。**无法区分"真死锁"与"单纯慢"**，也不报告卡在哪个 flag 上。
@@ -53,19 +61,19 @@ DEADLOCK (wait-for cycle):
 附带每个环上 lane 的最近事件轨迹（最后 N 条 set/wait/copy），直接指向
 Hazard 位置。
 
-### L3 电平守恒审计（kernel 边界）
+### L3 电平守恒审计（kernel 边界，可选诊断）
 
-kernel 正常结束时校验：所有 (HardEvent, id) 的 flag 电平归零、所有
-cross-flag 电平归零。非零 ⇒ 报告残留明细（哪个 id 残留几级、最后
-set/wait 的 lane 与 PC）。这正是 HS29 这类"per-kernel 预置账目"错误的
-自动证伪器——**账目不平衡在第一个 task 边界就显形，不用等死锁**。
+显式启用时校验 flag 残留并报告 id、电平和最后 set task。该结果是协议审计
+信号，不是普适死锁证明：循环流水可能故意在结尾恢复预置信用。只有调用方明确
+要求“该协议结束必须归零”时才应使用 `error`；默认关闭以避免误报。
 
 ## 3. 实现要点
 
 - 改动面：`tilelang/simulator/executor.py`（主循环加 L1 停顿判定 + L2 图
   构建）、`tilelang/simulator/sync.py`（flag 电平账目 API + L3 审计）、
   `tilelang/simulator/config.py`（`deadlock_detect: bool = True` 开关，
-  默认开；L2 报告长度限制）。
+  默认开；`deadlock_history_limit` 控制报告长度；L3 使用独立
+  `flag_balance_check` 策略）。
 - 与 sync_only 的关系：L1/L2/L3 全部**只依赖 flag/pipe/lane 状态**，不依赖
   数值——sync_only 模式原生受益（这也是它最该在的地方）。
 - 判定必须**零误报**：L1 只在"全部 lane 阻塞 + 全部 pipe 空闲"时触发；
