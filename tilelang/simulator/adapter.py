@@ -52,12 +52,8 @@ class SimulatorKernelAdapter:
         self._validate_sync = validate_sync
         self._has_dynamic_control = any(task.metadata.get("dynamic_predicates") for task in self.program.tasks)
         self.sync_diagnostics = (
-            validate_memory_synchronization(
-                self.program,
-                hazard_check=self.config.hazard_check,
-                validate_local=validate_sync,
-            )
-            if self.config.hazard_check != "off" and not self._has_dynamic_control
+            validate_memory_synchronization(self.program, hazard_check=self.config.hazard_check)
+            if validate_sync and not self._has_dynamic_control
             else ()
         )
         self.func = self._functional_execute
@@ -188,12 +184,11 @@ class SimulatorKernelAdapter:
                 framework = "torch"
             simulator.write(self._full_region(self._buffer_specs[name]), array)
 
-        if self._has_dynamic_control:
+        if self._has_dynamic_control and self._validate_sync:
             active_program = simulator._program_for_dynamic_control()
             self.sync_diagnostics = validate_memory_synchronization(
                 active_program,
                 hazard_check=self.config.hazard_check,
-                validate_local=self._validate_sync,
             )
 
         execution = simulator.run()

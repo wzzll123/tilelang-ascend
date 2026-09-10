@@ -353,19 +353,10 @@ wait. Modes 0 and 1 retain per-waiter phase counters: one participant waiting do
 the collective phase for the other participants. Because the wait intrinsic carries no mode,
 the simulator resolves it from matching set declarations and rejects ambiguous mode reuse.
 
-An asynchronous access progresses through `issued`, `in_flight`, and `completed` states.
-Completion frees an execution resource and permits a dependent access. Cache coherence is
-modelled separately only for access paths that actually use a private cache (Scalar DCache,
-SIMT DCache, or cached NDDMA); ordinary MTE3/MTE2 GM traffic must not be labelled a DCache/L2
-visibility problem.
-
-Synchronization validation is graph reachability across pipes. Besides a direct matching
-`set/wait` and `PIPE_ALL`, it recognizes the transitive chain `producer pipe -> completed mode-0
-collective -> consumer-side PIPE_xxx -> consumer pipe`. WQBM D54 is the motivating case:
-`MTE3 -> mode-0 collective -> PIPE_MTE2 -> MTE2`. Without the final consumer-pipe fence the
-ordinary `missing-pipe-synchronization` diagnostic fires; no special GM visibility diagnostic or
-configuration is required. This rule follows the official completion/synchronization model and
-applies equally to A2 and A3.
+An asynchronous write progresses through `issued`, `in_flight`, `completed`, and `visible`
+states. Completion frees an execution resource; visibility permits a dependent reader. These
+states must remain distinct because a flag or barrier can alter visibility without changing the
+functional result.
 
 `T.Pipelined` is not interpreted as a high-level construct in authoritative simulation. The
 `PipelinePlanning` and `InjectSoftwarePipeline` passes have already expanded it. The simulator
