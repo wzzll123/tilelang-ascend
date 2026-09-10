@@ -270,7 +270,11 @@ class FunctionalSimulator:
         program = self._program_for_dynamic_control()
         schedule = DiscreteEventScheduler(
             self.config,
-            synchronization=FlagBarrierSynchronizationModel(),
+            synchronization=FlagBarrierSynchronizationModel(
+                flag_blocking=self.config.flag_blocking,
+                local_flag_depth=self.config.local_flag_depth,
+                cross_flag_depth=self.config.cross_flag_depth,
+            ),
         ).run(program, bindings=self.bindings)
         task_by_id = {task.task_id: task for task in program.tasks}
         for record in schedule.records:

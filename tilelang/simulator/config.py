@@ -29,6 +29,17 @@ class SimulatorConfig:
     deadlock_detect: bool = True
     deadlock_history_limit: int = 8
     flag_balance_check: str = "off"
+    # Flag credit depth fidelity (HS29 motivation): on real silicon a flag's
+    # outstanding SET credits occupy a bounded hardware queue; a SET issued at
+    # full depth STALLS the issuing pipe until a WAIT frees a slot (blocking
+    # semantics), which can deadlock a kernel whose accounting is level-balanced
+    # but depth-unbalanced. The default (flag_blocking=False) keeps the legacy
+    # idealized semantics (local: error on double-set; cross: error at 15
+    # outstanding credits). flag_blocking=True turns overflow into a blocking
+    # wait so the scheduler's deadlock detector can report the cycle.
+    flag_blocking: bool = False
+    local_flag_depth: int = 1
+    cross_flag_depth: int = 15
     execution_timeout_s: float = 120.0
     max_cycles: int | None = None
     timing_profile: TimingProfile | None = None
@@ -52,6 +63,12 @@ class SimulatorConfig:
             raise SimulatorConfigError("deadlock_history_limit must be a positive integer")
         if self.flag_balance_check not in {"off", "warn", "error"}:
             raise SimulatorConfigError("flag_balance_check must be one of: off, warn, error")
+        if not isinstance(self.flag_blocking, bool):
+            raise SimulatorConfigError("flag_blocking must be a boolean")
+        for name in ("local_flag_depth", "cross_flag_depth"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise SimulatorConfigError(f"{name} must be a positive integer")
         if self.execution_timeout_s <= 0:
             raise SimulatorConfigError("execution_timeout_s must be positive")
         if self.max_cycles is not None and self.max_cycles <= 0:

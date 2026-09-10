@@ -91,7 +91,11 @@ class SimulatorKernelAdapter:
         """Run discrete-event scheduling and optionally emit a Chrome/Perfetto trace."""
         scheduler = DiscreteEventScheduler(
             self.config,
-            synchronization=FlagBarrierSynchronizationModel(),
+            synchronization=FlagBarrierSynchronizationModel(
+                flag_blocking=self.config.flag_blocking,
+                local_flag_depth=self.config.local_flag_depth,
+                cross_flag_depth=self.config.cross_flag_depth,
+            ),
         )
         result = scheduler.run(self.program)
         self._record_schedule(result)

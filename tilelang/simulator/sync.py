@@ -278,7 +278,21 @@ class FlagBarrierSynchronizationModel:
         }
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        flag_blocking: bool = False,
+        local_flag_depth: int = 1,
+        cross_flag_depth: int = 15,
+    ) -> None:
+        # flag_blocking=True: a SET issued while a flag already has `depth`
+        # outstanding credits BLOCKS the issuing pipe (hardware queue
+        # semantics) instead of raising -- the scheduler's deadlock detector
+        # can then prove the cycle. flag_blocking=False keeps the legacy
+        # idealized semantics (error on overflow).
+        self._flag_blocking = flag_blocking
+        self._local_flag_depth = local_flag_depth
+        self._cross_flag_depth = cross_flag_depth
         self._tokens: dict[FlagKey, deque[tuple[int, str]]] = defaultdict(deque)
         self._collective_ready: dict[CollectiveKey, dict[Participant, list[tuple[int, str]]]] = defaultdict(lambda: defaultdict(list))
         self._collective_wait_phase: dict[tuple[CollectiveKey, Participant], int] = defaultdict(int)
@@ -413,6 +427,38 @@ class FlagBarrierSynchronizationModel:
                 detail="waiting for " + ", ".join(missing_ordering),
             )
         ordering_cycle = max((completed[task_id].end_cycle for task_id in ordering), default=0)
+        if self._flag_blocking and operation in self._SET_LOCAL:
+            key = self._local_flag_key(task)
+            outstanding = len(self._tokens.get(key, ()))
+            if outstanding >= self._local_flag_depth:
+                return SyncDecision(
+                    ready_cycle=None,
+                    reason="local flag depth",
+                    detail=(
+                        f"{self._format_flag_key(key)} full "
+                        f"({outstanding}/{self._local_flag_depth} outstanding credits)"
+                    ),
+                )
+
+        if self._flag_blocking and operation in self._SET_CROSS:
+            mode = self._cross_mode(task)
+            if mode not in {0, 1}:
+                full = tuple(
+                    key
+                    for key in self._cross_set_keys_mode2(task)
+                    if len(self._tokens.get(key, ())) >= self._cross_flag_depth
+                )
+                if full:
+                    return SyncDecision(
+                        ready_cycle=None,
+                        reason="cross flag depth",
+                        detail="; ".join(
+                            f"{self._format_flag_key(key)} full "
+                            f"({self._cross_flag_depth} outstanding credits)"
+                            for key in full
+                        ),
+                    )
+
         if operation in self._WAIT_LOCAL:
             key = self._local_flag_key(task)
             tokens = self._tokens.get(key)
@@ -476,8 +522,10 @@ class FlagBarrierSynchronizationModel:
         if operation in self._SET_LOCAL:
             key = self._local_flag_key(task)
             tokens = self._tokens.get(key)
-            if tokens:
+            if tokens and not self._flag_blocking:
                 raise ProgramValidationError(f"set task {task.task_id!r} reused an outstanding {self._format_flag_key(key)}")
+            # flag_blocking: evaluate() already blocked the set at full depth,
+            # so outstanding < local_flag_depth here by construction.
             self._tokens[key].append((record.end_cycle, task.task_id))
         elif operation in self._SET_CROSS:
             mode = self._cross_mode(task)
@@ -486,7 +534,7 @@ class FlagBarrierSynchronizationModel:
             else:
                 for key in self._cross_set_keys_mode2(task):
                     tokens = self._tokens[key]
-                    if len(tokens) >= _MAX_CROSS_FLAG_CREDITS:
+                    if not self._flag_blocking and len(tokens) >= _MAX_CROSS_FLAG_CREDITS:
                         raise ProgramValidationError(
                             f"set task {task.task_id!r} overflowed "
                             f"{self._format_flag_key(key)} at "
