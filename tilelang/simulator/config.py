@@ -26,6 +26,7 @@ class SimulatorConfig:
     hazard_check: str = "error"
     gm_visibility: str = "error"
     sync_only: bool = False
+    dynamic_if: str = "error"
     execution_timeout_s: float = 120.0
     max_cycles: int | None = None
     timing_profile: TimingProfile | None = None
@@ -39,6 +40,8 @@ class SimulatorConfig:
             raise SimulatorConfigError("gm_visibility must be one of: off, warn, error")
         if not isinstance(self.sync_only, bool):
             raise SimulatorConfigError("sync_only must be a boolean")
+        if self.dynamic_if not in {"error", "then", "else"}:
+            raise SimulatorConfigError("dynamic_if must be one of: error, then, else")
         if self.execution_timeout_s <= 0:
             raise SimulatorConfigError("execution_timeout_s must be positive")
         if self.max_cycles is not None and self.max_cycles <= 0:

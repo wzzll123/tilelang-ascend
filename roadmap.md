@@ -473,6 +473,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   first/difference/count、wraparound、dependency 和 template dtype 验证。~~
 - [x] ~~支持 `CreateVecIndex` 中由整数运行时表达式转换到浮点 first value 的 TIR
   `Cast`，覆盖 GQA causal mask 的 loop-var affine 起点。~~
+- [x] ~~支持读取 UB/GM 标量的动态 `IfThenElse`：全量模式按真实值选择路径，
+  sync-only 通过 `dynamic_if="then"/"else"` 分别覆盖互斥路径，默认保持 fail-closed；
+  同步校验只检查实际选中的 task，并重连被删除分支的依赖前驱。~~
 - [x] ~~实现 bitwise AND/OR/XOR/NOT 与 scalar left/right shift 的 offset、count、
   int16/int32/uint16/uint32 定宽语义、scratch dependency 和 shift 范围验证。~~
 - [x] ~~实现 leaky_relu 和 in-place accumulator 语义的 axpy。~~
