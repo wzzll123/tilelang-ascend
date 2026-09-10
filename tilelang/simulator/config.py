@@ -27,6 +27,9 @@ class SimulatorConfig:
     gm_visibility: str = "error"
     sync_only: bool = False
     dynamic_if: str = "error"
+    deadlock_detect: bool = True
+    deadlock_history_limit: int = 8
+    flag_balance_check: str = "off"
     execution_timeout_s: float = 120.0
     max_cycles: int | None = None
     timing_profile: TimingProfile | None = None
@@ -42,6 +45,16 @@ class SimulatorConfig:
             raise SimulatorConfigError("sync_only must be a boolean")
         if self.dynamic_if not in {"error", "then", "else"}:
             raise SimulatorConfigError("dynamic_if must be one of: error, then, else")
+        if not isinstance(self.deadlock_detect, bool):
+            raise SimulatorConfigError("deadlock_detect must be a boolean")
+        if (
+            not isinstance(self.deadlock_history_limit, int)
+            or isinstance(self.deadlock_history_limit, bool)
+            or self.deadlock_history_limit <= 0
+        ):
+            raise SimulatorConfigError("deadlock_history_limit must be a positive integer")
+        if self.flag_balance_check not in {"off", "warn", "error"}:
+            raise SimulatorConfigError("flag_balance_check must be one of: off, warn, error")
         if self.execution_timeout_s <= 0:
             raise SimulatorConfigError("execution_timeout_s must be positive")
         if self.max_cycles is not None and self.max_cycles <= 0:

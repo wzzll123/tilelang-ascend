@@ -10,12 +10,13 @@ the scheduling API.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 from types import MappingProxyType
 from collections import defaultdict, deque
 from typing import Protocol
 from collections.abc import Mapping
 
-from .errors import ProgramValidationError
+from .errors import ProgramValidationError, SimulationDeadlockError
 from .hazard import HazardDiagnostic, HazardReporter
 from .program import BufferRegion, KernelProgram, MemoryScope, Task
 from .trace import ExecutionRecord
@@ -475,6 +476,8 @@ class FlagBarrierSynchronizationModel:
         self._collective_ready: dict[CollectiveKey, dict[Participant, list[tuple[int, str]]]] = defaultdict(lambda: defaultdict(list))
         self._collective_wait_phase: dict[tuple[CollectiveKey, Participant], int] = defaultdict(int)
         self._cross_wait_modes: dict[tuple[int, str], int] = {}
+        self._audited_cross_keys: set[FlagKey] = set()
+        self._audited_collective_participants: set[tuple[CollectiveKey, Participant]] = set()
         self._core_ids: tuple[int, ...] = ()
         self._barrier_dependencies: dict[str, tuple[str, ...]] = {}
         self._ordering_dependencies: dict[str, tuple[str, ...]] = {}
@@ -488,6 +491,8 @@ class FlagBarrierSynchronizationModel:
         self._collective_ready.clear()
         self._collective_wait_phase.clear()
         self._cross_wait_modes.clear()
+        self._audited_cross_keys.clear()
+        self._audited_collective_participants.clear()
         self._core_ids = tuple(sorted(core.core_id for core in program.cores))
         self._barrier_dependencies.clear()
         self._ordering_dependencies.clear()
@@ -505,6 +510,14 @@ class FlagBarrierSynchronizationModel:
                 flag_id, target_kind = signature
                 raise ProgramValidationError(f"cross flag id={flag_id} targeting {target_kind} has ambiguous modes {sorted(modes)}")
             self._cross_wait_modes[signature] = next(iter(modes))
+        for task in program.tasks:
+            if self._operation(task) not in self._WAIT_CROSS:
+                continue
+            mode = self._cross_wait_mode(task)
+            if mode in {0, 1}:
+                self._audited_collective_participants.add((self._collective_key(task, mode), self._participant(task)))
+            elif mode == 2:
+                self._audited_cross_keys.update(self._cross_wait_keys_mode2(task))
         prior_by_core: dict[int, list[Task]] = defaultdict(list)
         prior_by_lane: dict[tuple[int, str], list[Task]] = defaultdict(list)
         last_fence: dict[tuple[int, str], str] = {}
@@ -675,6 +688,31 @@ class FlagBarrierSynchronizationModel:
                     if not tokens:
                         raise ProgramValidationError(f"wait task {task.task_id!r} consumed a missing {self._format_flag_key(key)}")
                     tokens.popleft()
+
+    def audit_flag_balance(self, policy: str = "error") -> None:
+        """Reject credits/phases left live at a completed kernel boundary."""
+        residual = []
+        for key, tokens in sorted(self._tokens.items(), key=lambda item: str(item[0])):
+            if tokens and (key[0] == "local" or key in self._audited_cross_keys):
+                residual.append(f"{self._format_flag_key(key)} level={len(tokens)} last_set={tokens[-1][1]}")
+        for key, ready_by_participant in sorted(self._collective_ready.items(), key=lambda item: str(item[0])):
+            expected = self._collective_participants(key)
+            for participant in expected:
+                if (key, participant) not in self._audited_collective_participants:
+                    continue
+                produced = len(ready_by_participant.get(participant, ()))
+                consumed = self._collective_wait_phase[(key, participant)]
+                if produced != consumed:
+                    mode, _, _, flag_id = key
+                    residual.append(
+                        f"collective flag mode={mode} id={flag_id} {self._format_participant(participant)} level={produced - consumed}"
+                    )
+        if residual:
+            message = "FLAG ACCOUNTING at kernel end: " + "; ".join(residual)
+            if policy == "warn":
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+            elif policy == "error":
+                raise SimulationDeadlockError(message)
 
     def _local_flag_key(self, task: Task) -> FlagKey:
         flag_id = task.metadata.get("flag_id")
