@@ -712,10 +712,10 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   pipe 调度、地址 region、initialized/poison 与 hazard，跳过 copy/vector/MMA 等 tensor
   数值计算；数值输出明确为 N/A，未知 operation 和数值读取继续 fail-closed。正确同步、
   缺失 flag 变异、poison 传播和 compute-heavy MMA 提速均有独立回归。~~
-- [x] ~~根据 A2 真机 D53/D54 二分补充 GM/workspace RAW visibility window：无 collective
-  的同相位 `MTE3_MTE2` flag 可放行；跨 mode-0 collective 后必须在读侧执行
-  `PIPE_MTE2`/`PIPE_ALL`。诊断统一服从 `hazard_check=error|warn|off`，并增加 T1–T7 回归，
-  不改变 UB/L1/L0 的原有 fence 判据；A3 暂按保守共同语义执行。~~
+- [x] ~~根据官方内存一致性语义重新定性 A2 真机 D53/D54：普通 MTE3/MTE2 GM 访问不走
+  私有 DCache，问题归入异步流水 completion/synchronization。通用同步图支持
+  `producer pipe -> mode-0 collective -> consumer PIPE_xxx -> consumer pipe` 传递链；删除
+  `gm-visibility-window` 特判，broken 版本报普通 missing synchronization，修复态通过。~~
 - [ ] 将 hazard 诊断扩展到带 source span 的动态精确 address range。
 - [ ] 执行 software-pipeline prologue、steady state、epilogue、stage/ring index 和 wrap。
 - [ ] 检查 ring-slot reuse、in-flight memory hazard 和 flag 配对协议。

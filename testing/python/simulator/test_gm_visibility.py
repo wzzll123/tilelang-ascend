@@ -1,6 +1,6 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""A2 GM visibility-window synchronization regressions."""
+"""GM RAW synchronization-chain regressions derived from WQBM D53/D54."""
 
 import pytest
 
@@ -72,8 +72,8 @@ def _local(operation, src, dst, flag_id, *, core=0) -> Task:
     )
 
 
-def _cross(operation, flag_id, *, core=0) -> Task:
-    pipe = Pipe.MTE3 if operation == "set_cross_flag" else Pipe.SCALAR
+def _cross(operation, flag_id, *, core=0, src="mte3") -> Task:
+    pipe = Pipe(src) if operation == "set_cross_flag" else Pipe.SCALAR
     return Task(
         f"{operation}-{core}-{flag_id}",
         operation,
@@ -81,7 +81,7 @@ def _cross(operation, flag_id, *, core=0) -> Task:
         Lane.VECTOR_0,
         pipe,
         1,
-        metadata={"src_pipe": "mte3", "flag_id": flag_id, "mode": 0},
+        metadata={"src_pipe": src, "flag_id": flag_id, "mode": 0},
     )
 
 
@@ -103,20 +103,20 @@ def test_gm_visibility_uses_unified_hazard_policy() -> None:
 
 def test_d53_gm_raw_rejects_unrelated_pipe_barrier() -> None:
     program = _program(_write(), _barrier("v"), _read())
-    with pytest.raises(MemoryHazardError, match="GM visibility"):
+    with pytest.raises(MemoryHazardError, match="missing.*synchronization"):
         validate_memory_synchronization(program, hazard_check="error")
 
 
-def test_gm_visibility_policy_and_diagnostic_metadata() -> None:
+def test_gm_raw_uses_normal_hazard_policy_and_diagnostic_metadata() -> None:
     program = _program(_write(), _read())
-    with pytest.warns(SimulatorHazardWarning, match="GM visibility"):
+    with pytest.warns(SimulatorHazardWarning, match="missing.*synchronization"):
         diagnostics = validate_memory_synchronization(
             program,
             hazard_check="warn",
         )
     assert len(diagnostics) == 1
     diagnostic = diagnostics[0]
-    assert diagnostic.kind == "gm-visibility-window"
+    assert diagnostic.kind == "missing-pipe-synchronization"
     assert diagnostic.buffer == "workspace"
     assert diagnostic.metadata["producer_task"] == "write"
     assert diagnostic.metadata["consumer_task"] == "read"
@@ -148,7 +148,7 @@ def test_d54_collective_alone_does_not_make_gm_raw_visible() -> None:
         _cross("wait_cross_flag", 4),
         _read(),
     )
-    with pytest.raises(MemoryHazardError, match="GM visibility"):
+    with pytest.raises(MemoryHazardError, match="missing.*synchronization"):
         validate_memory_synchronization(program, hazard_check="error")
 
 
@@ -163,7 +163,19 @@ def test_d54_read_side_mte2_barrier_makes_gm_raw_visible() -> None:
     assert validate_memory_synchronization(program, hazard_check="error") == ()
 
 
-def test_d54_flag_pair_across_collective_is_not_a_visibility_fence() -> None:
+def test_collective_from_unrelated_producer_pipe_does_not_close_raw_edge() -> None:
+    program = _program(
+        _write(),
+        _cross("set_cross_flag", 3, src="v"),
+        _cross("wait_cross_flag", 3, src="v"),
+        _barrier("mte2"),
+        _read(),
+    )
+    with pytest.raises(MemoryHazardError, match="missing.*synchronization"):
+        validate_memory_synchronization(program, hazard_check="error")
+
+
+def test_d54_direct_local_flag_pair_remains_a_valid_fence_across_collective() -> None:
     program = _program(
         _write(),
         _local("auto_set_flag", "mte3", "mte2", 7),
@@ -172,11 +184,10 @@ def test_d54_flag_pair_across_collective_is_not_a_visibility_fence() -> None:
         _local("auto_wait_flag", "mte3", "mte2", 7),
         _read(),
     )
-    with pytest.raises(MemoryHazardError, match="GM visibility"):
-        validate_memory_synchronization(program, hazard_check="error")
+    assert validate_memory_synchronization(program, hazard_check="error") == ()
 
 
-def test_d54_rule_is_not_extrapolated_to_unverified_a3() -> None:
+def test_d54_transitive_sync_chain_also_applies_to_a3() -> None:
     program = _program(
         _write(),
         _local("auto_set_flag", "mte3", "mte2", 7),
@@ -235,7 +246,7 @@ def test_cross_core_gm_raw_requires_collective_then_read_drain(with_read_drain) 
     if with_read_drain:
         assert validate_memory_synchronization(program, hazard_check="error") == ()
     else:
-        with pytest.raises(MemoryHazardError, match="GM visibility"):
+        with pytest.raises(MemoryHazardError, match="missing.*synchronization"):
             validate_memory_synchronization(program, hazard_check="error")
 
 

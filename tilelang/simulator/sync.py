@@ -101,7 +101,6 @@ def validate_memory_synchronization(
     set/wait flag pair connects the producer and consumer pipes.
     """
     reporter = HazardReporter(hazard_check if validate_local else "off")
-    gm_reporter = HazardReporter(hazard_check)
     task_by_id = {task.task_id: task for task in program.tasks}
     for core in program.cores:
         tasks = core.tasks
@@ -114,77 +113,38 @@ def validate_memory_synchronization(
                 producer = task_by_id.get(str(dependency_id))
                 if producer is None or producer.pipe == consumer.pipe:
                     continue
-                gm_buffer = _gm_raw_buffer(producer, consumer) if program.platform == "A2" else None
+                global_buffer = _global_raw_buffer(producer, consumer)
                 if producer.core_id != consumer.core_id:
-                    if gm_buffer is not None:
+                    if global_buffer is not None:
                         consumer_prefix = tasks[:consumer_index]
-                        if _has_cross_core_collective_then_read_drain(
+                        if _has_cross_core_collective_then_consumer_fence(
                             program,
                             producer,
                             consumer,
                             consumer_prefix,
                         ):
                             continue
-                        _report_gm_visibility(
-                            gm_reporter,
-                            producer,
-                            consumer,
-                            gm_buffer,
-                        )
+                        _report_missing_pipe_sync(reporter, producer, consumer, global_buffer)
                     continue
-                if producer.lane != consumer.lane and gm_buffer is None:
+                if producer.lane != consumer.lane and global_buffer is None:
                     continue
                 producer_index = index_by_id.get(producer.task_id)
                 if producer_index is None or producer_index >= consumer_index:
                     continue
                 between = tasks[producer_index + 1 : consumer_index]
-                if gm_buffer is not None:
-                    collective_index = _last_mode0_collective_index(between)
-                    if _has_read_side_gm_drain(
-                        between,
-                        consumer,
-                        after_index=collective_index,
-                    ):
-                        continue
-                    if collective_index is None and _has_local_flag_fence(
-                        between,
-                        producer,
-                        consumer,
-                    ):
-                        continue
-                    _report_gm_visibility(
-                        gm_reporter,
-                        producer,
-                        consumer,
-                        gm_buffer,
-                    )
+                if (
+                    _has_full_barrier(between)
+                    or _has_local_flag_fence(between, producer, consumer)
+                    or _has_collective_to_consumer_pipe_fence(between, producer, consumer)
+                ):
                     continue
-                if _has_full_barrier(between) or _has_local_flag_fence(between, producer, consumer):
-                    continue
-                buffer_name = _shared_buffer_name(producer, consumer)
-                buffer_detail = f" for buffer {buffer_name!r}" if buffer_name else ""
-                reporter.report(
-                    HazardDiagnostic(
-                        kind="missing-pipe-synchronization",
-                        message=(
-                            "missing A2/A3 pipe synchronization for memory dependency "
-                            f"{producer.task_id} ({producer.operation}/{producer.pipe.value}) -> "
-                            f"{consumer.task_id} ({consumer.operation}/{consumer.pipe.value}) "
-                            f"on core {consumer.core_id} lane {consumer.lane.value}"
-                            f"{buffer_detail}; "
-                            "expected a matching set/wait flag pair or PIPE_ALL"
-                        ),
-                        buffer=buffer_name,
-                        core_id=consumer.core_id,
-                        metadata={
-                            "producer_task": producer.task_id,
-                            "consumer_task": consumer.task_id,
-                            "producer_pipe": producer.pipe.value,
-                            "consumer_pipe": consumer.pipe.value,
-                        },
-                    )
+                _report_missing_pipe_sync(
+                    reporter,
+                    producer,
+                    consumer,
+                    global_buffer or _shared_buffer_name(producer, consumer),
                 )
-    return reporter.diagnostics + gm_reporter.diagnostics
+    return reporter.diagnostics
 
 
 _READ_REGION_KEYS = (
@@ -220,7 +180,7 @@ def _task_regions(task: Task, keys: tuple[str, ...]) -> tuple[BufferRegion, ...]
     return tuple(regions)
 
 
-def _gm_raw_buffer(producer: Task, consumer: Task) -> str | None:
+def _global_raw_buffer(producer: Task, consumer: Task) -> str | None:
     """Return the shared GM/workspace buffer for a write-to-read dependency."""
     writes = {region.buffer for region in _task_regions(producer, _WRITE_REGION_KEYS) if region.scope in _GLOBAL_SCOPES}
     reads = {region.buffer for region in _task_regions(consumer, _READ_REGION_KEYS) if region.scope in _GLOBAL_SCOPES}
@@ -228,25 +188,23 @@ def _gm_raw_buffer(producer: Task, consumer: Task) -> str | None:
     return sorted(shared)[0] if shared else None
 
 
-def _report_gm_visibility(
+def _report_missing_pipe_sync(
     reporter: HazardReporter,
     producer: Task,
     consumer: Task,
-    buffer_name: str,
+    buffer_name: str | None,
 ) -> None:
+    buffer_detail = f" for buffer {buffer_name!r}" if buffer_name else ""
     reporter.report(
         HazardDiagnostic(
-            kind="gm-visibility-window",
+            kind="missing-pipe-synchronization",
             message=(
-                "GM visibility window for RAW dependency "
+                "missing A2/A3 pipe synchronization for memory dependency "
                 f"{producer.task_id} ({producer.operation}/{producer.pipe.value}) -> "
                 f"{consumer.task_id} ({consumer.operation}/{consumer.pipe.value}) "
-                f"on buffer {buffer_name!r}, core {producer.core_id} -> "
-                f"{consumer.core_id}: after a mode-0 collective an A2 GM "
-                "read requires a read-side PIPE_MTE2 or PIPE_ALL drain; a "
-                "cross-phase flag/collective alone is insufficient. Without a "
-                "collective, only an adjacent matching MTE3_MTE2 flag is "
-                "accepted (A2 D53/D54 hardware evidence; not extrapolated to A3)"
+                f"on core {consumer.core_id} lane {consumer.lane.value}"
+                f"{buffer_detail}; expected a matching set/wait flag pair, "
+                "PIPE_ALL, or a completed collective followed by a consumer-pipe fence"
             ),
             buffer=buffer_name,
             core_id=consumer.core_id,
@@ -262,25 +220,41 @@ def _report_gm_visibility(
     )
 
 
-def _last_mode0_collective_index(tasks: tuple[Task, ...]) -> int | None:
-    set_operations = FlagBarrierSynchronizationModel._SET_CROSS
-    wait_operations = FlagBarrierSynchronizationModel._WAIT_CROSS
-    mode0_ids = {
-        task.metadata.get("flag_id")
-        for task in tasks
-        if task.operation.strip().lower() in set_operations and task.metadata.get("mode") == 0
-    }
-    indices = []
-    for index, task in enumerate(tasks):
+def _has_collective_to_consumer_pipe_fence(
+    tasks: tuple[Task, ...], producer: Task, consumer: Task
+) -> bool:
+    """Recognize producer-pipe -> collective -> consumer-pipe completion chains."""
+    completed_ids: set[object] = set()
+    pending_ids: set[object] = set()
+    for task in tasks:
         operation = task.operation.strip().lower()
-        is_set = operation in set_operations and task.metadata.get("mode") == 0
-        is_wait = operation in wait_operations and task.metadata.get("flag_id") in mode0_ids
-        if is_set or is_wait:
-            indices.append(index)
-    return max(indices) if indices else None
+        flag_id = task.metadata.get("flag_id")
+        if operation in FlagBarrierSynchronizationModel._SET_CROSS and task.metadata.get("mode") == 0:
+            source_pipe = str(task.metadata.get("src_pipe", task.pipe.value)).lower()
+            if source_pipe.startswith("pipe_"):
+                source_pipe = source_pipe[5:]
+            if source_pipe == producer.pipe.value:
+                pending_ids.add(flag_id)
+        elif operation in FlagBarrierSynchronizationModel._WAIT_CROSS and flag_id in pending_ids:
+            completed_ids.add(flag_id)
+        elif completed_ids and _is_consumer_pipe_fence(task, consumer):
+            return True
+    return False
 
 
-def _has_read_side_gm_drain(
+def _is_consumer_pipe_fence(task: Task, consumer: Task) -> bool:
+    operation = task.operation.strip().lower()
+    if operation in FlagBarrierSynchronizationModel._BARRIER_ALL:
+        return True
+    if operation not in FlagBarrierSynchronizationModel._PIPE_BARRIER:
+        return False
+    target = str(task.metadata.get("target_pipe", task.pipe.value)).lower()
+    if target.startswith("pipe_"):
+        target = target[5:]
+    return target in {"all", consumer.pipe.value}
+
+
+def _has_consumer_pipe_fence(
     tasks: tuple[Task, ...],
     consumer: Task,
     *,
@@ -290,20 +264,14 @@ def _has_read_side_gm_drain(
     for task in tasks[start:]:
         if task.core_id != consumer.core_id:
             continue
-        operation = task.operation.strip().lower()
-        if operation in FlagBarrierSynchronizationModel._BARRIER_ALL:
-            return True
-        if operation not in FlagBarrierSynchronizationModel._PIPE_BARRIER:
-            continue
-        target = str(task.metadata.get("target_pipe", task.pipe.value)).lower()
-        if target.startswith("pipe_"):
-            target = target[5:]
-        if target in {"all", "mte2"}:
+        if _is_consumer_pipe_fence(task, consumer):
             return True
     return False
 
 
-def _completed_mode0_ids(tasks: tuple[Task, ...]) -> set[object]:
+def _completed_mode0_ids(
+    tasks: tuple[Task, ...], *, source_pipe: str | None = None
+) -> set[object]:
     set_operations = FlagBarrierSynchronizationModel._SET_CROSS
     wait_operations = FlagBarrierSynchronizationModel._WAIT_CROSS
     pending = set()
@@ -311,14 +279,21 @@ def _completed_mode0_ids(tasks: tuple[Task, ...]) -> set[object]:
     for task in tasks:
         operation = task.operation.strip().lower()
         flag_id = task.metadata.get("flag_id")
-        if operation in set_operations and task.metadata.get("mode") == 0:
+        task_source = str(task.metadata.get("src_pipe", task.pipe.value)).lower()
+        if task_source.startswith("pipe_"):
+            task_source = task_source[5:]
+        if (
+            operation in set_operations
+            and task.metadata.get("mode") == 0
+            and (source_pipe is None or task_source == source_pipe)
+        ):
             pending.add(flag_id)
         elif operation in wait_operations and flag_id in pending:
             completed.add(flag_id)
     return completed
 
 
-def _has_cross_core_collective_then_read_drain(
+def _has_cross_core_collective_then_consumer_fence(
     program: KernelProgram,
     producer: Task,
     consumer: Task,
@@ -326,7 +301,9 @@ def _has_cross_core_collective_then_read_drain(
 ) -> bool:
     producer_tasks = next(core.tasks for core in program.cores if core.core_id == producer.core_id)
     producer_index = next(index for index, task in enumerate(producer_tasks) if task.task_id == producer.task_id)
-    producer_ids = _completed_mode0_ids(producer_tasks[producer_index + 1 :])
+    producer_ids = _completed_mode0_ids(
+        producer_tasks[producer_index + 1 :], source_pipe=producer.pipe.value
+    )
     consumer_ids = _completed_mode0_ids(consumer_prefix)
     common_ids = producer_ids.intersection(consumer_ids)
     if not common_ids:
@@ -336,7 +313,7 @@ def _has_cross_core_collective_then_read_drain(
         for index, task in enumerate(consumer_prefix)
         if task.operation.strip().lower() in FlagBarrierSynchronizationModel._WAIT_CROSS and task.metadata.get("flag_id") in common_ids
     )
-    return _has_read_side_gm_drain(
+    return _has_consumer_pipe_fence(
         consumer_prefix,
         consumer,
         after_index=last_wait,
