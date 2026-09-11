@@ -69,6 +69,6 @@ def test_kernel_end_rejects_outstanding_local_flag_credit() -> None:
         SimulationDeadlockError,
         match=r"FLAG ACCOUNTING.*local flag.*id=5.*level=1",
     ):
-        DiscreteEventScheduler(SimulatorConfig(flag_balance_check="error"), synchronization=FlagBarrierSynchronizationModel()).run(
+        DiscreteEventScheduler(SimulatorConfig(), synchronization=FlagBarrierSynchronizationModel()).run(
             _program(set_flag)
         )

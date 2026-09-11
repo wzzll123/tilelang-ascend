@@ -31,6 +31,7 @@ from tilelang.simulator import (
     KernelProgram,
     Lane,
     Pipe,
+    SimulationDeadlockError,
     SimulatorConfig,
     Task,
 )
@@ -104,16 +105,11 @@ for i in range(3):
 
 
 @pytest.mark.parametrize("flag_blocking", [False, True])
-def test_hs29a_pattern_healthy_in_current_model(flag_blocking) -> None:
-    """HS29-A (per-kernel preset, balanced tasks): the model says NO deadlock.
-
-    Hardware says otherwise (flaky aicore timeout). This test intentionally
-    asserts the model verdict; a flip after a flag-model change is the signal
-    to revisit HS29 -- see the module docstring.
-    """
+def test_hs29a_pattern_reports_undrained_kernel_entry_credits(flag_blocking) -> None:
+    """HS29-A leaves its one-time preset credits live at the kernel boundary."""
     program = _kernel("hs29a-sentinel", HS29A_TASKS)
-    result = _run(program, flag_blocking=flag_blocking)
-    assert result is not None
+    with pytest.raises(SimulationDeadlockError, match=r"FLAG ACCOUNTING.*id=0.*level=1"):
+        _run(program, flag_blocking=flag_blocking)
 
 
 @pytest.mark.parametrize("flag_blocking", [False, True])

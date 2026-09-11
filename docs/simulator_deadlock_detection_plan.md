@@ -4,9 +4,10 @@
 > 立即报告 `DEADLOCK (global no-progress)`；L2 已完成 task/FIFO 依赖的 wait-for
 > 环证明，并附有限长度最近事件。flag/cross-flag 阻塞会报告具体 id、方向和参与
 > lane，跨 flag producer 的 lane 级闭环重建仍可继续增强。L3 已实现为独立
-> `flag_balance_check="off"|"warn"|"error"`，默认 off。GQA 实证表明正确的循环
-> 流水会在 kernel 结束时合法保留 slot-free 信用，因此原提案“所有 flag 必须归零”
-> 会误报，不能作为默认正确性条件。
+> `flag_balance_check="off"|"warn"|"error"`，默认 error。HS29-A/B 的实测表明其
+> kernel 末尾残留每 core 四个 local `MTE1→MTE2` flag，和 catlass 的尾部 drain
+> 不一致；模拟器默认要求一个完整 kernel 的 local latch 在边界回到 0。确需建模不完整协议时
+> 必须显式设为 `off` 或 `warn`。
 
 > 2026-09-10，GQA 战役 HS29 死锁定位期间沉淀。现状：模拟器只有
 > `execution_timeout_s` 兜底——转够时间抛 `SimulationLimitError` 附 pending
@@ -61,11 +62,11 @@ DEADLOCK (wait-for cycle):
 附带每个环上 lane 的最近事件轨迹（最后 N 条 set/wait/copy），直接指向
 Hazard 位置。
 
-### L3 电平守恒审计（kernel 边界，可选诊断）
+### L3 电平守恒审计（kernel 边界，默认严格）
 
 显式启用时校验 flag 残留并报告 id、电平和最后 set task。该结果是协议审计
-信号，不是普适死锁证明：循环流水可能故意在结尾恢复预置信用。只有调用方明确
-要求“该协议结束必须归零”时才应使用 `error`；默认关闭以避免误报。
+信号，不是“调度已死锁”的同义词。模拟器以完整 kernel 的 local flag 必须归零作为
+严格默认策略，因此默认使用 `error`；只有调用方刻意建模不完整协议时才可显式关闭或降级。
 
 ## 3. 实现要点
 

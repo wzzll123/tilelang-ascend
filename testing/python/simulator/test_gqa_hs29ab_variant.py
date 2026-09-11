@@ -4,17 +4,16 @@
 
 This drives the REAL GQA kernel design (the HS29 A+B variant: per-kernel
 slot-credit preset + C0 preload reorder + no task-tail drain -- fixture:
-gqa_hs29ab_design.py) through the simulator, pinning the current model verdict
-(healthy) for a program that deadlocks FLAKILY on real A2 silicon.
+gqa_hs29ab_design.py) through the simulator.  It pins the discovered
+kernel-boundary flag-accounting violation for a program that deadlocks FLAKILY
+on real A2 silicon.
 
 Hardware evidence (2026-09-10, ascendc/test_hs29_hw_vs_sim.sh):
   hardware : aicore hang within a few runs (B1/B2, S128, Nq48, Nkv4 shapes)
-  simulator: completes cleanly (sync_only, full, and flag_blocking modes)
+  simulator: reports undrained local flags at the kernel boundary
 
-The mechanism is outside the modeled flag semantics (suspected pipe-queue
-marker-position / credit-fire timing). This test MUST keep asserting the
-current verdict; if a future flag-model change makes it deadlock, that is the
-signal the model moved closer to silicon -- investigate and flip with evidence.
+This is a protocol error, not yet proof that the residual flags cause the
+hardware hang.  The tail-drain-only hardware A/B remains the deciding test.
 See test_hs29_divergence.py for the distilled pattern version.
 """
 
@@ -29,6 +28,7 @@ os.environ["GQA_SIM"] = "1"
 import torch  # noqa: E402
 
 import tilelang  # noqa: E402
+from tilelang.simulator import SimulationDeadlockError  # noqa: E402
 
 # Smallest HS29-relevant shape: kv_loops=1 + multiple tasks per core
 # (B24/Hq8/Hkv2/S8/Skv128 -> block_num=48 > 20 cores, tasks_per_core=3).
@@ -47,7 +47,7 @@ def _gen(shape, dtype):
 
 
 @pytest.mark.parametrize("flag_blocking", [False, True])
-def test_gqa_hs29ab_variant_healthy_in_current_model(flag_blocking) -> None:
+def test_gqa_hs29ab_variant_reports_undrained_local_flags(flag_blocking) -> None:
     from gqa_hs29ab_design import GQAConfig, gqa_fwd, pass_configs
 
     builder = gqa_fwd.__jit_impl__.func   # undecorated raw builder
@@ -73,6 +73,8 @@ def test_gqa_hs29ab_variant_healthy_in_current_model(flag_blocking) -> None:
             "execution_timeout_s": 600.0,
         },
     )
-    # Completes without deadlock / hazard / validation error = the model's
-    # current verdict. (sync_only skips numerics by design.)
-    ker(q, k, v, 1.0 / (cfg.dim ** 0.5))
+    with pytest.raises(
+        SimulationDeadlockError,
+        match=r"FLAG ACCOUNTING.*mte1->mte2 id=0.*level=1",
+    ):
+        ker(q, k, v, 1.0 / (cfg.dim ** 0.5))

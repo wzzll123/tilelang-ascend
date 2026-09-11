@@ -28,7 +28,10 @@ class SimulatorConfig:
     dynamic_if: str = "error"
     deadlock_detect: bool = True
     deadlock_history_limit: int = 8
-    flag_balance_check: str = "off"
+    # A completed A2/A3 kernel must return all local flag latches to level 0.
+    # Keep the check strict by default; callers modelling a deliberately
+    # partial protocol must opt out explicitly.
+    flag_balance_check: str = "error"
     # Experimental HS29 hypothesis: model a bounded outstanding-credit queue
     # and block SET at its configured depth.  Official material establishes
     # finite instruction queues, but does not specify a flag-credit capacity;
