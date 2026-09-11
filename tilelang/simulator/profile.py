@@ -92,6 +92,10 @@ class TimingProfile:
             "auto_wait_cross_flag", "pipe_barrier", "barrier_all",
         }:
             return 1
+        if normalized_pipe == "m":
+            mma_cycles = _pto_mma_cycles(metadata)
+            if mma_cycles is not None:
+                return mma_cycles
         if elements is None:
             return self.fallback_cycles
         if normalized_pipe == "m":
@@ -129,6 +133,35 @@ _DTYPE_BYTES = {
     "float": 4, "int8": 1, "uint8": 1, "int16": 2, "uint16": 2,
     "int32": 4, "uint32": 4,
 }
+
+
+def _pto_mma_cycles(metadata: Mapping[str, Any]) -> int | None:
+    """Port ``TryEstimateMadCycles`` for TileLang's concrete ``mma`` metadata."""
+    details = metadata.get("mma")
+    lhs = metadata.get("lhs")
+    if not isinstance(details, Mapping):
+        return None
+    rows = details.get("rows")
+    inner = details.get("inner")
+    cols = details.get("cols")
+    dtype = str(getattr(lhs, "dtype", "")).lower()
+    if not all(isinstance(value, int) and value > 0 for value in (rows, inner, cols)):
+        return None
+    # PTO formula_backend_compute.hpp: 16x16 output tiles, a 32-byte K
+    # fractal, head=6, and fp32/fp16 repeat costs of 2/1 respectively.
+    if dtype in {"float32", "float"}:
+        element_bytes, repeat_cycles = 4, 2
+    elif dtype in {"float16", "half"}:
+        element_bytes, repeat_cycles = 2, 1
+    else:
+        return None
+    k_tile = 32 // element_bytes
+    repeats = _ceil_div(rows, 16) * _ceil_div(inner, k_tile) * _ceil_div(cols, 16)
+    return 6 + repeat_cycles * repeats
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
 
 
 _DEVICE_PROFILES = {

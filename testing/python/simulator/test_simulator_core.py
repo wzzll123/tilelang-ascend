@@ -76,6 +76,18 @@ def test_pto_fallback_timing_profile_ports_public_pipe_formulas() -> None:
     assert profile.estimate_task("set_flag", pipe="mte1", metadata={}) == 1
 
 
+def test_pto_fallback_timing_profile_ports_mma_formula() -> None:
+    profile = pto_fallback_timing_profile("A2")
+    fp16_lhs = BufferRegion("a", MemoryScope.L0A, (16 * 16,), "float16", core_id=0)
+    fp32_lhs = BufferRegion("a", MemoryScope.L0A, (16 * 16,), "float32", core_id=0)
+    half_mma = {"mma": {"rows": 16, "inner": 13, "cols": 16}, "lhs": fp16_lhs}
+    float_mma = {"mma": {"rows": 16, "inner": 13, "cols": 16}, "lhs": fp32_lhs}
+
+    # PTO: head 6; fp16 K tile=16 / repeat=1, fp32 K tile=8 / repeat=2.
+    assert profile.estimate_task("mma", pipe="m", metadata=half_mma) == 7
+    assert profile.estimate_task("mma", pipe="m", metadata=float_mma) == 10
+
+
 def test_pto_timing_profile_keeps_explicit_operation_override() -> None:
     profile = TimingProfile(
         platform="A2", estimator="pto-fallback", operation_cycles={"mma": 99}
