@@ -285,11 +285,12 @@ class FlagBarrierSynchronizationModel:
         local_flag_depth: int = 1,
         cross_flag_depth: int = 15,
     ) -> None:
-        # flag_blocking=True: a SET issued while a flag already has `depth`
-        # outstanding credits BLOCKS the issuing pipe (hardware queue
-        # semantics) instead of raising -- the scheduler's deadlock detector
-        # can then prove the cycle. flag_blocking=False keeps the legacy
-        # idealized semantics (error on overflow).
+        # Local flags are FIFO event channels: each SET contributes one
+        # outstanding credit and each WAIT consumes one.  This matches PTO's
+        # event-counter model and permits repeated SETs of one ID.  The
+        # optional blocking mode is an experimental bounded-credit model; it
+        # is deliberately not enabled by default because no A2/A3 queue depth
+        # is documented.
         self._flag_blocking = flag_blocking
         self._local_flag_depth = local_flag_depth
         self._cross_flag_depth = cross_flag_depth
@@ -521,11 +522,9 @@ class FlagBarrierSynchronizationModel:
         operation = self._operation(task)
         if operation in self._SET_LOCAL:
             key = self._local_flag_key(task)
-            tokens = self._tokens.get(key)
-            if tokens and not self._flag_blocking:
-                raise ProgramValidationError(f"set task {task.task_id!r} reused an outstanding {self._format_flag_key(key)}")
-            # flag_blocking: evaluate() already blocked the set at full depth,
-            # so outstanding < local_flag_depth here by construction.
+            # In the default unbounded model, repeated SETs are distinct FIFO
+            # credits.  In blocking mode evaluate() has already ensured the
+            # configured experimental depth is not exceeded.
             self._tokens[key].append((record.end_cycle, task.task_id))
         elif operation in self._SET_CROSS:
             mode = self._cross_mode(task)

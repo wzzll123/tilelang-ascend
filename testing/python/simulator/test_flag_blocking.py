@@ -89,14 +89,13 @@ def test_double_set_same_pipe_deadlocks_under_blocking() -> None:
         _run(program, flag_blocking=True, local_flag_depth=1)
 
 
-def test_double_set_legacy_mode_still_errors() -> None:
-    """Same program under the legacy idealized model keeps the old contract."""
+def test_double_set_default_counter_model_consumes_each_credit() -> None:
+    """Default PTO-aligned semantics accept two FIFO credits on one ID."""
     program = _program(
-        "flag-depth-legacy",
-        [_local_set("s1"), _local_set("s2"), _local_wait("w1")],
+        "flag-counter-default",
+        [_local_set("s1"), _local_set("s2"), _local_wait("w1"), _local_wait("w2")],
     )
-    with pytest.raises(ProgramValidationError, match="reused an outstanding"):
-        _run(program)
+    assert _run(program) is not None
 
 
 def test_depth_two_absorbs_double_set() -> None:

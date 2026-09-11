@@ -398,19 +398,24 @@ def test_cube_cross_set_gives_each_vector_lane_one_independent_credit() -> None:
         ).run(_program(*tasks))
 
 
-def test_local_flag_is_a_single_outstanding_latch() -> None:
-    tasks = tuple(
-        Task(
-            f"set-{index}", "set_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
-            metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 4},
-        )
-        for index in range(2)
+def test_local_flag_reuses_id_as_fifo_event_channel() -> None:
+    tasks = (
+        Task("set-0", "set_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
+             metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 4}),
+        Task("set-1", "set_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
+             metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 4}),
+        Task("wait-0", "wait_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
+             metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 4}),
+        Task("wait-1", "wait_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
+             metadata={"src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 4}),
     )
 
-    with pytest.raises(ProgramValidationError, match="reused an outstanding local flag"):
-        DiscreteEventScheduler(
-            synchronization=FlagBarrierSynchronizationModel()
-        ).run(_program(*tasks))
+    result = DiscreteEventScheduler(
+        synchronization=FlagBarrierSynchronizationModel()
+    ).run(_program(*tasks))
+    assert tuple(record.task_id for record in result.records) == (
+        "set-0", "set-1", "wait-0", "wait-1"
+    )
 
 
 def test_local_flags_are_isolated_between_cube_and_vector_lanes() -> None:
