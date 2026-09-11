@@ -30,9 +30,9 @@ class DeviceProfile:
 class TimingProfile:
     """Parameter table for a discrete-event scheduler.
 
-    Empty operation costs are intentional: callers must either provide calibrated values or
-    accept ``fallback_cycles``.  This prevents the scaffold from presenting invented hardware
-    latencies as measurements.
+    Explicit operation costs override the selected estimator.  The default simulator profile
+    uses PTO's documented fallback formulas and labels their provenance; it does not claim
+    measured A2/A3 hardware latency.
     """
 
     platform: str
@@ -156,8 +156,8 @@ def get_device_profile(platform: str) -> DeviceProfile:
 
 
 def default_timing_profile(platform: str) -> TimingProfile:
-    """Return a unit-cost profile clearly marked as uncalibrated."""
-    return TimingProfile(platform=normalize_platform(platform))
+    """Return the single default PTO-derived relative timing profile."""
+    return pto_fallback_timing_profile(platform)
 
 
 def pto_fallback_timing_profile(platform: str) -> TimingProfile:

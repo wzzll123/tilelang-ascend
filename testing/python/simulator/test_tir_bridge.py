@@ -5089,7 +5089,7 @@ def test_real_tir_vector_add_builds_dependencies_and_executes_end_to_end() -> No
     # scheduler therefore keeps its independent MTE2/Vector/MTE3 pipes free
     # to overlap; the functional interpreter separately evaluates the full
     # dataflow DAG to obtain the numeric result above.
-    assert result.schedule.stats.makespan_cycles == 2
+    assert result.schedule.stats.makespan_cycles == 6
 
 
 def test_symbolic_extent_and_affine_offsets_bind_at_runtime() -> None:

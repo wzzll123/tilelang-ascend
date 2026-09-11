@@ -40,7 +40,7 @@ def test_config_selects_a2_a3_profile(platform: str) -> None:
     assert config.device_profile.cube_core_count == 20
     assert config.device_profile.vector_core_count == 40
     assert config.device_profile.vector_lanes_per_cube == 2
-    assert config.timing_profile.calibration == "uncalibrated-unit-cost"
+    assert config.timing_profile.calibration == "pto-perf-sim-derived-fallback"
 
 
 def test_config_rejects_unsupported_platform_and_mismatched_timing() -> None:
@@ -50,16 +50,7 @@ def test_config_rejects_unsupported_platform_and_mismatched_timing() -> None:
     a3_timing = TimingProfile(platform="A3", operation_cycles={"mma": 7})
     with pytest.raises(SimulatorConfigError, match="does not match"):
         SimulatorConfig(platform="A2", timing_profile=a3_timing)
-    with pytest.raises(SimulatorConfigError, match="timing_model must be"):
-        SimulatorConfig(timing_model="measured")
-    with pytest.raises(SimulatorConfigError, match="cannot be combined"):
-        SimulatorConfig(timing_model="pto-fallback", timing_profile=a3_timing)
-
-
-def test_config_selects_pto_fallback_timing_model() -> None:
-    config = SimulatorConfig(platform="A3", timing_model="pto-fallback")
-    assert config.timing_profile.estimator == "pto-fallback"
-    assert config.timing_profile.calibration == "pto-perf-sim-derived-fallback"
+    assert SimulatorConfig(platform="A3").timing_profile.estimator == "pto-fallback"
 
 
 def test_timing_profile_uses_explicit_cost_and_visible_fallback() -> None:
