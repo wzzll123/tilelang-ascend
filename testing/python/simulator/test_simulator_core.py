@@ -28,6 +28,7 @@ from tilelang.simulator import (
     UnsupportedMemoryScopeError,
     UnsupportedSimOpError,
     get_device_profile,
+    pto_fallback_timing_profile,
 )
 
 
@@ -49,6 +50,16 @@ def test_config_rejects_unsupported_platform_and_mismatched_timing() -> None:
     a3_timing = TimingProfile(platform="A3", operation_cycles={"mma": 7})
     with pytest.raises(SimulatorConfigError, match="does not match"):
         SimulatorConfig(platform="A2", timing_profile=a3_timing)
+    with pytest.raises(SimulatorConfigError, match="timing_model must be"):
+        SimulatorConfig(timing_model="measured")
+    with pytest.raises(SimulatorConfigError, match="cannot be combined"):
+        SimulatorConfig(timing_model="pto-fallback", timing_profile=a3_timing)
+
+
+def test_config_selects_pto_fallback_timing_model() -> None:
+    config = SimulatorConfig(platform="A3", timing_model="pto-fallback")
+    assert config.timing_profile.estimator == "pto-fallback"
+    assert config.timing_profile.calibration == "pto-perf-sim-derived-fallback"
 
 
 def test_timing_profile_uses_explicit_cost_and_visible_fallback() -> None:
@@ -58,6 +69,27 @@ def test_timing_profile_uses_explicit_cost_and_visible_fallback() -> None:
     assert profile.estimate_cycles("copy") == 2
     assert profile.calibration == "uncalibrated-unit-cost"
     assert get_device_profile("A3").calibration == "uncalibrated"
+
+
+def test_pto_fallback_timing_profile_ports_public_pipe_formulas() -> None:
+    profile = pto_fallback_timing_profile("A2")
+    fp16_tile = BufferRegion("tile", MemoryScope.UB, (16, 16), "float16", core_id=0)
+
+    assert profile.calibration == "pto-perf-sim-derived-fallback"
+    # PTO fallback: GM = 3 + elements * 2 / 64; MTE1 = 1 + elements / 64;
+    # Matrix = 4 + elements / 16; Vector = 2 + elements / 32.
+    assert profile.estimate_task("copy", pipe="mte2", metadata={"transfer_bytes": 512, "src": fp16_tile}) == 11
+    assert profile.estimate_task("copy", pipe="mte1", metadata={"dst": fp16_tile}) == 5
+    assert profile.estimate_task("mma", pipe="m", metadata={"dst": fp16_tile}) == 20
+    assert profile.estimate_task("binary", pipe="v", metadata={"dst": fp16_tile}) == 10
+    assert profile.estimate_task("set_flag", pipe="mte1", metadata={}) == 1
+
+
+def test_pto_timing_profile_keeps_explicit_operation_override() -> None:
+    profile = TimingProfile(
+        platform="A2", estimator="pto-fallback", operation_cycles={"mma": 99}
+    )
+    assert profile.estimate_task("mma", pipe="m", metadata={}) == 99
 
 
 @pytest.mark.parametrize("scope", ["shmem", "shared.shmem", "shared_memory"])

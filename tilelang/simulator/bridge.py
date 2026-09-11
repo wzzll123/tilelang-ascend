@@ -4425,7 +4425,11 @@ class _TirBridge:
             context.core_id,
             lane,
             pipe,
-            self.timing_profile.estimate_cycles(timing_key),
+            self.timing_profile.estimate_task(
+                timing_key,
+                pipe=pipe.value,
+                metadata=task_metadata,
+            ),
             dependencies=dependencies,
             metadata=task_metadata,
         )

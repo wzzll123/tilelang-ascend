@@ -14,6 +14,7 @@ from .profile import (
     default_timing_profile,
     get_device_profile,
     normalize_platform,
+    pto_fallback_timing_profile,
 )
 
 
@@ -42,6 +43,9 @@ class SimulatorConfig:
     cross_flag_depth: int = 15
     execution_timeout_s: float = 120.0
     max_cycles: int | None = None
+    # ``pto-fallback`` ports PTO perf-sim's public fallback cost formulas.
+    # It is a relative-performance model, not a measured hardware profile.
+    timing_model: str = "unit"
     timing_profile: TimingProfile | None = None
 
     def __post_init__(self) -> None:
@@ -73,9 +77,19 @@ class SimulatorConfig:
             raise SimulatorConfigError("execution_timeout_s must be positive")
         if self.max_cycles is not None and self.max_cycles <= 0:
             raise SimulatorConfigError("max_cycles must be positive when specified")
+        if self.timing_model not in {"unit", "pto-fallback"}:
+            raise SimulatorConfigError("timing_model must be one of: unit, pto-fallback")
+        if self.timing_profile is not None and self.timing_model != "unit":
+            raise SimulatorConfigError(
+                "timing_model cannot be combined with an explicit timing_profile"
+            )
         if self.trace_path is not None:
             object.__setattr__(self, "trace_path", Path(self.trace_path))
-        timing_profile = self.timing_profile or default_timing_profile(platform)
+        timing_profile = self.timing_profile or (
+            pto_fallback_timing_profile(platform)
+            if self.timing_model == "pto-fallback"
+            else default_timing_profile(platform)
+        )
         if timing_profile.platform != platform:
             raise SimulatorConfigError(
                 f"timing profile platform does not match simulator platform: {timing_profile.platform} != {platform}"

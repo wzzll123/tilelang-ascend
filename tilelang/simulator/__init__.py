@@ -31,7 +31,13 @@ from .memory import (
     contiguous_strides_bytes,
     dtype_size_bytes,
 )
-from .profile import DeviceProfile, TimingProfile, default_timing_profile, get_device_profile
+from .profile import (
+    DeviceProfile,
+    TimingProfile,
+    default_timing_profile,
+    get_device_profile,
+    pto_fallback_timing_profile,
+)
 from .program import (
     AffineInt,
     BufferRegion,
@@ -105,6 +111,7 @@ __all__ = [
     "contiguous_strides_bytes",
     "classify_operation",
     "default_timing_profile",
+    "pto_fallback_timing_profile",
     "dtype_size_bytes",
     "get_device_profile",
 ]
