@@ -1,6 +1,6 @@
 # TileLang Ascend A2/A3 Simulator Roadmap
 
-更新时间：2026-09-09
+更新时间：2026-09-13
 
 本路线图当前主线只覆盖 Ascend A2/A3（C220）的单设备功能语义。`shmem` 在当前版本
 仍必须 fail fast，禁止以空操作或近似语义静默执行；但 SHMEM 是长期 roadmap，待单设备
@@ -35,8 +35,10 @@
 3. **性能 trace**：通过离散事件调度模拟 AIC/AIV pipe overlap、依赖和等待，输出
    Chrome/Perfetto trace 和统计数据。
 
-功能结果必须正确，性能模型必须可解释。当前 timing profile 是未校准单位成本，不能
-当作真机 latency。A2 与 A3 共用功能语义，但 timing profile 必须独立维护。
+功能结果必须正确，性能模型必须可解释。默认 timing profile 已移植 PTO perf-sim 的
+公开 fallback 公式和 fp16/fp32 MMA lightweight 公式，并在 trace 中标记为
+`pto-perf-sim-derived-fallback`；它只能用于趋势/结构分析，不能当作真机 latency。
+A2 与 A3 共用功能语义，但最终 timing calibration 必须独立维护。
 
 权威输入是 `OptimizeForTarget` 和最终 `tir.transform.Simplify()` 之后、
 `device_codegen` 之前的 TIR。不要解析生成的 AscendC/PTO C++，也不要另建一条与原生
@@ -313,7 +315,8 @@ MTE1 load 和 MATRIX stage，
 L0A/L0B payload，逐 K tile 累加并按 N tile 写入对应 L0C column band。内部 load 的 L1
 窗口已拆为精确 zN C0 source regions。各 stage 已有独立的 `gemm_v0.load_a/load_b/mma`
 timing key、transfer bytes/math ops 和 MTE1↔M event annotation；周期仍使用可替换的
-`uncalibrated-unit-cost` profile，annotation 尚不是显式硬件 flag task。
+PTO-derived fallback profile；fp16/fp32 MMA 已按 PTO lightweight cost-model 的 16×16
+tile、32-byte K fractal、head/repeat 公式估时。annotation 尚不是显式硬件 flag task。
 实际 `examples/gemm/example_gemm.py` 已提供 `--simulator --platform A2/A3` 入口；单 tile
 以及多 M/N tile、两段 K 累加均与 PyTorch 结果匹配。final TIR 中循环相关的
 `init=(k == 0)` 会按每个静态展开迭代解析，不再要求源表达式本身是 literal。
@@ -687,8 +690,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 
 - [x] ~~实现 dependency DAG 和 `(core, lane, pipe)` FIFO 离散事件调度。~~
 - [x] ~~允许不同 pipe overlap，并统计 makespan、utilization、wait 和 per-core completion。~~
-- [x] ~~实现 local set/wait 的单 latch、event 0..7、source/destination pipe 作用域，以及
-  manual/auto intrinsic metadata 解码。~~
+- [x] ~~实现 local set/wait 的 event 0..7、source/destination pipe 作用域，以及
+  manual/auto intrinsic metadata 解码；执行模型为按 `(core,lane,src,dst,id)` 隔离的
+  FIFO event credit，重复 `set` 产生独立 credit，`wait` 依次消费。~~
 - [x] ~~按 EasyASC 语义实现 mode-2 cross flag：Cube→Vector 双 lane 独立 fan-out、
   Vector→Cube 双 lane join、方向隔离和 15 个 outstanding phase 上限。~~
 - [x] ~~实现 lane-local barrier_all、pipe-local pipe_barrier，并验证同步不会错误阻塞无关
@@ -708,8 +712,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   `90bb652`/`e9f9456` 仅用于 if 前后 barrier lowering 回归，不宣称复现原业务 bug。~~
 - [x] ~~同步契约按“CANN 官方文档 > PTO A2/A3 lowering > PTO perf-sim > EasyASC”审计：
   set 落 source pipe、local wait 落 destination pipe、A2/A3 cross wait 阻塞当前 lane
-  后续发射；保留官方 local 0/1 latch，明确不照搬 PTO perf-sim 的 local counter 和
-  unbounded pre-filled queue 简化。~~
+  后续发射；local event 对齐 PTO counter/FIFO，并由 A2 真机连续 `set,set,wait,wait`
+  探针确认不会将重复 set 误报为硬件错误。有限 queue depth 没有文档依据，保持实验性
+  opt-in，不能作为默认死锁结论。~~
 - [x] ~~从真实 TIR 的同名重叠 `BufferRegion` 自动生成 RAW、WAR 和 WAW dependency。~~
 - [x] ~~将 dependency 扩展到 storage alias、跨 buffer 物理地址和保守动态 region。~~
 - [x] ~~实现 `SimulatorConfig.sync_only` 同步骨架模式：完整执行 flag/barrier/cross-flag、
@@ -743,13 +748,47 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [x] ~~按本地 scope 统计 peak physical address-space high watermark；每种 scope 取
   hardware owner 最大值而非跨核求和，并自然计入 alignment/hole、去重 alias/reuse。~~
 - [x] ~~统计 active cores 的 completion spread（`load_imbalance_cycles`）。~~
+- [x] ~~公开 `kernel.schedule_simulator()`、`kernel.adapter.last_stats` 与
+  `SimulationStats.to_dict()`：只调度时可获得结构化性能摘要；功能模拟后也可读取相同
+  stats；`trace_path` 输出 Perfetto/Chrome JSON。~~
+- [x] ~~默认使用统一的 PTO-derived timing profile；不向普通用户暴露 timing-model
+  选择开关。显式 `TimingProfile` 仅保留给测试/研究覆盖。~~
 - [ ] 标记 critical path、copy/compute overlap 和主要 stall 原因。
 - [x] ~~增加 trace schema/version 回归测试。~~
 - [ ] 增加 trace comparison 工具。
 
-## P8：A2/A3 Timing Calibration 与硬化
+### Profiler 与大模型消费路线
 
-- [x] ~~A2/A3 分离配置，并将当前成本明确标记为 `uncalibrated-unit-cost`。~~
+模拟器不是硬件 profiler：它给出带 provenance 的预测 cycle、结构性瓶颈和可解释 trace；
+真机 latency、带宽与 contention 仍须由 msprof/硬件实验确认。面向用户和大模型的输出按
+“先摘要、后钻取”组织，避免把完整 trace 直接塞入上下文：
+
+1. `SimulationStats.to_dict()`：makespan、每 pipe utilization、wait 原因、memory path
+   bytes、operation counts、local-memory peak、core imbalance；这是默认分析输入。
+2. Perfetto trace：按需定位具体 task、flag flow、memory dependency、queue depth 和 live
+   memory counter。
+3. 后续 `PerformanceReport`：关键路径、top-N stall/idle interval、copy/compute overlap、
+   PTO formula/fallback 命中率与 calibration/provenance，提供稳定 JSON 和简短文本摘要。
+
+- [ ] 实现 `PerformanceReport`（JSON + human-readable summary），从 `last_stats` 和
+  schedule records 提取关键路径、top-N wait/stall 与瓶颈 pipe。
+- [ ] 为 trace comparison 实现两个 schedule 的 makespan、critical path、utilization、wait
+  和 overlap 差异报告，供 compiler/pass 回归与大模型分析。
+- [ ] 给 simulator examples 增加 `--report`，写出大模型上下文友好的摘要 JSON；trace 仍为
+  可选深度证据。
+- [ ] 在报告中区分 `pto-perf-sim-derived-fallback`、将来 A2/A3 measured profile 和未知
+  fallback，禁止混合解释为真机测量。
+
+## P8：A2/A3 Timing Calibration、PTO 对齐与硬化
+
+- [x] ~~将 PTO perf-sim 的 pipe FIFO、显式 event counter 语义作为调度对照；默认 timing
+  profile 移植其公开 fallback（GM/MTE1/Vector/Matrix/Scalar）并明确 provenance。~~
+- [x] ~~移植 PTO fp16/fp32 MMA lightweight 公式；无法从 final TIR 无歧义恢复 PTO opcode/
+  tile type/shape 的 operation 保持 fallback，不猜测。~~
+- [ ] 建立 final-TIR operation → PTO opcode/tile-type/shape 的可审计映射；只在映射完整时
+  移植 `formula_params.csv` 的 vector/reduce 拟合公式。
+- [ ] 实现 PTO 可选 L2 model；PTO 默认 `has_l2=false`，仅在 TileLang 具备明确 L2 launch/
+  地址 contract 时启用，不作为默认 A2/A3 假设。
 - [ ] 建立 copy、vector、reduce、cube、fixpipe、sync、atomic 微基准集。
 - [ ] 在 A2 和 A3 上分别采集 latency、throughput、bandwidth 和 contention 数据。
 - [ ] 建立独立的、带版本和来源的 A2/A3 timing profile。
@@ -784,7 +823,7 @@ SHMEM 不属于当前单设备 simulator 的完成门槛。在正式实现之前
 ## 测试与交付门槛
 
 - [x] ~~纯 simulator 测试可在无 CANN、无 NPU、无 `torch_npu` 的 CPU host 运行。~~
-- [x] ~~当前 simulator 核心测试基线：589 passed，覆盖 memory、scheduler、sync、trace、
+- [x] ~~当前 simulator 核心测试基线：621 passed，覆盖 memory、scheduler、sync、trace、
   functional executor、真实 TIR bridge、跨 pipe 同步 hazard 和 shmem rejection；另有
   2 个依赖 native module 的 JIT 集成测试文件，覆盖自动同步回滚以及 FA 使用的二维
   row broadcast/runtime float scalar。~~
