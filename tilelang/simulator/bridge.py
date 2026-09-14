@@ -191,6 +191,7 @@ def classify_operation(operation: str, lane: Lane) -> tuple[Lane, Pipe, str]:
         "auto_set_cross_flag",
         "auto_wait_cross_flag",
         "barrier_all",
+        "sync_all",
         "pipe_barrier",
         "auto_barrier",
         "reinterpretcast",
@@ -4398,6 +4399,19 @@ class _TirBridge:
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
         self.task_counter += 1
         task_metadata = dict(metadata)
+        # Keep the scope selected by CodeGenTileLangAscendPto::SyncAllCodegen:
+        # CUBE -> SYNCALL<AICOnly>, VEC -> SYNCALL<AIVOnly>, and an unscoped
+        # call -> SYNCALL<Mix>.  The scheduler uses this to form the correct
+        # collective participant set.
+        if normalized == "sync_all":
+            task_metadata.setdefault(
+                "sync_scope",
+                "aic"
+                if lane is Lane.CUBE
+                else "aiv"
+                if lane in {Lane.VECTOR_0, Lane.VECTOR_1}
+                else "mix",
+            )
         if context.predicates:
             task_metadata["dynamic_predicates"] = context.predicates
         timing_key = str(task_metadata.get("timing_key", normalized))

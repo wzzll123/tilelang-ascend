@@ -76,6 +76,7 @@ class NoOpSynchronizationModel:
 FlagKey = tuple[object, ...]
 Participant = tuple[int, str]
 CollectiveKey = tuple[int, str, int, int]
+SyncAllKey = tuple[str, int]
 _VECTOR_LANE_NAMES = ("vector0", "vector1")
 _MAX_CROSS_FLAG_CREDITS = 15
 _PIPE_NAMES = frozenset({"mte2", "mte1", "m", "fix", "v", "mte3", "s"})
@@ -269,6 +270,10 @@ class FlagBarrierSynchronizationModel:
         }
     )
     _BARRIER_ALL = frozenset({"barrier_all", "tl.ascend_barrier_all"})
+    # PTO lowers the same TileLang intrinsic to one of SYNCALL<AICOnly>,
+    # SYNCALL<AIVOnly>, or SYNCALL<Mix>, according to the enclosing resource
+    # scope.  This is a collective core barrier, not PIPE_ALL.
+    _SYNC_ALL = frozenset({"sync_all", "tl.ascend_sync_all"})
     _PIPE_BARRIER = frozenset(
         {
             "pipe_barrier",
@@ -303,6 +308,12 @@ class FlagBarrierSynchronizationModel:
         self._core_ids: tuple[int, ...] = ()
         self._barrier_dependencies: dict[str, tuple[str, ...]] = {}
         self._ordering_dependencies: dict[str, tuple[str, ...]] = {}
+        self._sync_all_arrivals: dict[
+            SyncAllKey, dict[Participant, tuple[int, str]]
+        ] = defaultdict(dict)
+        self._sync_all_task_phase: dict[str, SyncAllKey] = {}
+        self._sync_all_release_dependencies: dict[str, SyncAllKey] = {}
+        self._sync_all_expected: dict[str, tuple[Participant, ...]] = {}
 
     @staticmethod
     def _operation(task: Task) -> str:
@@ -318,6 +329,10 @@ class FlagBarrierSynchronizationModel:
         self._core_ids = tuple(sorted(core.core_id for core in program.cores))
         self._barrier_dependencies.clear()
         self._ordering_dependencies.clear()
+        self._sync_all_arrivals.clear()
+        self._sync_all_task_phase.clear()
+        self._sync_all_release_dependencies.clear()
+        self._sync_all_expected.clear()
         wait_modes: dict[tuple[int, str, int | None], set[int]] = defaultdict(set)
         for task in program.tasks:
             operation = self._operation(task)
@@ -362,10 +377,15 @@ class FlagBarrierSynchronizationModel:
         prior_by_lane: dict[tuple[int, str], list[Task]] = defaultdict(list)
         last_fence: dict[tuple[int, str], str] = {}
         last_pipe_fence: dict[tuple[int, str, str], str] = {}
+        sync_all_phase: dict[Participant, int] = defaultdict(int)
+        pending_sync_all: dict[Participant, SyncAllKey] = {}
         for task in program.tasks:
             operation = self._operation(task)
             self._validate_sync_task(task, operation)
             lane_key = (task.core_id, task.lane.value)
+            participant = self._participant(task)
+            if participant in pending_sync_all:
+                self._sync_all_release_dependencies[task.task_id] = pending_sync_all[participant]
             ordering = []
             if lane_key in last_fence:
                 ordering.append(last_fence[lane_key])
@@ -396,9 +416,34 @@ class FlagBarrierSynchronizationModel:
                         for prior in prior_by_core[task.core_id]
                         if prior.pipe.value == target_pipe and prior.lane.value == target_lane
                     )
+            elif operation in self._SYNC_ALL:
+                # PTO's A2/A3 hard SYNCALL implementation starts with
+                # pipe_barrier(PIPE_ALL), before issuing its FFTS rendezvous.
+                # Drain only the calling participant's pipes; the collective
+                # rendezvous below supplies the cross-core ordering.
+                self._barrier_dependencies[task.task_id] = tuple(
+                    prior.task_id for prior in prior_by_lane[lane_key]
+                )
+                scope = self._sync_all_scope(task)
+                sync_participants = self._sync_all_task_participants(task, scope)
+                phases = {sync_all_phase[item] for item in sync_participants}
+                if len(phases) != 1:
+                    raise ProgramValidationError(
+                        f"sync_all task {task.task_id!r} reaches mismatched participant phases "
+                        f"{sorted(phases)} in scope={scope}"
+                    )
+                key = (scope, phases.pop())
+                self._sync_all_task_phase[task.task_id] = key
+                for sync_participant in sync_participants:
+                    sync_all_phase[sync_participant] += 1
+                pending_sync_all[participant] = key
             prior_by_core[task.core_id].append(task)
             prior_by_lane[lane_key].append(task)
-            if operation in self._WAIT_CROSS or operation in self._BARRIER_ALL:
+            if (
+                operation in self._WAIT_CROSS
+                or operation in self._BARRIER_ALL
+                or operation in self._SYNC_ALL
+            ):
                 last_fence[lane_key] = task.task_id
             elif operation in self._WAIT_LOCAL:
                 destination_pipe = self._pipe_name(task.metadata.get("dst_pipe"))
@@ -416,6 +461,10 @@ class FlagBarrierSynchronizationModel:
                 source_pipe = self._pipe_name(task.metadata.get("src_pipe"))
                 if source_pipe:
                     last_pipe_fence[(task.core_id, task.lane.value, source_pipe)] = task.task_id
+        self._sync_all_expected = {
+            scope: self._sync_all_participants(scope)
+            for scope, _phase in self._sync_all_task_phase.values()
+        }
 
     def evaluate(self, task: Task, completed: Mapping[str, ExecutionRecord]) -> SyncDecision:
         operation = self._operation(task)
@@ -428,6 +477,30 @@ class FlagBarrierSynchronizationModel:
                 detail="waiting for " + ", ".join(missing_ordering),
             )
         ordering_cycle = max((completed[task_id].end_cycle for task_id in ordering), default=0)
+        sync_all_key = self._sync_all_release_dependencies.get(task.task_id)
+        if sync_all_key is not None:
+            expected = self._sync_all_expected[sync_all_key[0]]
+            arrivals = self._sync_all_arrivals[sync_all_key]
+            missing = tuple(participant for participant in expected if participant not in arrivals)
+            if missing:
+                return SyncDecision(
+                    ready_cycle=None,
+                    reason="sync_all",
+                    detail=(
+                        f"scope={sync_all_key[0]} phase={sync_all_key[1]} waiting for "
+                        + ", ".join(self._format_participant(item) for item in missing)
+                    ),
+                )
+            return SyncDecision(
+                ready_cycle=max(
+                    ordering_cycle, max(cycle for cycle, _task_id in arrivals.values())
+                ),
+                reason="sync_all",
+                detail=f"scope={sync_all_key[0]} phase={sync_all_key[1]}",
+                producer_task_ids=tuple(
+                    dict.fromkeys(task_id for _cycle, task_id in arrivals.values())
+                ),
+            )
         if self._flag_blocking and operation in self._SET_LOCAL:
             key = self._local_flag_key(task)
             outstanding = len(self._tokens.get(key, ()))
@@ -504,7 +577,11 @@ class FlagBarrierSynchronizationModel:
                 producer_task_ids=tuple(self._tokens[key][0][1] for key in keys),
             )
 
-        if operation in self._BARRIER_ALL or operation in self._PIPE_BARRIER:
+        if (
+            operation in self._BARRIER_ALL
+            or operation in self._PIPE_BARRIER
+            or operation in self._SYNC_ALL
+        ):
             required = self._barrier_dependencies.get(task.task_id, ())
             missing = tuple(task_id for task_id in required if task_id not in completed)
             if missing:
@@ -560,6 +637,16 @@ class FlagBarrierSynchronizationModel:
                     if not tokens:
                         raise ProgramValidationError(f"wait task {task.task_id!r} consumed a missing {self._format_flag_key(key)}")
                     tokens.popleft()
+        elif operation in self._SYNC_ALL:
+            key = self._sync_all_task_phase[task.task_id]
+            arrivals = self._sync_all_arrivals[key]
+            for participant in self._sync_all_task_participants(task, key[0]):
+                if participant in arrivals:
+                    raise ProgramValidationError(
+                        f"sync_all task {task.task_id!r} duplicates participant "
+                        f"{self._format_participant(participant)} in scope={key[0]} phase={key[1]}"
+                    )
+                arrivals[participant] = (record.end_cycle, task.task_id)
 
     def audit_flag_balance(self, policy: str = "error") -> None:
         """Reject credits/phases left live at a completed kernel boundary."""
@@ -579,6 +666,14 @@ class FlagBarrierSynchronizationModel:
                     residual.append(
                         f"collective flag mode={mode} id={flag_id} {self._format_participant(participant)} level={produced - consumed}"
                     )
+        for key, arrivals in sorted(self._sync_all_arrivals.items()):
+            expected = self._sync_all_expected[key[0]]
+            missing = tuple(participant for participant in expected if participant not in arrivals)
+            if missing:
+                residual.append(
+                    f"sync_all scope={key[0]} phase={key[1]} missing "
+                    + ", ".join(self._format_participant(participant) for participant in missing)
+                )
         if residual:
             message = "FLAG ACCOUNTING at kernel end: " + "; ".join(residual)
             if policy == "warn":
@@ -681,6 +776,53 @@ class FlagBarrierSynchronizationModel:
         if mode == 1 and lane_kind == "vector":
             return tuple((group_id, lane) for lane in _VECTOR_LANE_NAMES)
         raise ProgramValidationError(f"invalid collective cross flag key {key!r}")
+
+    def _sync_all_participants(self, scope: str) -> tuple[Participant, ...]:
+        if scope == "aic":
+            return tuple((core_id, "cube") for core_id in self._core_ids)
+        if scope == "aiv":
+            return tuple(
+                (core_id, lane)
+                for core_id in self._core_ids
+                for lane in _VECTOR_LANE_NAMES
+            )
+        if scope == "mix":
+            return tuple(
+                (core_id, lane)
+                for core_id in self._core_ids
+                for lane in ("cube", *_VECTOR_LANE_NAMES)
+            )
+        raise ProgramValidationError(f"invalid sync_all scope {scope!r}")
+
+    def _sync_all_task_participants(
+        self, task: Task, scope: str
+    ) -> tuple[Participant, ...]:
+        # An unscoped TileLang call is emitted by PTO as SYNCALL<Mix> in the
+        # shared C/AIV kernel body.  One CONTROL TIR task therefore denotes
+        # all hardware participants of that core, not a fourth CONTROL core.
+        if scope == "mix" and task.lane.value == "control":
+            return tuple(
+                (task.core_id, lane)
+                for lane in ("cube", *_VECTOR_LANE_NAMES)
+            )
+        return (self._participant(task),)
+
+    @staticmethod
+    def _sync_all_scope(task: Task) -> str:
+        scope = str(task.metadata.get("sync_scope", "")).strip().lower()
+        if not scope:
+            scope = (
+                "aic"
+                if task.lane.value == "cube"
+                else "aiv"
+                if task.lane.value in _VECTOR_LANE_NAMES
+                else "mix"
+            )
+        if scope not in {"aic", "aiv", "mix"}:
+            raise ProgramValidationError(
+                f"sync_all task {task.task_id!r} requires sync_scope aic, aiv, or mix, got {scope!r}"
+            )
+        return scope
 
     def _cross_wait_mode(self, task: Task) -> int | None:
         flag_id = self._flag_id(task)

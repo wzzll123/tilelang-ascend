@@ -29,6 +29,10 @@ def _program(*tasks: Task) -> KernelProgram:
     return KernelProgram("schedule_test", "A2", (CoreProgram(0, tasks),))
 
 
+def _multi_core_program(*cores: CoreProgram) -> KernelProgram:
+    return KernelProgram("multi_core_schedule_test", "A2", cores)
+
+
 def test_dependencies_and_pipe_fifo_determine_start_cycles() -> None:
     load_0 = Task("load-0", "copy", 0, Lane.CUBE, Pipe.MTE2, 4)
     load_1 = Task("load-1", "copy", 0, Lane.CUBE, Pipe.MTE2, 6)
@@ -259,6 +263,92 @@ def test_cross_flag_and_barrier_all_order_independent_pipes() -> None:
 
     assert records["barrier"].start_cycle == 8
     assert records["wait-cross"].start_cycle == records["set-cross"].end_cycle
+
+
+def test_sync_all_aic_releases_each_core_after_every_core_arrives() -> None:
+    """PTO's sync_all_aic is a cross-core collective, not PIPE_ALL."""
+    core0 = CoreProgram(
+        0,
+        (
+            Task("c0-sync", "sync_all", 0, Lane.CUBE, Pipe.SCALAR, 1),
+            Task("c0-after", "mma", 0, Lane.CUBE, Pipe.MATRIX, 3),
+        ),
+    )
+    core1 = CoreProgram(
+        1,
+        (
+            Task("c1-delay", "mma", 1, Lane.CUBE, Pipe.MATRIX, 9),
+            Task(
+                "c1-sync",
+                "sync_all",
+                1,
+                Lane.CUBE,
+                Pipe.SCALAR,
+                1,
+                dependencies=("c1-delay",),
+            ),
+            Task("c1-after", "mma", 1, Lane.CUBE, Pipe.MATRIX, 3),
+        ),
+    )
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_multi_core_program(core0, core1)).records
+    }
+
+    assert records["c0-after"].start_cycle == records["c1-sync"].end_cycle
+    assert records["c1-after"].start_cycle == records["c1-sync"].end_cycle
+    assert records["c1-sync"].start_cycle == records["c1-delay"].end_cycle
+    assert records["c0-after"].metadata["sync_producers"] == ("c0-sync", "c1-sync")
+
+
+def test_sync_all_missing_aic_participant_reports_deadlock() -> None:
+    core0 = CoreProgram(
+        0,
+        (
+            Task("c0-sync", "sync_all", 0, Lane.CUBE, Pipe.SCALAR, 1),
+            Task("c0-after", "mma", 0, Lane.CUBE, Pipe.MATRIX, 1),
+        ),
+    )
+    # A second launched core has no matching AIC SYNCALL dynamic point.
+    core1 = CoreProgram(
+        1, (Task("c1-work", "mma", 1, Lane.CUBE, Pipe.MATRIX, 1),)
+    )
+
+    with pytest.raises(SimulationDeadlockError, match="sync_all.*core=1/lane=cube"):
+        DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_multi_core_program(core0, core1))
+
+
+def test_unscoped_sync_all_models_pto_mix_participant_bundle() -> None:
+    core0 = CoreProgram(
+        0,
+        (
+            Task("c0-sync", "sync_all", 0, Lane.CONTROL, Pipe.SCALAR, 1),
+            Task("c0-after", "scalar", 0, Lane.CONTROL, Pipe.SCALAR, 1),
+        ),
+    )
+    core1 = CoreProgram(
+        1,
+        (
+            Task("c1-delay", "scalar", 1, Lane.CONTROL, Pipe.SCALAR, 7),
+            Task("c1-sync", "sync_all", 1, Lane.CONTROL, Pipe.SCALAR, 1),
+            Task("c1-after", "scalar", 1, Lane.CONTROL, Pipe.SCALAR, 1),
+        ),
+    )
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_multi_core_program(core0, core1)).records
+    }
+
+    assert records["c0-after"].start_cycle == records["c1-sync"].end_cycle
+    assert records["c0-after"].metadata["sync_producers"] == ("c0-sync", "c1-sync")
 
 
 def test_wait_without_matching_flag_reports_deadlock() -> None:

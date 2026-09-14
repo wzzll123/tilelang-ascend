@@ -19,6 +19,7 @@ from tilelang.simulator import Lane, Pipe, UnsupportedSimOpError, classify_opera
         ("tl.ascend_add", Lane.VECTOR_0, Lane.VECTOR_0, Pipe.VECTOR),
         ("tl.ascend_sort", Lane.VECTOR_1, Lane.VECTOR_1, Pipe.VECTOR),
         ("tl.ascend_set_flag", Lane.CUBE, Lane.CUBE, Pipe.SCALAR),
+        ("tl.ascend_sync_all", Lane.CUBE, Lane.CUBE, Pipe.SCALAR),
     ],
 )
 def test_known_operations_map_to_c220_resources(

@@ -139,6 +139,27 @@ def test_manual_sync_intrinsics_preserve_pipe_flag_and_mode_metadata() -> None:
     assert tasks[3].pipe is Pipe.SCALAR
 
 
+def test_sync_all_intrinsic_preserves_pto_resource_scope() -> None:
+    sync = tvm.tir.call_extern("handle", "sync_all")
+    cube = build_kernel_program(
+        _resource_scope_primfunc(0, sync, sync),
+        platform="A2",
+    )
+    vector = build_kernel_program(
+        _resource_scope_primfunc(1, sync, sync),
+        platform="A2",
+    )
+
+    cube_task = cube.cores[0].tasks[0]
+    vector_task = vector.cores[0].tasks[0]
+    assert (cube_task.operation, cube_task.lane, cube_task.metadata["sync_scope"]) == (
+        "sync_all", Lane.CUBE, "aic"
+    )
+    assert (vector_task.operation, vector_task.lane, vector_task.metadata["sync_scope"]) == (
+        "sync_all", Lane.VECTOR_0, "aiv"
+    )
+
+
 def test_auto_sync_intrinsics_decode_event_pair_and_cross_arguments() -> None:
     program = build_kernel_program(
         _sync_calls_primfunc(
