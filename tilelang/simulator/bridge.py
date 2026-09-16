@@ -331,18 +331,25 @@ class _TirBridge:
         # syntax tree even though the resources execute concurrently.  Memory
         # hazards are therefore only source-order dependencies within one
         # execution lane; cross-lane visibility is established by C/V flags.
-        # Keep the most recent logical accesses partitioned by the only
-        # dimensions that can overlap: execution lane, memory scope, and
-        # owning core.  The previous flat lists made every emitted task scan
-        # every historical access, which is prohibitive for large sync-only
-        # kernels even though almost all accesses live in distinct scopes.
+        # Keep the most recent logical accesses partitioned by execution lane,
+        # memory scope, owning core, and buffer.  The
+        # previous flat lists (and then scope-only buckets) made every emitted
+        # task compare with unrelated UB/L1/L0 buffers.  That is prohibitive
+        # for large sync-only kernels even though distinct buffers cannot
+        # overlap.  Candidate buckets are subsequently selected by their
+        # physical address ranges (and the active reinterpretcast alias map),
+        # so planned partial aliases remain sound.
         self.last_writes: dict[
-            tuple[Lane, MemoryScope, int], list[tuple[BufferRegion, str, Lane, int]]
+            tuple[Lane, MemoryScope, int, str], list[tuple[BufferRegion, str, Lane, int]]
         ] = defaultdict(list)
         self.last_reads: dict[
-            tuple[Lane, MemoryScope, int], list[tuple[BufferRegion, str, Lane, int]]
+            tuple[Lane, MemoryScope, int, str], list[tuple[BufferRegion, str, Lane, int]]
         ] = defaultdict(list)
         self.active_aliases: dict[tuple[MemoryScope, int | None, str], str] = {}
+        # TIR reuses the same Var objects across many unrolled calls.  Looking
+        # up ``name``/``name_hint`` on a TVM object crosses the FFI boundary,
+        # so cache it by Python object identity for this bridge build.
+        self.var_name_cache: dict[int, tuple[Any, str]] = {}
         self.task_counter = 0
         self.predicate_counter = 0
         self.kernel_name = "main"
@@ -4612,12 +4619,11 @@ class _TirBridge:
                 (region, task.task_id, lane, core_id)
             )
 
-    @staticmethod
     def _memory_history_key(
-        region: BufferRegion, lane: Lane, core_id: int
-    ) -> tuple[Lane, MemoryScope, int]:
+        self, region: BufferRegion, lane: Lane, core_id: int
+    ) -> tuple[Lane, MemoryScope, int, str]:
         owner = region.core_id if region.core_id is not None else core_id
-        return (lane, region.scope, owner)
+        return (lane, region.scope, owner, region.buffer)
 
     def _memory_history_keys(
         self,
@@ -4626,35 +4632,71 @@ class _TirBridge:
         core_id: int,
         *,
         include_cross_core: bool,
-    ) -> tuple[tuple[Lane, MemoryScope, int], ...]:
-        if (
-            not include_cross_core
-            or region.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}
-        ):
-            return (self._memory_history_key(region, lane, core_id),)
+    ) -> tuple[tuple[Lane, MemoryScope, int, str], ...]:
+        owner = region.core_id if region.core_id is not None else core_id
+        cross_core = include_cross_core and region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
         return tuple(
             key
             for key in self.last_writes.keys() | self.last_reads.keys()
-            if key[0] is lane and key[1] is region.scope
+            if key[0] is lane
+            and key[1] is region.scope
+            and (cross_core or key[2] == owner)
+            and self._memory_history_key_may_overlap(region, key, core_id)
         )
 
     def _memory_history_candidates(
         self,
-        history: Mapping[tuple[Lane, MemoryScope, int], list[tuple[BufferRegion, str, Lane, int]]],
+        history: Mapping[
+            tuple[Lane, MemoryScope, int, str],
+            list[tuple[BufferRegion, str, Lane, int]],
+        ],
         region: BufferRegion,
         lane: Lane,
         core_id: int,
         *,
         include_cross_core: bool,
     ) -> tuple[tuple[BufferRegion, str, Lane, int], ...]:
-        if include_cross_core and region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}:
-            return tuple(
-                entry
-                for key, entries in history.items()
-                if key[0] is lane and key[1] is region.scope
-                for entry in entries
-            )
-        return tuple(history.get(self._memory_history_key(region, lane, core_id), ()))
+        owner = region.core_id if region.core_id is not None else core_id
+        cross_core = include_cross_core and region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+        return tuple(
+            entry
+            for key, entries in history.items()
+            if key[0] is lane
+            and key[1] is region.scope
+            and (cross_core or key[2] == owner)
+            and self._memory_history_key_may_overlap(region, key, core_id)
+            for entry in entries
+        )
+
+    def _memory_history_key_may_overlap(
+        self,
+        region: BufferRegion,
+        key: tuple[Lane, MemoryScope, int, str],
+        core_id: int,
+    ) -> bool:
+        """Whether a history bucket can share bytes with ``region``.
+
+        This is intentionally a buffer-allocation test, not a region test.
+        It cheaply rejects unrelated buffers before the exact region overlap
+        logic runs, while retaining partial planned aliases and aliases that
+        appeared after a reinterpretcast task was recorded.
+        """
+        _, scope, previous_owner, previous_buffer = key
+        owner = region.core_id if region.core_id is not None else core_id
+        if scope not in {MemoryScope.GM, MemoryScope.WORKSPACE} and owner != previous_owner:
+            return False
+        left_buffer = self._resolve_active_alias(region, owner)
+        alias_owner = None if scope in {MemoryScope.GM, MemoryScope.WORKSPACE} else previous_owner
+        right_buffer = self._resolve_active_alias_name(scope, alias_owner, previous_buffer)
+        if left_buffer == right_buffer:
+            return True
+        left = self.buffers[left_buffer]
+        right = self.buffers[right_buffer]
+        left_size = _buffer_size_bytes(left)
+        right_size = _buffer_size_bytes(right)
+        if left.address is None or right.address is None or left_size is None or right_size is None:
+            return False
+        return left.address < right.address + right_size and right.address < left.address + left_size
 
     @staticmethod
     def _operand_regions(metadata: Mapping[str, Any], names: tuple[str, ...]) -> tuple[BufferRegion, ...]:
@@ -4715,12 +4757,16 @@ class _TirBridge:
         return True
 
     def _resolve_active_alias(self, region: BufferRegion, owner: int) -> str:
-        current = region.buffer
-        seen = set()
         alias_owner = None if region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE} else owner
+        return self._resolve_active_alias_name(region.scope, alias_owner, region.buffer)
+
+    def _resolve_active_alias_name(
+        self, scope: MemoryScope, alias_owner: int | None, current: str
+    ) -> str:
+        seen = set()
         while current not in seen:
             seen.add(current)
-            target = self.active_aliases.get((region.scope, alias_owner, current))
+            target = self.active_aliases.get((scope, alias_owner, current))
             if target is None:
                 break
             current = target
@@ -4807,6 +4853,13 @@ class _TirBridge:
             return int(value)
         if isinstance(value, int):
             return value
+        # Fast-path immediate values before invoking TVM's substituter and
+        # analyzer.  Intrinsic arguments contain these in abundance.
+        if isinstance(value, self.tir.IntImm):
+            return int(value.value)
+        if isinstance(value, self.tir.FloatImm):
+            literal = float(value.value)
+            return int(literal) if literal.is_integer() else None
         substituted = value
         if environment:
             replacements = self._environment_replacements(environment)
@@ -4975,9 +5028,19 @@ class _TirBridge:
             return value.value
         return type(value).__name__
 
-    @staticmethod
-    def _var_name(value: Any) -> str:
-        return str(getattr(value, "name", getattr(value, "name_hint", value)))
+    def _var_name(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        identity = id(value)
+        cached = self.var_name_cache.get(identity)
+        if cached is not None and cached[0] is value:
+            return cached[1]
+        name = str(getattr(value, "name", getattr(value, "name_hint", value)))
+        # Retain the object as well as its id: transient TVM Python wrappers
+        # can otherwise be collected and let Python reuse an id for a
+        # different Var during this build.
+        self.var_name_cache[identity] = (value, name)
+        return name
 
 
 @lru_cache(maxsize=131072)
