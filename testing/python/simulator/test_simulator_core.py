@@ -13,7 +13,9 @@ from tilelang.simulator import (
     BufferSpec,
     ChromeTraceExporter,
     CoreProgram,
+    DiscreteEventScheduler,
     ExecutionRecord,
+    FunctionalSimulator,
     HazardDiagnostic,
     KernelProgram,
     Lane,
@@ -93,6 +95,22 @@ def test_pto_timing_profile_keeps_explicit_operation_override() -> None:
         platform="A2", estimator="pto-fallback", operation_cycles={"mma": 99}
     )
     assert profile.estimate_task("mma", pipe="m", metadata={}) == 99
+
+
+def test_functional_execution_order_uses_schedule_rank_after_dependencies() -> None:
+    first = Task("first", "copy", 0, Lane.CUBE, Pipe.MTE2, 1)
+    independent = Task("independent", "copy", 0, Lane.CUBE, Pipe.MTE1, 1)
+    dependent = Task(
+        "dependent", "copy", 0, Lane.CUBE, Pipe.MATRIX, 1, dependencies=("first",)
+    )
+    program = KernelProgram("order", "A2", (CoreProgram(0, (first, independent, dependent)),))
+    schedule = DiscreteEventScheduler().run(program)
+
+    ordered = FunctionalSimulator._functional_execution_order(program, schedule)
+
+    assert [task.task_id for task in ordered] == [
+        "first", "independent", "dependent"
+    ]
 
 
 @pytest.mark.parametrize("scope", ["shmem", "shared.shmem", "shared_memory"])

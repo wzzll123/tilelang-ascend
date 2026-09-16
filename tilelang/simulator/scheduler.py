@@ -18,7 +18,7 @@ from .errors import (
 )
 from .program import KernelProgram, Task
 from .stats import SimulationStats
-from .sync import NoOpSynchronizationModel, SynchronizationModel, readonly_records
+from .sync import NoOpSynchronizationModel, SynchronizationModel
 from .trace import ExecutionRecord
 
 
@@ -73,6 +73,7 @@ class DiscreteEventScheduler:
 
         pending: set[str] = set(task_by_id)
         completed: dict[str, ExecutionRecord] = {}
+        completed_view = MappingProxyType(completed)
         records: list[ExecutionRecord] = []
         started_at = time.monotonic()
 
@@ -95,7 +96,7 @@ class DiscreteEventScheduler:
                     blocked_details[task.task_id] = "waiting for " + ", ".join(missing)
                     continue
 
-                decision = self.synchronization.evaluate(task, readonly_records(completed))
+                decision = self.synchronization.evaluate(task, completed_view)
                 if decision.blocked:
                     reason = decision.reason or "synchronization"
                     suffix = f": {decision.detail}" if decision.detail else ""

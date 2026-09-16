@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from heapq import heappop, heappush
 from typing import Any
 from collections.abc import Mapping
 
@@ -317,32 +318,41 @@ class FunctionalSimulator:
             for index, record in enumerate(schedule.records)
             if record.category != "wait"
         }
-        pending = {task.task_id: task for task in program.tasks}
-        completed: set[str] = set()
+        task_by_id = {task.task_id: task for task in program.tasks}
+        remaining = {
+            task.task_id: len(task.dependencies)
+            for task in program.tasks
+        }
+        dependents: dict[str, list[str]] = {task.task_id: [] for task in program.tasks}
+        for task in program.tasks:
+            for dependency in task.dependencies:
+                dependents[dependency].append(task.task_id)
+        ready = [
+            (schedule_rank[task_id], task_id)
+            for task_id, count in remaining.items()
+            if count == 0
+        ]
+        ready.sort()
         ordered: list[Task] = []
-        while pending:
-            ready = [
-                task
-                for task in pending.values()
-                if set(task.dependencies).issubset(completed)
-            ]
-            if not ready:
-                unresolved = "; ".join(
-                    f"{task.task_id}: {', '.join(task.dependencies)}"
-                    for task in pending.values()
-                )
-                raise ProgramValidationError(
-                    "functional interpreter cannot topologically order task dependencies: "
-                    + unresolved
-                )
-            # The timing scheduler already represents explicit flag/barrier
-            # happens-before (including cross-lane waits).  Use its stable
-            # event order as the tie-breaker between otherwise independent
-            # value-DAG nodes, without promoting a memory edge into timing.
-            task = min(ready, key=lambda candidate: schedule_rank[candidate.task_id])
+        while ready:
+            _rank, task_id = heappop(ready)
+            task = task_by_id[task_id]
             ordered.append(task)
-            completed.add(task.task_id)
-            del pending[task.task_id]
+            for dependent in dependents[task_id]:
+                remaining[dependent] -= 1
+                if remaining[dependent] == 0:
+                    heappush(ready, (schedule_rank[dependent], dependent))
+
+        if len(ordered) != len(program.tasks):
+            unresolved = "; ".join(
+                f"{task_id}: {', '.join(task_by_id[task_id].dependencies)}"
+                for task_id, count in remaining.items()
+                if count
+            )
+            raise ProgramValidationError(
+                "functional interpreter cannot topologically order task dependencies: "
+                + unresolved
+            )
         return tuple(ordered)
 
     def _program_for_dynamic_control(self) -> KernelProgram:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any
 from collections.abc import Mapping
 
@@ -330,8 +331,17 @@ class _TirBridge:
         # syntax tree even though the resources execute concurrently.  Memory
         # hazards are therefore only source-order dependencies within one
         # execution lane; cross-lane visibility is established by C/V flags.
-        self.last_writes: list[tuple[BufferRegion, str, Lane, int]] = []
-        self.last_reads: list[tuple[BufferRegion, str, Lane, int]] = []
+        # Keep the most recent logical accesses partitioned by the only
+        # dimensions that can overlap: execution lane, memory scope, and
+        # owning core.  The previous flat lists made every emitted task scan
+        # every historical access, which is prohibitive for large sync-only
+        # kernels even though almost all accesses live in distinct scopes.
+        self.last_writes: dict[
+            tuple[Lane, MemoryScope, int], list[tuple[BufferRegion, str, Lane, int]]
+        ] = defaultdict(list)
+        self.last_reads: dict[
+            tuple[Lane, MemoryScope, int], list[tuple[BufferRegion, str, Lane, int]]
+        ] = defaultdict(list)
         self.active_aliases: dict[tuple[MemoryScope, int | None, str], str] = {}
         self.task_counter = 0
         self.predicate_counter = 0
@@ -4516,7 +4526,9 @@ class _TirBridge:
         dependencies = {
             task_id
             for region in reads
-            for previous, task_id, previous_lane, previous_core in self.last_writes
+            for previous, task_id, previous_lane, previous_core in self._memory_history_candidates(
+                self.last_writes, region, lane, core_id, include_cross_core=keep_cross_core
+            )
             if previous_lane is lane
             and self._regions_overlap(region, previous, core_id)
             and (keep_cross_core or self._same_on_chip_owner(region, previous, core_id, previous_core))
@@ -4524,7 +4536,14 @@ class _TirBridge:
         for region in writes:
             dependencies.update(
                 task_id
-                for previous, task_id, previous_lane, previous_core in (self.last_writes + self.last_reads)
+                for previous, task_id, previous_lane, previous_core in (
+                    self._memory_history_candidates(
+                        self.last_writes, region, lane, core_id, include_cross_core=keep_cross_core
+                    )
+                    + self._memory_history_candidates(
+                        self.last_reads, region, lane, core_id, include_cross_core=keep_cross_core
+                    )
+                )
                 if previous_lane is lane
                 and self._regions_overlap(region, previous, core_id)
                 and (keep_cross_core or self._same_on_chip_owner(region, previous, core_id, previous_core))
@@ -4567,14 +4586,66 @@ class _TirBridge:
             ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch"),
         )
         for region in writes:
-            self.last_writes = [
-                entry for entry in self.last_writes if entry[2] is not lane or not self._regions_overlap(region, entry[0], core_id)
-            ]
-            self.last_reads = [
-                entry for entry in self.last_reads if entry[2] is not lane or not self._regions_overlap(region, entry[0], core_id)
-            ]
-            self.last_writes.append((region, task.task_id, lane, core_id))
-        self.last_reads.extend((region, task.task_id, lane, core_id) for region in reads)
+            for history in (self.last_writes, self.last_reads):
+                for key in self._memory_history_keys(region, lane, core_id, include_cross_core=True):
+                    entries = history.get(key)
+                    if entries:
+                        history[key] = [
+                            entry
+                            for entry in entries
+                            if not self._regions_overlap(region, entry[0], core_id)
+                        ]
+            self.last_writes[self._memory_history_key(region, lane, core_id)].append(
+                (region, task.task_id, lane, core_id)
+            )
+        for region in reads:
+            self.last_reads[self._memory_history_key(region, lane, core_id)].append(
+                (region, task.task_id, lane, core_id)
+            )
+
+    @staticmethod
+    def _memory_history_key(
+        region: BufferRegion, lane: Lane, core_id: int
+    ) -> tuple[Lane, MemoryScope, int]:
+        owner = region.core_id if region.core_id is not None else core_id
+        return (lane, region.scope, owner)
+
+    def _memory_history_keys(
+        self,
+        region: BufferRegion,
+        lane: Lane,
+        core_id: int,
+        *,
+        include_cross_core: bool,
+    ) -> tuple[tuple[Lane, MemoryScope, int], ...]:
+        if (
+            not include_cross_core
+            or region.scope not in {MemoryScope.GM, MemoryScope.WORKSPACE}
+        ):
+            return (self._memory_history_key(region, lane, core_id),)
+        return tuple(
+            key
+            for key in self.last_writes.keys() | self.last_reads.keys()
+            if key[0] is lane and key[1] is region.scope
+        )
+
+    def _memory_history_candidates(
+        self,
+        history: Mapping[tuple[Lane, MemoryScope, int], list[tuple[BufferRegion, str, Lane, int]]],
+        region: BufferRegion,
+        lane: Lane,
+        core_id: int,
+        *,
+        include_cross_core: bool,
+    ) -> tuple[tuple[BufferRegion, str, Lane, int], ...]:
+        if include_cross_core and region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}:
+            return tuple(
+                entry
+                for key, entries in history.items()
+                if key[0] is lane and key[1] is region.scope
+                for entry in entries
+            )
+        return tuple(history.get(self._memory_history_key(region, lane, core_id), ()))
 
     @staticmethod
     def _operand_regions(metadata: Mapping[str, Any], names: tuple[str, ...]) -> tuple[BufferRegion, ...]:
@@ -4886,6 +4957,7 @@ class _TirBridge:
         return str(getattr(value, "name", getattr(value, "name_hint", value)))
 
 
+@lru_cache(maxsize=131072)
 def _region_bounds(region: BufferRegion) -> tuple[int, int] | None:
     values = (region.byte_offset,) + region.shape + (region.strides_bytes or ())
     if any(isinstance(value, (AffineInt, SymbolicInt)) for value in values):

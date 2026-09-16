@@ -373,8 +373,13 @@ class FlagBarrierSynchronizationModel:
                 self._audited_collective_participants.add((self._collective_key(task, mode), self._participant(task)))
             elif mode == 2:
                 self._audited_cross_keys.update(self._cross_wait_keys_mode2(task))
-        prior_by_core: dict[int, list[Task]] = defaultdict(list)
-        prior_by_lane: dict[tuple[int, str], list[Task]] = defaultdict(list)
+        # A pipe's FIFO tail transitively depends on every older task on that
+        # pipe.  Retain those tails rather than materializing all preceding
+        # tasks for every SET/barrier; large hand-synchronized kernels contain
+        # thousands of such markers.
+        last_by_resource: dict[tuple[int, str, str], Task] = {}
+        resources_by_lane: dict[tuple[int, str], dict[str, Task]] = defaultdict(dict)
+        resources_by_core: dict[int, dict[tuple[str, str], Task]] = defaultdict(dict)
         last_fence: dict[tuple[int, str], str] = {}
         last_pipe_fence: dict[tuple[int, str, str], str] = {}
         sync_all_phase: dict[Participant, int] = defaultdict(int)
@@ -396,25 +401,40 @@ class FlagBarrierSynchronizationModel:
             # that behavior instead of draining unrelated pipes in the lane.
             if operation in self._SET_LOCAL or operation in self._SET_CROSS:
                 source_pipe = self._pipe_name(task.metadata.get("src_pipe"))
-                ordering.extend(prior.task_id for prior in prior_by_lane[lane_key] if prior.pipe.value == source_pipe)
+                previous = last_by_resource.get(
+                    (task.core_id, task.lane.value, source_pipe)
+                )
+                if previous is not None:
+                    ordering.append(previous.task_id)
             if ordering:
                 self._ordering_dependencies[task.task_id] = tuple(dict.fromkeys(ordering))
             if operation in self._BARRIER_ALL:
                 self._barrier_dependencies[task.task_id] = tuple(
-                    prior.task_id for prior in prior_by_core[task.core_id] if task.lane.value == "control" or prior.lane == task.lane
+                    prior.task_id
+                    for prior in (
+                        resources_by_core[task.core_id].values()
+                        if task.lane.value == "control"
+                        else resources_by_lane[lane_key].values()
+                    )
                 )
             elif operation in self._PIPE_BARRIER:
                 target_pipe = self._pipe_name(task.metadata.get("target_pipe", task.pipe.value))
                 if target_pipe == "all":
                     self._barrier_dependencies[task.task_id] = tuple(
-                        prior.task_id for prior in prior_by_core[task.core_id] if task.lane.value == "control" or prior.lane == task.lane
+                        prior.task_id
+                        for prior in (
+                            resources_by_core[task.core_id].values()
+                            if task.lane.value == "control"
+                            else resources_by_lane[lane_key].values()
+                        )
                     )
                 else:
                     target_lane = str(task.metadata.get("target_lane", task.lane.value)).lower()
-                    self._barrier_dependencies[task.task_id] = tuple(
-                        prior.task_id
-                        for prior in prior_by_core[task.core_id]
-                        if prior.pipe.value == target_pipe and prior.lane.value == target_lane
+                    previous = last_by_resource.get(
+                        (task.core_id, target_lane, target_pipe)
+                    )
+                    self._barrier_dependencies[task.task_id] = (
+                        (previous.task_id,) if previous is not None else ()
                     )
             elif operation in self._SYNC_ALL:
                 # PTO's A2/A3 hard SYNCALL implementation starts with
@@ -422,7 +442,7 @@ class FlagBarrierSynchronizationModel:
                 # Drain only the calling participant's pipes; the collective
                 # rendezvous below supplies the cross-core ordering.
                 self._barrier_dependencies[task.task_id] = tuple(
-                    prior.task_id for prior in prior_by_lane[lane_key]
+                    prior.task_id for prior in resources_by_lane[lane_key].values()
                 )
                 scope = self._sync_all_scope(task)
                 sync_participants = self._sync_all_task_participants(task, scope)
@@ -437,8 +457,10 @@ class FlagBarrierSynchronizationModel:
                 for sync_participant in sync_participants:
                     sync_all_phase[sync_participant] += 1
                 pending_sync_all[participant] = key
-            prior_by_core[task.core_id].append(task)
-            prior_by_lane[lane_key].append(task)
+            resource_key = (task.core_id, task.lane.value, task.pipe.value)
+            last_by_resource[resource_key] = task
+            resources_by_lane[lane_key][task.pipe.value] = task
+            resources_by_core[task.core_id][(task.lane.value, task.pipe.value)] = task
             if (
                 operation in self._WAIT_CROSS
                 or operation in self._BARRIER_ALL
