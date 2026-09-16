@@ -92,6 +92,7 @@ def validate_memory_synchronization(
     program: KernelProgram,
     *,
     hazard_check: str = "error",
+    dependency_key: str = "memory_dependencies",
 ) -> tuple[HazardDiagnostic, ...]:
     """Verify that inferred cross-pipe memory edges have hardware fences.
 
@@ -106,7 +107,7 @@ def validate_memory_synchronization(
         index_by_id = {task.task_id: index for index, task in enumerate(tasks)}
         task_by_id = {task.task_id: task for task in tasks}
         for consumer_index, consumer in enumerate(tasks):
-            dependencies = consumer.metadata.get("memory_dependencies", ())
+            dependencies = consumer.metadata.get(dependency_key, ())
             if not isinstance(dependencies, (tuple, list)):
                 continue
             for dependency_id in dependencies:

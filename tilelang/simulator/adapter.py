@@ -33,7 +33,7 @@ class SimulatorKernelAdapter:
         workspace_idx: list[int] | int | None,
         config: SimulatorConfig,
         program: Any,
-        validate_sync: bool = False,
+        validate_sync: str | None = None,
     ) -> None:
         self.optimized_mod = optimized_mod
         self.params = params
@@ -52,8 +52,8 @@ class SimulatorKernelAdapter:
         self._validate_sync = validate_sync
         self._has_dynamic_control = any(task.metadata.get("dynamic_predicates") for task in self.program.tasks)
         self.sync_diagnostics = (
-            validate_memory_synchronization(self.program, hazard_check=self.config.hazard_check)
-            if validate_sync and not self._has_dynamic_control
+            validate_memory_synchronization(self.program, hazard_check=self.config.hazard_check, dependency_key=validate_sync)
+            if validate_sync is not None and not self._has_dynamic_control
             else ()
         )
         self.func = self._functional_execute
@@ -188,11 +188,12 @@ class SimulatorKernelAdapter:
                 framework = "torch"
             simulator.write(self._full_region(self._buffer_specs[name]), array)
 
-        if self._has_dynamic_control and self._validate_sync:
+        if self._has_dynamic_control and self._validate_sync is not None:
             active_program = simulator._program_for_dynamic_control()
             self.sync_diagnostics = validate_memory_synchronization(
                 active_program,
                 hazard_check=self.config.hazard_check,
+                dependency_key=self._validate_sync,
             )
 
         execution = simulator.run()
@@ -293,7 +294,11 @@ def create_simulator_adapter(
         workspace_idx=workspace_idx,
         config=config,
         program=program,
-        validate_sync=bool(pass_configs.get("tl.ascend_auto_sync", False)),
+        validate_sync=(
+            "memory_dependencies"
+            if pass_configs.get("tl.ascend_auto_sync", False)
+            else "alias_memory_dependencies"
+        ),
     )
 
 

@@ -4452,6 +4452,11 @@ class _TirBridge:
             # deterministic, but are not hardware synchronization by
             # themselves; the adapter separately verifies cross-pipe edges.
             task_metadata["memory_dependencies"] = memory_dependencies
+        alias_dependencies = self._alias_memory_dependencies(
+            task_metadata, context.core_id, context.lane, operation=normalized
+        )
+        if alias_dependencies:
+            task_metadata["alias_memory_dependencies"] = alias_dependencies
         hardware_dependencies = set(extra_dependencies)
         # An atomic GM update is a hardware serialization point for the one
         # shared destination it touches.  The bridge derives the fixed order
@@ -4565,6 +4570,26 @@ class _TirBridge:
                 and (keep_cross_core or self._same_on_chip_owner(region, previous, core_id, previous_core))
             )
         return tuple(sorted(dependencies))
+
+    def _alias_memory_dependencies(
+        self, metadata: Mapping[str, Any], core_id: int, lane: Lane, *, operation: str = ""
+    ) -> tuple[str, ...]:
+        """Return inferred edges caused by distinct logical buffers aliasing bytes."""
+        reads = self._operand_regions(metadata, ("src_regions", "src", "lhs", "rhs", "mask", "accumulator", "scalar_src", "offsets", "bias"))
+        writes = self._operand_regions(metadata, ("dst", "dst_regions", "pad_dst", "scratch", "output_scratch"))
+        keep_cross_core = "atomic_add" in operation
+        result: set[str] = set()
+        for region, histories in ((region, (self.last_writes,)) for region in reads):
+            for history in histories:
+                for previous, task_id, previous_lane, previous_core in self._memory_history_candidates(history, region, lane, core_id, include_cross_core=keep_cross_core):
+                    if previous.buffer != region.buffer and previous_lane is lane and self._regions_overlap(region, previous, core_id) and (keep_cross_core or self._same_on_chip_owner(region, previous, core_id, previous_core)):
+                        result.add(task_id)
+        for region in writes:
+            for history in (self.last_writes, self.last_reads):
+                for previous, task_id, previous_lane, previous_core in self._memory_history_candidates(history, region, lane, core_id, include_cross_core=keep_cross_core):
+                    if previous.buffer != region.buffer and previous_lane is lane and self._regions_overlap(region, previous, core_id) and (keep_cross_core or self._same_on_chip_owner(region, previous, core_id, previous_core)):
+                        result.add(task_id)
+        return tuple(sorted(result))
 
     @staticmethod
     def _same_on_chip_owner(region: BufferRegion, previous: BufferRegion, core_id: int, previous_core: int) -> bool:
