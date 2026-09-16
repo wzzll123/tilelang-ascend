@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
@@ -480,8 +480,7 @@ class _TirBridge:
             if extent < 0 or extent > self.max_unrolled_iterations:
                 raise UnsupportedSimOpError(f"loop extent {extent} exceeds simulator bridge limit {self.max_unrolled_iterations}")
             for value in range(minimum, minimum + extent):
-                environment = dict(context.environment)
-                environment[stmt.loop_var] = value
+                environment = self._bind_environment(context.environment, stmt.loop_var, value)
                 try:
                     self._visit(stmt.body, replace(context, environment=environment))
                 except _LoopBreak:
@@ -513,8 +512,7 @@ class _TirBridge:
             return
         if isinstance(stmt, tir.LetStmt):
             value = self._require_int(stmt.value, context.environment, "let binding")
-            environment = dict(context.environment)
-            environment[stmt.var] = value
+            environment = self._bind_environment(context.environment, stmt.var, value)
             self._visit(stmt.body, replace(context, environment=environment))
             return
         if isinstance(stmt, tir.Allocate):
@@ -565,8 +563,7 @@ class _TirBridge:
             extent = self._require_int(stmt.value, context.environment, f"{tag} extent")
             if tag == "blockIdx.x":
                 for core_id in range(extent):
-                    environment = dict(context.environment)
-                    environment[variable] = core_id
+                    environment = self._bind_environment(context.environment, variable, core_id)
                     self._visit(
                         stmt.body,
                         replace(context, core_id=core_id, environment=environment),
@@ -574,8 +571,7 @@ class _TirBridge:
                 return
             if tag in {"blockIdx.y", "threadIdx.x"}:
                 for vector_index in range(extent):
-                    environment = dict(context.environment)
-                    environment[variable] = vector_index
+                    environment = self._bind_environment(context.environment, variable, vector_index)
                     self._visit(
                         stmt.body,
                         replace(
@@ -602,6 +598,11 @@ class _TirBridge:
             name = self._var_name(stmt.node)
             self.storage_scope_by_var[name] = MemoryScope.parse(self._literal(stmt.value))
         self._visit(stmt.body, context)
+
+    @staticmethod
+    def _bind_environment(environment: Mapping[Any, int], variable: Any, value: int) -> Mapping[Any, int]:
+        """Add one lexical TIR binding without copying all outer bindings."""
+        return ChainMap({variable: value}, environment)
 
     def _collect_allocate(self, stmt: Any, context: _Context) -> None:
         name = self._var_name(stmt.buffer_var)
