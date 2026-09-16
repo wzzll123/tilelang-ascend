@@ -650,8 +650,17 @@ class _TirBridge:
             if isinstance(operation_tag, str) and operation_tag.startswith("mma_bias<"):
                 operation = "mma_bias"
         metadata = {
-            "arguments": tuple(self._literal(arg) for arg in arguments),
-            "tir": str(call),
+            # ``arguments`` and ``tir`` are diagnostic-only.  In particular,
+            # neither the functional executor nor the sync model consumes
+            # them.  Rendering every TVM object here is surprisingly costly:
+            # ``str``/``getattr`` on a TVM Object crosses the FFI boundary.
+            # A large, unrolled kernel can have hundreds of thousands of
+            # calls, so eagerly formatting these fields used to dominate
+            # bridge construction even in sync_only mode.  Preserve scalar
+            # literals for trace readability, and retain opaque expressions
+            # without forcing their repr; the detailed source remains
+            # available on the original TIR program.
+            "arguments": tuple(self._debug_literal(arg) for arg in arguments),
         }
         if tail_kind in _TAIL_OPERATIONS or tail_kind == "tail_reduce":
             metadata.update(
@@ -4951,6 +4960,20 @@ class _TirBridge:
         if isinstance(literal, (bool, int, float, str)):
             return literal
         return str(value)
+
+    def _debug_literal(self, value: Any) -> Any:
+        """Return cheap, trace-only argument metadata.
+
+        The normal ``_literal`` contract intentionally stringifies arbitrary
+        TIR expressions for operation decoding.  Do not use it for the raw
+        per-task argument dump: unknown expressions are not interpreted
+        there, and formatting them performs an expensive TVM FFI lookup.
+        """
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (self.tir.IntImm, self.tir.FloatImm, self.tir.StringImm)):
+            return value.value
+        return type(value).__name__
 
     @staticmethod
     def _var_name(value: Any) -> str:
