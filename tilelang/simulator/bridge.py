@@ -4860,6 +4860,31 @@ class _TirBridge:
         if isinstance(value, self.tir.FloatImm):
             literal = float(value.value)
             return int(literal) if literal.is_integer() else None
+        # Most address/extent expressions in an unrolled kernel are a small
+        # integer expression over bound loop variables.  Evaluating that
+        # subset here avoids one substitute + Analyzer.simplify FFI round trip
+        # per operand.  Anything outside this exact subset falls through to
+        # the established TVM path below.
+        if isinstance(value, self.tir.Var):
+            bound = environment.get(value)
+            if bound is not None:
+                return bound
+        if isinstance(value, self.tir.Cast):
+            return self._const_int(value.value, environment)
+        binary_kind = (
+            (self.tir.Add, lambda a, b: a + b),
+            (self.tir.Sub, lambda a, b: a - b),
+            (self.tir.Mul, lambda a, b: a * b),
+            (self.tir.FloorDiv, lambda a, b: a // b),
+            (self.tir.FloorMod, lambda a, b: a % b),
+        )
+        for expression_type, evaluate in binary_kind:
+            if isinstance(value, expression_type):
+                left = self._const_int(value.a, environment)
+                right = self._const_int(value.b, environment)
+                if left is not None and right not in {None, 0}:
+                    return evaluate(left, right)
+                break
         substituted = value
         if environment:
             replacements = self._environment_replacements(environment)
