@@ -2332,9 +2332,12 @@ class _TirBridge:
         accumulator_dtype = _ascend_template_dtype(parameters[1])
         if (input_dtype, accumulator_dtype) not in {
             ("float16", "float32"),
+            ("bfloat16", "float32"),
             ("int8", "int32"),
         }:
-            raise UnsupportedSimOpError("functional gemm_v0 supports half-to-float and int8-to-int32")
+            raise UnsupportedSimOpError(
+                "functional gemm_v0 supports half/bfloat16-to-float and int8-to-int32"
+            )
         input_bytes = dtype_size_bytes(input_dtype)
         max_n_by_l0b = (32 * 1024) // (k_l0_size * input_bytes)
         n_tile = cols if transpose_b or cols <= max_n_by_l0b else max_n_by_l0b

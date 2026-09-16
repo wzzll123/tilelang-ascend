@@ -551,7 +551,11 @@ def _mma_primfunc(
     l0c = tvm.tir.decl_buffer(
         (c_elements,), accumulator_dtype, name="l0c", scope="wmma.accumulator"
     )
-    input_token = {"float16": "half", "int8": "int8_t"}[input_dtype]
+    input_token = {
+        "float16": "half",
+        "bfloat16": "bfloat16_t",
+        "int8": "int8_t",
+    }[input_dtype]
     accumulator_token = {"float32": "float", "int32": "int"}[
         accumulator_dtype
     ]
@@ -768,7 +772,11 @@ def _gemm_v0_primfunc(
     l0c = tvm.tir.decl_buffer(
         (c_elements,), accumulator_dtype, name="l0c", scope="wmma.accumulator"
     )
-    input_token = {"float16": "half", "int8": "int8_t"}[input_dtype]
+    input_token = {
+        "float16": "half",
+        "bfloat16": "bfloat16_t",
+        "int8": "int8_t",
+    }[input_dtype]
     accumulator_token = {"float32": "float", "int32": "int"}[
         accumulator_dtype
     ]
@@ -4649,6 +4657,40 @@ def test_real_tir_gemm_v0_executes_transpose_and_accumulation(
     expected = (left.T if transpose_a else left).astype(np.float32) @ (
         right.T if transpose_b else right
     ).astype(np.float32)
+    if not initialize:
+        previous = np.arange(256, dtype=np.float32).reshape(16, 16) / 17
+        simulator.write(
+            task.metadata["accumulator"], pack_matrix(previous, "l0c")
+        )
+        expected += previous
+    simulator.run()
+    np.testing.assert_allclose(
+        unpack_matrix(simulator.read(task.metadata["dst"]), "l0c", (16, 16)),
+        expected,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("initialize", [True, False])
+def test_real_tir_gemm_v0_executes_bfloat16_to_float32(initialize) -> None:
+    prim_func, shape_a, shape_b = _gemm_v0_primfunc(
+        init=initialize,
+        input_dtype="bfloat16",
+        accumulator_dtype="float32",
+    )
+    program = build_kernel_program(prim_func, platform="A3")
+    task = program.tasks[0]
+    simulator = FunctionalSimulator(program)
+    left = (
+        np.arange(np.prod(shape_a), dtype=np.float32).reshape(shape_a) - 50
+    ).astype(ml_dtypes.bfloat16)
+    right = (
+        np.arange(np.prod(shape_b), dtype=np.float32).reshape(shape_b) - 70
+    ).astype(ml_dtypes.bfloat16)
+    simulator.write(task.metadata["lhs"], pack_matrix(left, "zn"))
+    simulator.write(task.metadata["rhs"], pack_matrix(right, "zn"))
+    expected = left.astype(np.float32) @ right.astype(np.float32)
     if not initialize:
         previous = np.arange(256, dtype=np.float32).reshape(16, 16) / 17
         simulator.write(
