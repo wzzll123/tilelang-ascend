@@ -99,7 +99,7 @@ def tile_add(M: int, N: int, block_M: int, block_N: int, dtype: str = 'float'):
             a_ub = T.alloc_shared((block_M // VEC_NUM, block_N), dtype)
             b_ub = T.alloc_shared((block_M // VEC_NUM, block_N), dtype)
             c_ub = T.alloc_shared((block_M // VEC_NUM, block_N), dtype)
-            
+
             T.copy(A[bx * block_M + vid * block_M // VEC_NUM, by * block_N], a_ub)
             T.copy(B[bx * block_M + vid * block_M // VEC_NUM, by * block_N], b_ub)
 
@@ -308,7 +308,7 @@ shape除了可以是整形常量外，还可以是符号变量的形式表示，
           ...
   ```
 
-  
+
 
 - **T.dynamic(name, dtype)**
 
@@ -440,7 +440,7 @@ for ko in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
 三段式流水并行排布示意：
 ```
 ------------------------------------->
-  stage1  |     stage2     |  stage3 
+  stage1  |     stage2     |  stage3
 --------------------------------------
 copy copy | copy copy copy | ---- ----
 ---- ---- | gemm gemm gemm | gemm gemm
@@ -496,13 +496,13 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
 两个层级的存储分配定义如下。
 
-- `T.alloc_shared(shape, dtype)`: 
+- `T.alloc_shared(shape, dtype)`:
 
   **参数**：
 
   - Parameters:
 
-    **shape** (*tuple*) – The shape of the buffer to allocate 
+    **shape** (*tuple*) – The shape of the buffer to allocate
 
     **dtype** (*str*) – The data type of the buffer (e.g., ‘float32’, ‘int32’)
 
@@ -514,7 +514,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   A_L1 = T.alloc_shared((block_M, block_K), dtype)
   ```
 
-- `T.alloc_fragment(shape, dtype, scope='local.fragment')`: 
+- `T.alloc_fragment(shape, dtype, scope='local.fragment')`:
 
   **参数**：
 
@@ -552,10 +552,10 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   ```
   # 分配布尔类型标志位，初始化为False
   flag = T.alloc_var("bool", init=False)
-  
+
   # 分配整数变量，初始化为1
   counter = T.alloc_var("int32", init=1)
-  
+
   # 分配浮点数变量，初始化为0.0
   value = T.alloc_var("float32", init=0.0)
   ```
@@ -571,7 +571,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   ```
   flag = T.alloc_var("bool", init=False)
   a = T.alloc_var("int32", init=1)
-  
+
   flag = True
   if flag:
       a = 2
@@ -583,7 +583,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
   ```
   # 使用默认作用域
   var1 = T.alloc_var("int32", init=1)
-  
+
   # 显式指定作用域
   var2 = T.alloc_var("int32", "local.var", init=1)
   var3 = T.alloc_var("int32", init=1, scope="local.var")
@@ -593,7 +593,7 @@ fragment层级的存储对应偏上的寄存器级别的存储单元，一般用
 
   - 初始化值会直接写入变量，而不是默认的零值
   - 支持的初始化值类型包括常量、表达式和其他变量
-  
+
 在Ascend平台中，shared层级的存储对应到L1 Buffer 和 Unified Buffer，前者用于Cube计算，后者对应到Vector计算。但用户无需关心指定的存储是L1 Buffer还是Unified Buffer，TileLang的编译器会通过程序上下文自动分析和识别。fragment层级的存储对应到L0A/L0B/L0C Buffer，同样，用户无需显示指定是分配的是哪种，TileLang编译器会根据程序上下文自动分析和识别。
 
 ![image-tilelang_ascend_arch](./images/image-tilelang_ascend_arch.png)
@@ -735,7 +735,7 @@ extent 调用 `LocalTensor::SetSize`；因此 region extent 尚不构成 AscendC
       T.gemm_v0(A_L1, B_L1, C_L0, init=(k == 0))
       ......
   ```
-  
+
 
 ##### 4.1.3.2 Reduce类
 
@@ -1115,7 +1115,7 @@ TileLang提供了多种元素级操作算符，并结合调度原语**T.Parallel
   ```python
   for (i, j) in T.Parallel(block_M // VEC_NUM, block_N):
       c_ub[i, j] = b_ub[j] + 5 # b_ud is 1d and c_ub is 2d
-  ``` 
+  ```
 
 ###### 4.1.4.1.4 两种编程范式的说明
 
@@ -1131,12 +1131,12 @@ TileLang提供了多种元素级操作算符，并结合调度原语**T.Parallel
       with T.Scope("V"):
           a_ub = T.alloc_ub((block_M // VEC_NUM, block_N), "float16")
           b_ub = T.alloc_ub((block_M // VEC_NUM, block_N), "float16")
-  
+
           T.copy(A, a_ub)
-  
+
           for (i, j) in T.Parallel(block_M // VEC_NUM, block_N):
               b_ub[i, j] = T.exp(a_ub[i, j])
-  
+
           T.copy(b_ub, B)
   ```
 
@@ -1177,13 +1177,13 @@ for var in T.Pipelined(range: int, num_stages: int):
   for k in T.Pipelined(loop_k, num_stages=2):
       T.copy(A[bx * block_M, k * block_K], A_L1)
       T.copy(B[k * block_K, by * block_N], B_L1)
-  
+
       T.barrier_all()
       if k == 0:
           T.gemm_v0(A_L1, B_L1, C_L0, init=True)
       else:
           T.gemm_v0(A_L1, B_L1, C_L0)
-  
+
       T.barrier_all()
   ```
 
@@ -1223,7 +1223,7 @@ for var in T.Pipelined(range: int, num_stages: int):
       T.copy(K[bz, by, k * block_N:(k + 1) * block_N, :], k_l1)
       T.gemm_v0(q_l1, k_l1, acc_s_l0c, transpose_B=True, init=True)
       T.copy(acc_s_l0c, workspace_1[cid, :, :])
-  
+
       T.tile.fill(acc_s_ub, 0.0)
       T.copy(m_i, m_i_prev)
       T.copy(
@@ -1233,18 +1233,18 @@ for var in T.Pipelined(range: int, num_stages: int):
       T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
       ...
   ```
-  
+
   在上述案例中，在Cube核心上执行的`copy_K`、`gemm`和`copy_l0c_to_wk1`操作统称为`write_wk1`。在Vevtor核心上执行的以下操作中，包含`copy_wk1_to_ub`的操作可称为`read_wk1`。假设`T.ceildiv(seq_len, block_N)=4`，则这些操作为：
-  
+
   ```
   loop 0 : write_wk1_0 --> read_wk1_0
   loop 1 : write_wk1_1 --> read_wk1_1
   loop 2 : write_wk1_2 --> read_wk1_2
   loop 3 : write_wk1_3 --> read_wk1_3
   ```
-  
+
   此时`num_stages=2` ，即同时发出两个`write_wk1`任务，任务的执行顺序如下：
-  
+
   | Time | Write Workspace | Read Workspace |
   | ---- | --------------- | -------------- |
   | t₀   | **write_wk1_0** |                |
@@ -1286,7 +1286,7 @@ with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
             T.copy(C_L0, C[bx * block_M, by * block_N])
      ...
 ```
- 
+
 #### 4.1.5 CV分离
 
 ##### 4.1.5.1 Vid消除与CV自动配比
@@ -1301,7 +1301,7 @@ with T.Kernel(m_num * n_num, threads=2, is_npu=True) as (cid):
 
 ```python
 # UB申请原始形式
-c_ub = T.alloc_shared((block_M // VEC_NUM, block_N), dtype) 
+c_ub = T.alloc_shared((block_M // VEC_NUM, block_N), dtype)
 # vid消除后的新形式
 c_ub = T.alloc_shared((block_M, block_N), dtype)
 # UB拷贝原始形式
@@ -1366,7 +1366,7 @@ def flash_attn_kernel(...):
         T.gemm_v0(q_l1, k_l1, acc_s_l0c, ...)
         # L0C → UB：需要跨核传递
         T.copy(acc_s_l0c, acc_s_ub)  # 会触发Workspace消除
-        
+
         # Vector核心计算
         T.tile.exp(acc_s_ub, acc_s_ub)
         T.reduce_max(acc_s_ub, m_i, dim=-1)
@@ -1408,7 +1408,7 @@ Expert模式编程的含义是可以像专家那样去写算子，可以调用�
 
   **参数**：
 
-  - shape：The shape of the buffer to allocate 
+  - shape：The shape of the buffer to allocate
   - dtype：The data type of the buffer (e.g., ‘float32’, ‘int32’)
 
   **功能说明**：在Unified Buffer存储中申请形状为shape，类型为dtype的内存空间。
@@ -1547,7 +1547,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   #a_ub和b_ub逐元素相加，结果存放到c_ub
   T.tile.add(c_ub, a_ub, b_ub)
-  
+
   #a_ub逐元素加2，结果存放到c_ub
   T.tile.add(c_ub, a_ub, 2)
   ```
@@ -1567,7 +1567,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   #a_ub和b_ub的逐元素相减，结果存放到c_ub
   T.tile.sub(c_ub, a_ub, b_ub)
-  
+
   #a_ub的每个元素减去2，结果存放到c_ub
   T.tile.sub(c_ub, a_ub, 2)
   ```
@@ -1587,7 +1587,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   #a_ub和b_ub的逐元素相乘，结果存放到c_ub
   T.tile.mul(c_ub, a_ub, b_ub)
-  
+
   #a_ub的每个元素乘2，结果存放到c_ub
   T.tile.mul(c_ub, a_ub, 2)
   ```
@@ -1607,7 +1607,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   #a_ub和b_ub的逐元素相除，结果存放到c_ub
   T.tile.div(c_ub, a_ub, b_ub)
-  
+
   #a_ub的每个元素除以2，结果存放到c_ub
   T.tile.div(c_ub, a_ub, 2)
   ```
@@ -1627,7 +1627,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   #a_ub和b_ub的逐元素求max，结果存放到c_ub
   T.tile.max(c_ub, a_ub, b_ub)
-  
+
   #a_ub的每个元素和2比较，取最大值，结果存放到c_ub
   T.tile.max(c_ub, a_ub, 2)
   ```
@@ -1647,7 +1647,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   #a_ub和b_ub的逐元素求min，结果存放到c_ub
   T.tile.min(c_ub, a_ub, b_ub)
-  
+
   #a_ub的每个元素和2比较，取最小值，结果存放到c_ub
   T.tile.min(c_ub, a_ub, 2)
   ```
@@ -1957,7 +1957,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   # a_ub和b_ub逐元素比较，如果相等则相应位置置1，否则为0
   T.tile.compare(c_ub, a_ub, b_ub, “EQ”)
-  
+
   # a_ub逐元素和浮点数1.0比较，如果相等则相应位置置1，否则为0
   T.tile.compare(c_ub, a_ub, 1.0, "EQ")
   ```
@@ -1986,7 +1986,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   # 基于selMask设置，从a_ub和b_ub中选择元素，结果存放到c_ub
   T.tile.select(c_ub, selmask_ub, a_ub, b_ub, "VSEL_CMPMASK_SPR")
-  
+
   # 根据selMask设置，从a_ub和scalar值1.0中选择，结果存放到c_ub
   T.tile.select(c_ub, selmask_ub, a_ub, 1.0, "VSEL_TENSOR_SCALAR_MODE")
   ```
@@ -2084,7 +2084,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
   T.tile.fill(zero_ub, 0.0)
   ```
-  
+
 - `T.tile.createvecindex(dst, first_value)：`
 
   **参数**：
@@ -2125,28 +2125,22 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   - `dst`与 `src` 数据类型相同，仅支持float32和float16数据类型
   - `src` 的大小需要满足32或32的整数倍
 
-- `T.tile.merge_sort(dst, src0, src1, src2=None, src3=None):`
+- `T.tile.merge_sort(dst, src0, src1, src2=None, src3=None, tmp=None):`
 
   **参数**：
 
   - dst：归并结果输出缓冲区
-  - tmp：临时缓冲区，用于归并计算的中间结果存储
   - src0：第一个已排序的源数据缓冲区
   - src1：第二个已排序的源数据缓冲区
   - src2：第三个已排序的源数据缓冲区（可选，3-way 或 4-way 归并时需要）
   - src3：第四个已排序的源数据缓冲区（可选，4-way 归并时需要）
+  - tmp：可选临时缓冲区（ascendc 后端不使用；pto 后端不传时自动分配，显式传入须为非空 buffer）
 
   **功能**：将多个已排序的数据块合并为一个有序结果，支持 2-way、3-way 和 4-way 归并排序。
 
-  **数据格式**：输入/输出格式均为 value-index pair：`[value0, index0, value1, index1, value2, index2, ...]`，按降序排列。
-
-  数据类型为float，每个结构占据8Bytes：
+  **数据格式**：输入/输出格式均为 value-index pair：`[value0, index0, value1, index1, value2, index2, ...]`，按降序排列。数据类型为 float32，每个结构（value + index）占据 8 Bytes：
 
   ![image-tilelang_ascend_mergesort2](./images/zh-cn_image_0000002449970177.png)
-
-  数据类型为half，每个结构也占据8Bytes，中间有2Bytes保留：
-  
-  ![image-tilelang_ascend_mergesort2](./images/zh-cn_image_0000002449890293.png)
 
   **举例**：
 
@@ -2162,12 +2156,12 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
 
   **注意事项**：
-  - `tmp` 缓冲区大小需与 `dst` 相同
+  - 目前仅支持 `float32`，不支持 `float16`
   - 输入缓冲区必须已按降序排序
   - 所有缓冲区的数据格式必须为 value-index pair（每 2 个 float 表示一个元素）
+  - dst 大小至少为所有 src 大小之和
+  - pto 后端要求各 src 大小相同（不等长归并仅 ascendc 支持）
   - 建议配合 `T.tile.sort32` 一起使用
-
-  更详细说明，详见AscendC文档：https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/API/ascendcopapi/atlasascendc_api_07_0232.html
 
 - `T.tile.topk(dst, src, K, actual_num):`
 
@@ -2257,7 +2251,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   **参数**：
 
   - dst：GM 目标 buffer、buffer load 或 region
-  - src：本地 tensor，当前支持 UB/shared buffer 和 L0C/fragment buffer 
+  - src：本地 tensor，当前支持 UB/shared buffer 和 L0C/fragment buffer
 
   **功能**：将本地 tensor tile 原子累加到 GM 目标区域。该接口是 Ascend 专属的 `T.tile` 原语，不等价于主仓 GPU 风格的全局 `T.atomic_add`。V1 只支持 local/UB 到 GM 的原子累加，不支持 `return_prev`、`memory_order`、`use_tma`、常量 src 或任意表达式 src。
 
@@ -2276,7 +2270,7 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   T.tile.fill(src_ub, 1.0)
   T.tile.atomic_add(C[0], src_ub)
   ```
-  
+
   - L0C -> GM
   ```python
   src_l0c = T.alloc_L0C((block_M, block_N), dtype)
