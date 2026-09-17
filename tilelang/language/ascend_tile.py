@@ -507,7 +507,9 @@ def merge_sort(
     It merges descending-sorted (value, index) records. Hardware records are
     always 8 bytes: float32 uses ``[value, index]`` and float16 uses
     ``[value, reserved, index-low, index-high]``. ``blockLen`` is derived from
-    each source buffer size and that record width.
+    each source buffer size and that record width. Although AscendC hardware
+    defines both layouts, the TileLang float16 lowering has a known issue and
+    is not a verified hardware path.
 
     Args:
         dst: Destination buffer or region for the merged (value, index)
@@ -531,7 +533,9 @@ def merge_sort(
           ``buffer_size // 2``. The ascendc backend accepts
           blockLen in [1, 4095]; the pto backend requires equal
           block lengths in [4, 4088].
-        - Only float32 is supported; float16 inputs are not supported.
+        - The verified TileLang hardware path is float32. AscendC defines a
+          float16 ABI, but TileLang float16 lowering is currently known to
+          fail on AscendC or produce incorrect PTO results; do not rely on it.
         - Equal scores are ordered stably: sources are consumed in
           src0 → src1 → src2 → src3 order, preserving the order inside
           each source block.

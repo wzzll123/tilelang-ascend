@@ -11,8 +11,9 @@ Test suite for T.tile.merge_sort API.
 
 Covers:
   - Basic functionality: 2/3/4-way merge (verify 4-way is supported)
-  - dtype: float32 only (float16 is NOT supported by the current implementation:
-    ascendc raises aicore exception, pto produces wrong results)
+  - dtype: float32 only. AscendC MrgSort hardware defines a float16 8-byte
+    record ABI, but TileLang float16 lowering is a known implementation issue:
+    AscendC raises an AICore exception and PTO produces wrong results.
   - Unequal block lengths (ascendc only; pto compile fails)
   - BufferRegion slices as sources (2D buffer row slices)
   - Stability: equal scores keep source order (src0 -> src1 -> ...) and

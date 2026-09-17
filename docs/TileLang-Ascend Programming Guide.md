@@ -2156,7 +2156,9 @@ Expert编程模式可以复用Developer模式的Reduce类计算原语。
   ```
 
   **注意事项**：
-  - 目前仅支持 `float32`，不支持 `float16`
+  - TileLang 当前已验证的真机路径仅为 `float32`。AscendC MrgSort 硬件定义了
+    `float16` 的 8-byte record ABI，但 TileLang 的 float16 lowering 存在已知问题
+    （AscendC 异常、PTO 结果错误），当前不可作为受支持功能使用。
   - 输入缓冲区必须已按降序排序
   - 所有缓冲区的数据格式必须为 value-index pair（每 2 个 float 表示一个元素）
   - dst 大小至少为所有 src 大小之和

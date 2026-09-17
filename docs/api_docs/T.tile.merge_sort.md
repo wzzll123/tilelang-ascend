@@ -42,7 +42,10 @@ def merge_sort(
 |------|:---:|:----:|:----:|:----:|:----:|
 | Ascend A2 / A3 | float32 | float32 | float32 | float32 | float32 |
 
-> **注意**：仅支持 `float32`，不支持 `float16`。如需对 half 数据排序，请先用 `T.cast` 转为 float32。
+> **注意**：TileLang 当前已验证的真机路径仅为 `float32`。AscendC 的 MrgSort 硬件接口定义了
+> `float16` 的 8-byte record ABI，但 TileLang 的 float16 lowering 存在已知问题（AscendC
+> 异常、PTO 结果错误），当前不可作为受支持功能使用。如需对 half 数据排序，请先用 `T.cast`
+> 转为 float32。
 
 #### 2.3.2 Shape 支持
 
