@@ -346,6 +346,12 @@ class _TirBridge:
             tuple[Lane, MemoryScope, int, str], list[tuple[BufferRegion, str, Lane, int]]
         ] = defaultdict(list)
         self.active_aliases: dict[tuple[MemoryScope, int | None, str], str] = {}
+        # Memory dependency construction asks the same region pairs once for
+        # normal hazards and again for planned-alias hazards.  Cache the exact
+        # answer for the current alias map.  Reinterpretcast invalidates this
+        # small bounded cache, which keeps aliases that become active midway
+        # through a program semantically exact.
+        self.region_overlap_cache: dict[tuple[BufferRegion, BufferRegion, int], bool] = {}
         # TIR reuses the same Var objects across many unrolled calls.  Looking
         # up ``name``/``name_hint`` on a TVM object crosses the FFI boundary,
         # so cache it by Python object identity for this bridge build.
@@ -696,6 +702,7 @@ class _TirBridge:
             if isinstance(destination, BufferRegion) and isinstance(source, BufferRegion):
                 owner = destination.core_id
                 self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
+                self.region_overlap_cache.clear()
 
     def _emit_gemm_v0_trace_tasks(self, _operation: str, context: _Context, metadata: Mapping[str, Any]) -> None:
         details = metadata["gemm"]
@@ -4738,6 +4745,20 @@ class _TirBridge:
         return tuple(regions)
 
     def _regions_overlap(self, left: BufferRegion, right: BufferRegion, core_id: int) -> bool:
+        key = (left, right, core_id)
+        cached = self.region_overlap_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._regions_overlap_uncached(left, right, core_id)
+        # A pathological fully-unrolled program can contain millions of
+        # distinct views.  Bound cache memory rather than allowing a compile
+        # optimization to become its own capacity failure.
+        if len(self.region_overlap_cache) >= 131072:
+            self.region_overlap_cache.clear()
+        self.region_overlap_cache[key] = result
+        return result
+
+    def _regions_overlap_uncached(self, left: BufferRegion, right: BufferRegion, core_id: int) -> bool:
         if left.scope != right.scope:
             return False
         left_owner = left.core_id if left.core_id is not None else core_id
