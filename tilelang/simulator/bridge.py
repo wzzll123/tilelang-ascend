@@ -1599,18 +1599,40 @@ class _TirBridge:
             raise ProgramValidationError(f"{operation} tag dtype must match the operand buffers")
         if destination_spec.dtype not in {"float16", "float32"}:
             raise UnsupportedSimOpError(f"functional {operation} supports float16/float32 rows only")
-        physical_cols = destination_spec.shape[-1]
         itemsize = dtype_size_bytes(destination_spec.dtype)
         elements_per_block = BYTE_PER_C0 // itemsize
-        if not isinstance(physical_cols, int) or physical_cols != 8 * elements_per_block:
+        # 256-byte row *content* width is a property of the access window, not of
+        # the parent buffer: the GQA Brcb-fusion idiom legally slides 64-element
+        # (fp32) windows across a wider 2D tile.  The parent buffer's declared
+        # shape[-1] is the physical row *stride* (and is distorted once
+        # StorageRewrite flattens the allocation to 1-D), so it must never be
+        # validated against the window width.  Recover the pre-planning shape
+        # from the initial_buffer_shapes attr (same source as exp_experiment).
+        row_elements = 8 * elements_per_block
+        destination_shape = self.initial_shape_by_var.get(destination_name, destination_spec.shape)
+        row_stride = destination_shape[-1] if len(destination_shape) >= 2 else destination_spec.shape[-1]
+        if (
+            not isinstance(row_stride, int)
+            or row_stride < row_elements
+            or row_stride * itemsize % BYTE_PER_C0
+            or row_stride // elements_per_block > 255
+        ):
             raise ProgramValidationError(
-                f"{operation} requires 256-byte ({8 * elements_per_block}-element) rows, got {physical_cols} columns"
+                f"{operation} requires a 32-byte-aligned physical row stride of "
+                f"{row_elements}..{255 * elements_per_block} elements, got {row_stride}"
             )
-        rows = dst_extent // physical_cols
-        if dst_extent % physical_cols or not 1 <= rows <= 255:
-            raise ProgramValidationError(f"{operation} extent {dst_extent} must tile into 1..255 rows of {physical_cols} elements")
-        destination = self._access_buffer_region(arguments[1], (rows, physical_cols), context)
-        source = self._access_buffer_region(arguments[2], (rows, physical_cols), context)
+        rows = dst_extent // row_elements
+        if dst_extent % row_elements or not 1 <= rows <= 255:
+            raise ProgramValidationError(f"{operation} extent {dst_extent} must tile into 1..255 rows of {row_elements} elements")
+        destination = self._access_buffer_region(arguments[1], (rows, row_elements), context, row_stride_elems=row_stride)
+        source_name = self._access_ptr_data_name(arguments[2])
+        source_spec_pre = self.buffers.get(self.buffer_name_by_data_var.get(source_name)) if source_name else None
+        source_row_stride = (
+            self.initial_shape_by_var.get(source_name, source_spec_pre.shape)[-1]
+            if source_name and source_spec_pre is not None
+            else row_stride
+        )
+        source = self._access_buffer_region(arguments[2], (rows, row_elements), context, row_stride_elems=source_row_stride)
         if destination is None or source is None:
             return {}
         for region in (destination, source):
@@ -1618,8 +1640,7 @@ class _TirBridge:
                 raise ProgramValidationError(f"{operation} requires UB operands")
             if isinstance(region.byte_offset, int) and region.byte_offset % BYTE_PER_C0:
                 raise ProgramValidationError(f"{operation} requires 32-byte-aligned row windows")
-        source_spec = self.buffers[source.buffer]
-        if source_spec.shape[-1] != physical_cols:
+        if source_row_stride != row_stride:
             raise ProgramValidationError(f"{operation} source and destination physical row strides must match")
         has_tmp = len(arguments) == 5
         scalar_elements = rows if has_tmp else rows * elements_per_block
@@ -1650,7 +1671,7 @@ class _TirBridge:
             "scalar_src": scalar_source,
             "row_expand": {
                 "rows": rows,
-                "row_elements": physical_cols,
+                "row_elements": row_elements,
             },
         }
         if scratch is not None:
