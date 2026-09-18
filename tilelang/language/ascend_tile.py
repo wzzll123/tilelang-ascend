@@ -190,7 +190,10 @@ def _fold_nd_shape_to_2d(shape):
     shape = list(shape)
     if len(shape) <= 1:
         return shape
-    return [math.prod(shape[:-1]), shape[-1]]
+    # Slot slices can fold to algebraically constant expressions such as
+    # ``(slot + 1 - slot) * rows``.  Simplify before downstream static ABI
+    # validation decides whether the shape is legal.
+    return [arith.Analyzer().simplify(math.prod(shape[:-1])), shape[-1]]
 
 
 def _validate_buffer_region_contiguity(
@@ -1835,8 +1838,8 @@ def gather(
 
 @deprecated()
 def block_reduce_max(
-    dst: Buffer,
-    src: Buffer,
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
     repeat: PrimExpr,
     mask: PrimExpr,
     dstPepStride: PrimExpr,
@@ -1862,11 +1865,13 @@ def block_reduce_max(
     Returns:
         A TVM intrinsic call that performs the block reduce max operation.
     """
+    dst_ptr = _handle_buffer_region(dst, "w")[0] if isinstance(dst, BufferRegion) else dst.access_ptr("w")
+    src_ptr = _handle_buffer_region(src, "r")[0] if isinstance(src, BufferRegion) else src.access_ptr("r")
     return T.call_intrin(
         "handle",
         tir.op.Op.get("tl.ascend_block_reduce_max"),
-        dst.access_ptr("w"),
-        src.access_ptr("r"),
+        dst_ptr,
+        src_ptr,
         repeat,
         mask,
         dstPepStride,
@@ -1919,8 +1924,8 @@ def block_reduce_min(
 
 @deprecated()
 def block_reduce_sum(
-    dst: Buffer,
-    src: Buffer,
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
     repeat: PrimExpr,
     mask: PrimExpr,
     dstPepStride: PrimExpr,
@@ -1946,11 +1951,13 @@ def block_reduce_sum(
     Returns:
         A TVM intrinsic call that performs the block reduce sum operation.
     """
+    dst_ptr = _handle_buffer_region(dst, "w")[0] if isinstance(dst, BufferRegion) else dst.access_ptr("w")
+    src_ptr = _handle_buffer_region(src, "r")[0] if isinstance(src, BufferRegion) else src.access_ptr("r")
     return T.call_intrin(
         "handle",
         tir.op.Op.get("tl.ascend_block_reduce_sum"),
-        dst.access_ptr("w"),
-        src.access_ptr("r"),
+        dst_ptr,
+        src_ptr,
         repeat,
         mask,
         dstPepStride,
