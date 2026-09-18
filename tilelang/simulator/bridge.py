@@ -4767,6 +4767,13 @@ class _TirBridge:
         right_start, right_end = (right_base + right_bounds[0], right_base + right_bounds[1])
         if not (left_start < right_end and right_start < left_end):
             return False
+        # A contiguous view occupies every byte in its bounding interval, so
+        # the interval test above is already exact.  Avoid expanding it into
+        # per-row intervals: this is the overwhelmingly common path for the
+        # bridge-generated UB/L1/L0 regions, and expansion here used to sit in
+        # the hot loop of memory-dependency construction.
+        if _region_is_contiguous(left) and _region_is_contiguous(right):
+            return True
         # The bounding-box test above over-approximates strided regions: two
         # per-core column shards of one row-major GM matrix have overlapping
         # bounding boxes yet share no byte.  On real hardware cross-core
@@ -5159,6 +5166,16 @@ def _region_byte_intervals(
         else:
             merged.append((start, end))
     return tuple(merged)
+
+
+@lru_cache(maxsize=131072)
+def _region_is_contiguous(region: BufferRegion) -> bool:
+    """Whether ``region`` has no holes in its byte bounding interval."""
+    values = (region.byte_offset,) + region.shape + (region.strides_bytes or ())
+    if any(isinstance(value, (AffineInt, SymbolicInt)) for value in values):
+        return False
+    itemsize = dtype_size_bytes(region.dtype)
+    return (region.strides_bytes is None or tuple(region.strides_bytes) == contiguous_strides_bytes(region.shape, itemsize))
 
 
 def _strided_regions_disjoint(left: BufferRegion, right: BufferRegion, left_base: int, right_base: int) -> bool | None:
