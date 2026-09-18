@@ -76,7 +76,7 @@ copy_gm_to_l1(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
   // Zero-init them whenever the tile has fractal padding
   // (extent != dstM*dstN) or a partial tail copy.
   constexpr uint32_t ELE_PER_C0 = Catlass::BYTE_PER_C0 / sizeof(T);
-  constexpr uint32_t C0_PER_FRACTAL = Catlass::C0_NUM_PER_FRCATLASSAL;
+  constexpr uint32_t C0_PER_FRACTAL = Catlass::C0_NUM_PER_FRACTAL;
   const uint32_t paddedRows =
       (dstM + C0_PER_FRACTAL - 1) / C0_PER_FRACTAL * C0_PER_FRACTAL;
   const uint32_t fractalExtent =
