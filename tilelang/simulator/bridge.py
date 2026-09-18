@@ -359,10 +359,9 @@ class _TirBridge:
             tuple[int, Lane, MemoryScope, int, str, bool],
             tuple[tuple[Lane, MemoryScope, int, str], ...],
         ] = {}
-        # TIR reuses the same Var objects across many unrolled calls.  Looking
-        # up ``name``/``name_hint`` on a TVM object crosses the FFI boundary,
-        # so cache it by Python object identity for this bridge build.
-        self.var_name_cache: dict[int, tuple[Any, str]] = {}
+        # TIR rewraps the same Vars repeatedly while unrolling calls.  Looking
+        # up their names crosses the FFI boundary, so cache by TVM handle.
+        self.var_name_cache: dict[int, str] = {}
         self.task_counter = 0
         self.predicate_counter = 0
         self.kernel_name = "main"
@@ -5159,15 +5158,20 @@ class _TirBridge:
     def _var_name(self, value: Any) -> str:
         if isinstance(value, str):
             return value
-        identity = id(value)
+        # TVM recreates Python wrappers while traversing one immutable TIR
+        # object graph, so ``id(value)`` misses for the same underlying Var.
+        # ObjectRef.handle is a cheap ctypes pointer; unlike ``name`` it does
+        # not cross TVM's packed-function FFI boundary.  The PrimFunc retains
+        # its nodes for this bridge build, making the handle a stable cache
+        # identity.
+        handle = getattr(value, "handle", None)
+        handle_value = getattr(handle, "value", None)
+        identity = handle_value if isinstance(handle_value, int) else id(value)
         cached = self.var_name_cache.get(identity)
-        if cached is not None and cached[0] is value:
-            return cached[1]
-        name = str(getattr(value, "name", getattr(value, "name_hint", value)))
-        # Retain the object as well as its id: transient TVM Python wrappers
-        # can otherwise be collected and let Python reuse an id for a
-        # different Var during this build.
-        self.var_name_cache[identity] = (value, name)
+        if cached is not None:
+            return cached
+        name = str(getattr(value, "name", value))
+        self.var_name_cache[identity] = name
         return name
 
 
