@@ -10,6 +10,7 @@ the scheduling API.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from bisect import bisect_left
 import warnings
 from types import MappingProxyType
 from collections import defaultdict, deque
@@ -106,6 +107,22 @@ def validate_memory_synchronization(
         tasks = core.tasks
         index_by_id = {task.task_id: index for index, task in enumerate(tasks)}
         task_by_id = {task.task_id: task for task in tasks}
+        # This validator used to slice and scan every instruction between a
+        # producer/consumer pair.  Large sync-only kernels have many inferred
+        # memory edges but comparatively few synchronization instructions, so
+        # index only those events.  The local flag state-machine below remains
+        # identical; it simply receives the relevant event subrange.
+        barrier_indices = tuple(
+            index
+            for index, task in enumerate(tasks)
+            if _is_full_barrier(task)
+        )
+        local_events = tuple(
+            (index, task)
+            for index, task in enumerate(tasks)
+            if _is_local_flag_event(task)
+        )
+        local_event_indices = tuple(index for index, _ in local_events)
         for consumer_index, consumer in enumerate(tasks):
             dependencies = consumer.metadata.get(dependency_key, ())
             if not isinstance(dependencies, (tuple, list)):
@@ -121,9 +138,15 @@ def validate_memory_synchronization(
                 producer_index = index_by_id[producer.task_id]
                 if producer_index >= consumer_index:
                     continue
-                between = tasks[producer_index + 1 : consumer_index]
-                if _has_full_barrier(between) or _has_local_flag_fence(
-                    between, producer, consumer
+                if _has_full_barrier_between(
+                    barrier_indices, producer_index + 1, consumer_index
+                ) or _has_local_flag_fence_between(
+                    local_events,
+                    local_event_indices,
+                    producer_index + 1,
+                    consumer_index,
+                    producer,
+                    consumer,
                 ):
                     continue
                 buffer_name = _shared_buffer_name(producer, consumer)
@@ -192,6 +215,58 @@ def _has_full_barrier(tasks: tuple[Task, ...]) -> bool:
             if target.startswith("pipe_"):
                 target = target[5:]
             if target == "all":
+                return True
+    return False
+
+
+def _is_full_barrier(task: Task) -> bool:
+    """Whether one task establishes full pipe visibility."""
+    return _has_full_barrier((task,))
+
+
+def _is_local_flag_event(task: Task) -> bool:
+    operation = task.operation.strip().lower()
+    return operation in FlagBarrierSynchronizationModel._SET_LOCAL or operation in FlagBarrierSynchronizationModel._WAIT_LOCAL
+
+
+def _has_full_barrier_between(indices: tuple[int, ...], start: int, stop: int) -> bool:
+    """Return whether a full barrier lies in the half-open task interval."""
+    position = bisect_left(indices, start)
+    return position < len(indices) and indices[position] < stop
+
+
+def _has_local_flag_fence_between(
+    events: tuple[tuple[int, Task], ...],
+    event_indices: tuple[int, ...],
+    start: int,
+    stop: int,
+    producer: Task,
+    consumer: Task,
+) -> bool:
+    """Run the existing flag reachability logic over indexed interval events."""
+    first = bisect_left(event_indices, start)
+    last = bisect_left(event_indices, stop)
+    reachable = {producer.pipe.value}
+    pending: dict[tuple[object, ...], bool] = {}
+    for position in range(first, last):
+        task = events[position][1]
+        if task.core_id != consumer.core_id or task.lane != consumer.lane:
+            continue
+        operation = task.operation.strip().lower()
+        source_pipe = str(task.metadata.get("src_pipe", "")).lower()
+        destination_pipe = str(task.metadata.get("dst_pipe", "")).lower()
+        if source_pipe.startswith("pipe_"):
+            source_pipe = source_pipe[5:]
+        if destination_pipe.startswith("pipe_"):
+            destination_pipe = destination_pipe[5:]
+        signature = (source_pipe, destination_pipe, task.metadata.get("flag_id"))
+        if operation in FlagBarrierSynchronizationModel._SET_LOCAL:
+            pending[signature] = source_pipe in reachable
+        elif operation in FlagBarrierSynchronizationModel._WAIT_LOCAL and signature in pending:
+            source_was_reachable = pending.pop(signature)
+            if source_was_reachable:
+                reachable.add(destination_pipe)
+            if consumer.pipe.value in reachable:
                 return True
     return False
 
