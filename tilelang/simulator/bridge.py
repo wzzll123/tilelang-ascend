@@ -352,6 +352,13 @@ class _TirBridge:
         # small bounded cache, which keeps aliases that become active midway
         # through a program semantically exact.
         self.region_overlap_cache: dict[tuple[BufferRegion, BufferRegion, int], bool] = {}
+        # Candidate buckets depend on a region's allocation, not its slice.
+        # Reusing that selection avoids repeatedly resolving every historical
+        # buffer alias for the many tiled views of one allocation.
+        self.memory_history_candidate_key_cache: dict[
+            tuple[int, Lane, MemoryScope, int, str, bool],
+            tuple[tuple[Lane, MemoryScope, int, str], ...],
+        ] = {}
         # TIR reuses the same Var objects across many unrolled calls.  Looking
         # up ``name``/``name_hint`` on a TVM object crosses the FFI boundary,
         # so cache it by Python object identity for this bridge build.
@@ -703,6 +710,7 @@ class _TirBridge:
                 owner = destination.core_id
                 self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
                 self.region_overlap_cache.clear()
+                self.memory_history_candidate_key_cache.clear()
 
     def _emit_gemm_v0_trace_tasks(self, _operation: str, context: _Context, metadata: Mapping[str, Any]) -> None:
         details = metadata["gemm"]
@@ -4643,13 +4651,29 @@ class _TirBridge:
                             for entry in entries
                             if not self._regions_overlap(region, entry[0], core_id)
                         ]
-            self.last_writes[self._memory_history_key(region, lane, core_id)].append(
-                (region, task.task_id, lane, core_id)
+            self._append_memory_history(
+                self.last_writes, region, task.task_id, lane, core_id
             )
         for region in reads:
-            self.last_reads[self._memory_history_key(region, lane, core_id)].append(
-                (region, task.task_id, lane, core_id)
+            self._append_memory_history(
+                self.last_reads, region, task.task_id, lane, core_id
             )
+
+    def _append_memory_history(
+        self,
+        history: dict[
+            tuple[Lane, MemoryScope, int, str], list[tuple[BufferRegion, str, Lane, int]]
+        ],
+        region: BufferRegion,
+        task_id: str,
+        lane: Lane,
+        core_id: int,
+    ) -> None:
+        key = self._memory_history_key(region, lane, core_id)
+        if key not in history:
+            # A new allocation bucket can be a valid future alias candidate.
+            self.memory_history_candidate_key_cache.clear()
+        history[key].append((region, task_id, lane, core_id))
 
     def _memory_history_key(
         self, region: BufferRegion, lane: Lane, core_id: int
@@ -4688,17 +4712,43 @@ class _TirBridge:
         *,
         include_cross_core: bool,
     ) -> tuple[tuple[BufferRegion, str, Lane, int], ...]:
-        owner = region.core_id if region.core_id is not None else core_id
-        cross_core = include_cross_core and region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+        keys = self._memory_history_candidate_keys(
+            history, region, lane, core_id, include_cross_core=include_cross_core
+        )
         return tuple(
             entry
-            for key, entries in history.items()
-            if key[0] is lane
-            and key[1] is region.scope
-            and (cross_core or key[2] == owner)
-            and self._memory_history_key_may_overlap(region, key, core_id)
+            for key in keys
+            for entries in (history[key],)
             for entry in entries
         )
+
+    def _memory_history_candidate_keys(
+        self,
+        history: Mapping[
+            tuple[Lane, MemoryScope, int, str], list[tuple[BufferRegion, str, Lane, int]]
+        ],
+        region: BufferRegion,
+        lane: Lane,
+        core_id: int,
+        *,
+        include_cross_core: bool,
+    ) -> tuple[tuple[Lane, MemoryScope, int, str], ...]:
+        owner = region.core_id if region.core_id is not None else core_id
+        cross_core = include_cross_core and region.scope in {MemoryScope.GM, MemoryScope.WORKSPACE}
+        key = (id(history), lane, region.scope, owner, region.buffer, cross_core)
+        cached = self.memory_history_candidate_key_cache.get(key)
+        if cached is not None:
+            return cached
+        candidates = tuple(
+            previous_key
+            for previous_key in history
+            if previous_key[0] is lane
+            and previous_key[1] is region.scope
+            and (cross_core or previous_key[2] == owner)
+            and self._memory_history_key_may_overlap(region, previous_key, core_id)
+        )
+        self.memory_history_candidate_key_cache[key] = candidates
+        return candidates
 
     def _memory_history_key_may_overlap(
         self,
