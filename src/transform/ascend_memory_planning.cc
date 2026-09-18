@@ -887,6 +887,11 @@ private:
           }
         }
 
+        // No reusable free block remains.  Continuing below would dereference
+        // free_blocks[-1] for an over-capacity allocation.
+        if (free_blocks.empty()) {
+          return -1;
+        }
         auto &last_block = free_blocks[free_blocks.size() - 1];
         if ((last_block.first + last_block.second) == next_new_offset_) {
           next_new_offset_ = memory_limit_;
