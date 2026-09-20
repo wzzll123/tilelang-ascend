@@ -443,6 +443,67 @@ def test_cross_flag_fans_out_to_both_vector_lanes_and_joins_before_cube() -> Non
     assert records["cube-consumer"].start_cycle >= records["cube-wait"].end_cycle
 
 
+def test_pto_cross_slot_ready_consume_free_reuse_round_trip() -> None:
+    """Match PTO ``TSync_Custom``'s two-id C2V slot protocol.
+
+    ``flag_id`` carries the Cube/FIX producer's ready signal; ``flag_id + 1``
+    is emitted by the Vector-side MTE2 free path before Cube can reuse the
+    slot.  The explicit V -> MTE2 hand-off prevents the test from accidentally
+    treating a cross flag as a substitute for a local pipe event.
+    """
+    tasks = [
+        Task("cube-produce", "copy", 0, Lane.CUBE, Pipe.FIX, 3),
+        Task(
+            "cube-ready", "set_cross_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
+            metadata={"flag_id": 10, "src_pipe": "fix", "mode": 2},
+        ),
+    ]
+    for lane_index, lane in enumerate((Lane.VECTOR_0, Lane.VECTOR_1)):
+        prefix = f"v{lane_index}"
+        tasks.extend((
+            Task(
+                f"{prefix}-ready-wait", "wait_cross_flag", 0, lane,
+                Pipe.SCALAR, 1, metadata={"flag_id": 10},
+            ),
+            Task(f"{prefix}-consume", "add", 0, lane, Pipe.VECTOR, 4 + lane_index),
+            Task(
+                f"{prefix}-to-mte2-set", "set_flag", 0, lane, Pipe.VECTOR, 1,
+                metadata={"src_pipe": "v", "dst_pipe": "mte2", "flag_id": 0},
+            ),
+            Task(
+                f"{prefix}-to-mte2-wait", "wait_flag", 0, lane, Pipe.MTE2, 1,
+                metadata={"src_pipe": "v", "dst_pipe": "mte2", "flag_id": 0},
+            ),
+            Task(
+                f"{prefix}-free", "set_cross_flag", 0, lane, Pipe.MTE2, 1,
+                metadata={"flag_id": 11, "src_pipe": "mte2", "mode": 2},
+            ),
+        ))
+    tasks.extend((
+        Task(
+            "cube-free-wait", "wait_cross_flag", 0, Lane.CUBE, Pipe.SCALAR, 1,
+            metadata={"flag_id": 11},
+        ),
+        Task("cube-reuse", "copy", 0, Lane.CUBE, Pipe.FIX, 2),
+    ))
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_program(*tasks)).records
+    }
+
+    for lane_index in range(2):
+        prefix = f"v{lane_index}"
+        assert records[f"{prefix}-ready-wait"].start_cycle == records["cube-ready"].end_cycle
+        assert records[f"{prefix}-consume"].start_cycle >= records[f"{prefix}-ready-wait"].end_cycle
+        assert records[f"{prefix}-free"].start_cycle >= records[f"{prefix}-consume"].end_cycle
+    assert records["cube-reuse"].start_cycle >= max(
+        records["v0-free"].end_cycle, records["v1-free"].end_cycle
+    )
+
+
 def test_cross_flag_keeps_direction_and_vector_lane_credits_independent() -> None:
     tasks = (
         Task(
