@@ -4,6 +4,7 @@ import pytest
 
 import tilelang
 from tilelang import language as T
+from tilelang.intrinsics import make_zn_layout
 
 
 _PASS_CONFIGS = {
@@ -74,3 +75,56 @@ def test_hand_sync_pto_ub_pipeline_fences_are_accepted():
 def test_hand_sync_pipe_all_fences_pto_mte2_to_vector_edge():
     """PIPE_ALL is a valid, deliberately broad substitute for the event."""
     _compile(mte2_to_v=False, mte2_to_v_pipe_all=True, v_to_mte3=True)
+
+
+def _cube_kernel(*, mte1_to_m: bool):
+    """Minimal PTO-style L1 -> L0A/B -> M -> FIX pipeline."""
+    @T.prim_func
+    def main(
+        left: T.Tensor([16, 32], "float16"),
+        right: T.Tensor([32, 16], "float16"),
+        output: T.Tensor([16, 16], "float32"),
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            a_l1 = T.alloc_L1([16, 32], "float16")
+            b_l1 = T.alloc_L1([32, 16], "float16")
+            T.annotate_layout({
+                a_l1: make_zn_layout(a_l1),
+                b_l1: make_zn_layout(b_l1),
+            })
+            a_l0 = T.alloc_L0A([16, 32], "float16")
+            b_l0 = T.alloc_L0B([32, 16], "float16")
+            acc = T.alloc_L0C([16, 16], "float32")
+            with T.Scope("C"):
+                T.copy(left, a_l1)
+                T.copy(right, b_l1)
+                T.set_flag("mte2", "mte1", 0)
+                T.wait_flag("mte2", "mte1", 0)
+                T.copy(a_l1, a_l0)
+                T.copy(b_l1, b_l0)
+                if mte1_to_m:
+                    T.set_flag("mte1", "m", 0)
+                    T.wait_flag("mte1", "m", 0)
+                T.mma(a_l0, b_l0, acc, init=True)
+                T.set_flag("m", "fix", 0)
+                T.wait_flag("m", "fix", 0)
+                T.copy(acc, output)
+    return main
+
+
+def _compile_cube(*, mte1_to_m: bool):
+    return tilelang.compile(
+        _cube_kernel(mte1_to_m=mte1_to_m),
+        out_idx=[2], pass_configs=_PASS_CONFIGS,
+        target="ascendc", simulator=True, platform="A2",
+        sim_config={"hazard_check": "error", "sync_only": True},
+    )
+
+
+def test_hand_sync_pto_cube_pipeline_requires_l1_to_m_fence():
+    with pytest.raises(Exception, match="synchronization|hazard|fence"):
+        _compile_cube(mte1_to_m=False)
+
+
+def test_hand_sync_pto_cube_pipeline_fence_is_accepted():
+    _compile_cube(mte1_to_m=True)
