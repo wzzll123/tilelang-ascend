@@ -294,11 +294,13 @@ def create_simulator_adapter(
         workspace_idx=workspace_idx,
         config=config,
         program=program,
-        validate_sync=(
-            "memory_dependencies"
-            if pass_configs.get("tl.ascend_auto_sync", False)
-            else "alias_memory_dependencies"
-        ),
+        # Memory dependencies cover both ordinary same-buffer hazards (for
+        # example MTE2 -> V in UB) and physical aliases.  Selecting only the
+        # alias subset for hand-synchronized kernels silently skips the former,
+        # exactly where the simulator is expected to reject a missing fence.
+        # They remain diagnostic metadata; scheduler execution ordering is
+        # deliberately handled separately from this static validation.
+        validate_sync="memory_dependencies",
     )
 
 
