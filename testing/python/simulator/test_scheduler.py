@@ -304,6 +304,42 @@ def test_sync_all_aic_releases_each_core_after_every_core_arrives() -> None:
     assert records["c0-after"].metadata["sync_producers"] == ("c0-sync", "c1-sync")
 
 
+def test_pto_sync_all_drains_every_calling_cube_pipe_before_rendezvous() -> None:
+    """A2/A3 hard SYNCALL starts with PTO's ``pipe_barrier(PIPE_ALL)``.
+
+    This is intentionally distinct from the cross-core rendezvous: core 0
+    must first drain both its MTE2 and Matrix work, while the post-SYNCALL
+    operation on core 1 cannot start until that slowest local drain arrives.
+    """
+    core0 = CoreProgram(
+        0,
+        (
+            Task("c0-load", "copy", 0, Lane.CUBE, Pipe.MTE2, 4),
+            Task("c0-mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 9),
+            Task("c0-sync", "sync_all", 0, Lane.CUBE, Pipe.SCALAR, 1),
+        ),
+    )
+    core1 = CoreProgram(
+        1,
+        (
+            Task("c1-mma", "mma", 1, Lane.CUBE, Pipe.MATRIX, 5),
+            Task("c1-sync", "sync_all", 1, Lane.CUBE, Pipe.SCALAR, 1),
+            Task("c1-after", "mma", 1, Lane.CUBE, Pipe.MATRIX, 1),
+        ),
+    )
+
+    records = {
+        record.task_id: record
+        for record in DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_multi_core_program(core0, core1)).records
+    }
+
+    assert records["c0-sync"].start_cycle == records["c0-mma"].end_cycle == 9
+    assert records["c1-sync"].start_cycle == records["c1-mma"].end_cycle == 5
+    assert records["c1-after"].start_cycle == records["c0-sync"].end_cycle
+
+
 def test_sync_all_missing_aic_participant_reports_deadlock() -> None:
     core0 = CoreProgram(
         0,
