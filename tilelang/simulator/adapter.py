@@ -117,8 +117,8 @@ class SimulatorKernelAdapter:
                 result.records,
                 local_memory_timeline=timeline,
             )
-        self.last_report = PerformanceReport.from_stats(
-            result.stats, self.config, trace_path=self.last_trace
+        self.last_report = PerformanceReport.from_schedule(
+            result, self.config, trace_path=self.last_trace
         )
 
     def performance_report(self) -> PerformanceReport:

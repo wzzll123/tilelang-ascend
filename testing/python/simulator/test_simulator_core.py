@@ -290,6 +290,24 @@ def test_performance_report_is_compact_and_marks_pto_timing_unmeasured(
     assert json.loads(path.read_text(encoding="utf-8")) == document
 
 
+def test_performance_report_extracts_only_actual_scheduler_critical_edges() -> None:
+    load = Task("load", "copy", 0, Lane.CUBE, Pipe.MTE2, 5)
+    independent = Task("independent", "copy", 0, Lane.CUBE, Pipe.MTE1, 11)
+    mma = Task("mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 7, dependencies=("load",))
+    program = KernelProgram("critical-chain", "A2", (CoreProgram(0, (load, independent, mma)),))
+    result = DiscreteEventScheduler().run(program)
+
+    report = PerformanceReport.from_schedule(result, SimulatorConfig(platform="A2"))
+    critical = report.to_dict()["critical_path"]
+
+    assert critical["status"] == "schedule-derived"
+    assert critical["terminal_task_id"] == "mma"
+    assert critical["span_cycles"] == 12
+    assert critical["operation_cycles"] == 12
+    assert [step["task_id"] for step in critical["steps"]] == ["load", "mma"]
+    assert critical["steps"][0]["to_successor"] == "explicit"
+
+
 def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:
     dynamic = AffineInt.variable("count")
     records = (

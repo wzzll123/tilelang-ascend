@@ -111,6 +111,35 @@ class DiscreteEventScheduler:
                 synchronization_cycle = decision.ready_cycle or 0
                 ready_cycle = max(dependency_cycle, synchronization_cycle)
                 start_cycle = max(ready_cycle, resource_cycle)
+
+                # Preserve the *actual* scheduling edges for reports and traces.
+                # In particular, do not include inferred memory dependencies here:
+                # those are diagnostics, not hardware ordering.  A later report can
+                # therefore show a schedule-derived critical chain without turning a
+                # static hazard hint into invented execution causality.
+                schedule_predecessors: dict[str, tuple[str, ...]] = {}
+                if dependency_required:
+                    schedule_predecessors["explicit"] = tuple(dependency_required)
+                if predecessor is not None:
+                    schedule_predecessors["fifo"] = (predecessor,)
+                if decision.producer_task_ids:
+                    schedule_predecessors["synchronization"] = tuple(
+                        str(task_id) for task_id in decision.producer_task_ids
+                    )
+                critical_predecessors: dict[str, tuple[str, ...]] = {}
+                if start_cycle:
+                    if dependency_cycle == start_cycle and dependency_required:
+                        critical_predecessors["explicit"] = tuple(
+                            task_id
+                            for task_id in dependency_required
+                            if completed[task_id].end_cycle == dependency_cycle
+                        )
+                    if resource_cycle == start_cycle and predecessor is not None:
+                        critical_predecessors["fifo"] = (predecessor,)
+                    if synchronization_cycle == start_cycle and decision.producer_task_ids:
+                        critical_predecessors["synchronization"] = tuple(
+                            str(task_id) for task_id in decision.producer_task_ids
+                        )
                 if synchronization_cycle > max(dependency_cycle, resource_cycle):
                     records.append(
                         ExecutionRecord(
@@ -138,6 +167,10 @@ class DiscreteEventScheduler:
                 trace_metadata = {}
                 if decision.producer_task_ids:
                     trace_metadata["sync_producers"] = decision.producer_task_ids
+                if schedule_predecessors:
+                    trace_metadata["schedule_predecessors"] = schedule_predecessors
+                if critical_predecessors:
+                    trace_metadata["critical_predecessors"] = critical_predecessors
                 if start_cycle > ready_cycle:
                     trace_metadata["queue_enter_cycle"] = ready_cycle
                 record = ExecutionRecord.from_task(

@@ -7,10 +7,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .config import SimulatorConfig
 from .stats import SimulationStats
+from .trace import ExecutionRecord
+
+if TYPE_CHECKING:
+    from .scheduler import ScheduleResult
 
 
 REPORT_SCHEMA_VERSION = "1.0"
@@ -31,6 +35,7 @@ class PerformanceReport:
     sync_only: bool
     trace_path: str | None
     stats: SimulationStats
+    critical_path: Mapping[str, Any]
 
     @classmethod
     def from_stats(
@@ -47,7 +52,108 @@ class PerformanceReport:
             sync_only=config.sync_only,
             trace_path=None if trace_path is None else str(trace_path),
             stats=stats,
+            critical_path={
+                "status": "unavailable",
+                "reason": "a schedule result is required for critical-chain extraction",
+            },
         )
+
+    @classmethod
+    def from_schedule(
+        cls,
+        result: "ScheduleResult",
+        config: SimulatorConfig,
+        *,
+        trace_path: Path | None = None,
+    ) -> "PerformanceReport":
+        """Build a report with a critical chain from actual scheduler edges.
+
+        This is deliberately a simulator-schedule chain, not a claim about a
+        hardware microarchitectural critical path.  It contains only explicit
+        execution dependencies, same-resource FIFO order, and matched flag or
+        barrier producers recorded by the synchronization model.
+        """
+        return cls(
+            platform=config.platform,
+            calibration=config.timing_profile.calibration,
+            timing_estimator=config.timing_profile.estimator,
+            sync_only=config.sync_only,
+            trace_path=None if trace_path is None else str(trace_path),
+            stats=result.stats,
+            critical_path=cls._critical_chain(result.records),
+        )
+
+    @staticmethod
+    def _critical_chain(records: tuple[ExecutionRecord, ...]) -> dict[str, Any]:
+        operations = {
+            record.task_id: record
+            for record in records
+            if record.category == "operation"
+        }
+        if not operations:
+            return {
+                "status": "unavailable",
+                "reason": "schedule contains no operation records",
+            }
+
+        current = max(
+            operations.values(),
+            key=lambda record: (record.end_cycle, record.start_cycle, record.task_id),
+        )
+        reverse_chain: list[tuple[ExecutionRecord, str | None]] = [(current, None)]
+        visited = {current.task_id}
+        while True:
+            raw_predecessors = current.metadata.get("critical_predecessors", {})
+            if not isinstance(raw_predecessors, Mapping):
+                break
+            candidates: list[tuple[int, str, str, ExecutionRecord]] = []
+            for kind, task_ids in raw_predecessors.items():
+                if not isinstance(task_ids, (tuple, list)):
+                    continue
+                for task_id in task_ids:
+                    predecessor = operations.get(str(task_id))
+                    if (
+                        predecessor is not None
+                        and predecessor.task_id not in visited
+                        and predecessor.end_cycle <= current.start_cycle
+                    ):
+                        candidates.append(
+                            (predecessor.end_cycle, str(kind), predecessor.task_id, predecessor)
+                        )
+            if not candidates:
+                break
+            _, kind, _, predecessor = max(candidates)
+            reverse_chain.append((predecessor, kind))
+            visited.add(predecessor.task_id)
+            current = predecessor
+
+        chain = list(reversed(reverse_chain))
+        steps = []
+        for index, (record, relationship_to_successor) in enumerate(chain):
+            steps.append(
+                {
+                    "task_id": record.task_id,
+                    "operation": record.operation,
+                    "resource": f"core-{record.core_id}/{record.resource}",
+                    "start_cycle": record.start_cycle,
+                    "end_cycle": record.end_cycle,
+                    "duration_cycles": record.duration_cycles,
+                    "to_successor": relationship_to_successor if index + 1 < len(chain) else None,
+                }
+            )
+        first = chain[0][0]
+        terminal = chain[-1][0]
+        return {
+            "status": "schedule-derived",
+            "scope": (
+                "explicit execution dependencies, same-resource FIFO order, and "
+                "matched synchronization producers only; not a hardware timing proof"
+            ),
+            "terminal_task_id": terminal.task_id,
+            "span_cycles": terminal.end_cycle - first.start_cycle,
+            "operation_cycles": sum(record.duration_cycles for record, _ in chain),
+            "steps": steps,
+        }
 
     def to_dict(self) -> dict[str, Any]:
         """Return a versioned JSON-ready report without trace-sized payloads."""
@@ -86,10 +192,7 @@ class PerformanceReport:
                 {"reason": reason, "cycles": waits[reason]}
                 for reason in major_stalls
             ],
-            "critical_path": {
-                "status": "unavailable",
-                "reason": "critical-path extraction is not implemented",
-            },
+            "critical_path": dict(self.critical_path),
             "trace_path": self.trace_path,
         }
 
