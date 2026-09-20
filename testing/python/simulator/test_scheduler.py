@@ -496,9 +496,18 @@ def test_pto_cross_slot_ready_consume_free_reuse_round_trip() -> None:
 
     for lane_index in range(2):
         prefix = f"v{lane_index}"
-        assert records[f"{prefix}-ready-wait"].start_cycle == records["cube-ready"].end_cycle
-        assert records[f"{prefix}-consume"].start_cycle >= records[f"{prefix}-ready-wait"].end_cycle
-        assert records[f"{prefix}-free"].start_cycle >= records[f"{prefix}-consume"].end_cycle
+        assert (
+            records[f"{prefix}-ready-wait"].start_cycle
+            == records["cube-ready"].end_cycle
+        )
+        assert (
+            records[f"{prefix}-consume"].start_cycle
+            >= records[f"{prefix}-ready-wait"].end_cycle
+        )
+        assert (
+            records[f"{prefix}-free"].start_cycle
+            >= records[f"{prefix}-consume"].end_cycle
+        )
     assert records["cube-reuse"].start_cycle >= max(
         records["v0-free"].end_cycle, records["v1-free"].end_cycle
     )
