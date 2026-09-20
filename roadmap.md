@@ -770,8 +770,11 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 3. 后续 `PerformanceReport`：关键路径、top-N stall/idle interval、copy/compute overlap、
    PTO formula/fallback 命中率与 calibration/provenance，提供稳定 JSON 和简短文本摘要。
 
-- [ ] 实现 `PerformanceReport`（JSON + human-readable summary），从 `last_stats` 和
-  schedule records 提取关键路径、top-N wait/stall 与瓶颈 pipe。
+- [x] ~~实现基础 `PerformanceReport`（JSON + human-readable summary）：从 `last_stats`
+  输出 makespan、task count、top utilization resource、top wait/stall、memory/hazard
+  摘要、trace path 与 timing calibration；明确 PTO fallback 不是实测 latency。~~
+- [ ] 为 `PerformanceReport` 从 schedule records 提取关键路径、top-N idle interval、
+  copy/compute overlap 与瓶颈 pipe 归因。
 - [ ] 为 trace comparison 实现两个 schedule 的 makespan、critical path、utilization、wait
   和 overlap 差异报告，供 compiler/pass 回归与大模型分析。
 - [ ] 给 simulator examples 增加 `--report`，写出大模型上下文友好的摘要 JSON；trace 仍为

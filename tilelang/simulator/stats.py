@@ -190,7 +190,12 @@ class SimulationStats:
             "busy_cycles_by_resource": dict(self.busy_cycles_by_resource),
             "utilization_by_resource": dict(self.utilization_by_resource),
             "wait_cycles_by_reason": dict(self.wait_cycles_by_reason),
-            "completion_cycle_by_core": dict(self.completion_cycle_by_core),
+            # JSON object keys are strings.  Convert explicitly so callers see
+            # the same document before and after ``json.dumps``/``json.loads``.
+            "completion_cycle_by_core": {
+                str(core_id): cycle
+                for core_id, cycle in self.completion_cycle_by_core.items()
+            },
             "operation_counts": dict(self.operation_counts),
             "memory_bytes_by_path": dict(self.memory_bytes_by_path),
             "hazard_counts": dict(self.hazard_counts),

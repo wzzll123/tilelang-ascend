@@ -444,6 +444,12 @@ class JITKernel:
             raise ValueError("schedule_simulator is only available for simulator kernels")
         return self.adapter.schedule()
 
+    def get_simulator_report(self):
+        """Return the compact report from the most recent simulator schedule."""
+        if not self.simulator:
+            raise ValueError("get_simulator_report is only available for simulator kernels")
+        return self.adapter.performance_report()
+
     def get_host_source(self) -> str:
         """
         Returns the source code of the host function.

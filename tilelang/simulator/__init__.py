@@ -38,6 +38,7 @@ from .profile import (
     get_device_profile,
     pto_fallback_timing_profile,
 )
+from .report import PerformanceReport
 from .program import (
     AffineInt,
     BufferRegion,
@@ -87,6 +88,7 @@ __all__ = [
     "MemoryView",
     "NoOpSynchronizationModel",
     "Pipe",
+    "PerformanceReport",
     "ProgramValidationError",
     "ScheduleResult",
     "SchedulerError",

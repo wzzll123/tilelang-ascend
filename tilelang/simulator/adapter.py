@@ -16,6 +16,7 @@ from .config import SimulatorConfig
 from .errors import ProgramValidationError, SimulatorConfigError, UnsupportedSimOpError
 from .executor import FunctionalExecutionResult, FunctionalSimulator
 from .program import BufferRegion, BufferSpec, MemoryScope
+from .report import PerformanceReport
 from .scheduler import DiscreteEventScheduler, ScheduleResult
 from .sync import FlagBarrierSynchronizationModel, validate_memory_synchronization
 from .trace import ChromeTraceExporter
@@ -46,6 +47,7 @@ class SimulatorKernelAdapter:
         self.last_schedule: ScheduleResult | None = None
         self.last_stats = None
         self.last_trace: Path | None = None
+        self.last_report: PerformanceReport | None = None
         self.last_execution: FunctionalExecutionResult | None = None
         self._parameter_names = self._extract_parameter_names()
         self._buffer_specs = {buffer.name: buffer for buffer in self.program.buffers}
@@ -115,6 +117,17 @@ class SimulatorKernelAdapter:
                 result.records,
                 local_memory_timeline=timeline,
             )
+        self.last_report = PerformanceReport.from_stats(
+            result.stats, self.config, trace_path=self.last_trace
+        )
+
+    def performance_report(self) -> PerformanceReport:
+        """Return the most recent compact simulator performance report."""
+        if self.last_report is None:
+            raise SimulatorConfigError(
+                "no simulator schedule is available; call schedule() first"
+            )
+        return self.last_report
 
     def get_kernel_source(self) -> str:
         """Return the authoritative final pre-codegen TIR script."""

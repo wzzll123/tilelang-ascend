@@ -21,6 +21,7 @@ from tilelang.simulator import (
     Lane,
     MemoryScope,
     Pipe,
+    PerformanceReport,
     ProgramValidationError,
     SimulationStats,
     SimulatorConfig,
@@ -256,6 +257,37 @@ def test_empty_stats_are_well_defined() -> None:
     assert stats.to_dict()["hazard_counts"] == {}
     assert stats.to_dict()["peak_local_memory_bytes_by_scope"] == {}
     assert stats.to_dict()["load_imbalance_cycles"] == 0
+
+
+def test_performance_report_is_compact_and_marks_pto_timing_unmeasured(
+    tmp_path: Path,
+) -> None:
+    records = (
+        ExecutionRecord("load", "copy", 0, Lane.CUBE, Pipe.MTE2, 0, 8),
+        ExecutionRecord("mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 8, 20),
+        ExecutionRecord(
+            "wait", "wait", 0, Lane.CUBE, Pipe.SCALAR, 4, 8,
+            category="wait", stall_reason="local flag",
+        ),
+    )
+    report = PerformanceReport.from_stats(
+        SimulationStats.from_records(records),
+        SimulatorConfig(platform="A2", sync_only=True),
+        trace_path=tmp_path / "schedule.json",
+    )
+
+    document = report.to_dict()
+    assert document["schema_version"] == "1.0"
+    assert document["simulation_mode"] == "sync_only"
+    assert document["timing"]["measured"] is False
+    assert document["schedule"]["makespan_cycles"] == 20
+    assert document["top_resources"][0]["resource"] == "core-0/cube/m"
+    assert document["major_stalls"] == [{"reason": "local flag", "cycles": 4}]
+    assert document["critical_path"]["status"] == "unavailable"
+    assert "not measured hardware latency" in report.to_text()
+
+    path = report.write_json(tmp_path / "report.json")
+    assert json.loads(path.read_text(encoding="utf-8")) == document
 
 
 def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:

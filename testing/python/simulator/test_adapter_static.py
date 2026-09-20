@@ -51,6 +51,8 @@ def test_static_adapter_schedules_and_exports_trace(tmp_path: Path) -> None:
 
     assert result.stats.makespan_cycles == 9
     assert adapter.last_stats is result.stats
+    assert adapter.performance_report().stats is result.stats
+    assert adapter.last_report is adapter.performance_report()
     assert adapter.last_trace == (tmp_path / "trace.json").resolve()
     assert adapter.get_kernel_source() == "optimized tir"
     assert adapter.get_simulator_ir() is program
