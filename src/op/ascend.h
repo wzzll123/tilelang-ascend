@@ -276,6 +276,12 @@ TVM_DLL const Op &ascend_datacachecleanandinvalid_experiment();
 
 TVM_DLL const Op &ascend_brcb_experiment();
 
+TVM_DLL const Op &ascend_softmaxflash_update_experiment();
+
+TVM_DLL const Op &ascend_reduce_fold_max_experiment();
+
+TVM_DLL const Op &ascend_reduce_fold_sum_experiment();
+
 TVM_DLL const Op &ascend_row_expand_mul_experiment();
 
 TVM_DLL const Op &ascend_row_expand_sub_experiment();

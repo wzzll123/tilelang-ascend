@@ -741,6 +741,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
     CreateDatacacheExperimentCodegen(op);
   } else if (op->op.same_as(tl::ascend_brcb_experiment())) {
     BrcbExperimentCodegen(op);
+  } else if (op->op.same_as(tl::ascend_softmaxflash_update_experiment())) {
+    SoftmaxFlashUpdateExperimentCodegen(op);
+  } else if (op->op.same_as(tl::ascend_reduce_fold_max_experiment()) ||
+             op->op.same_as(tl::ascend_reduce_fold_sum_experiment())) {
+    ReduceFoldExperimentCodegen(op);
   } else if (op->op.same_as(builtin::if_then_else())) {
     IfThenElseCodegen(op, os);
   } else {
@@ -3388,6 +3393,24 @@ void CodeGenTileLangAscend::BrcbExperimentCodegen(const CallNode *op) {
   std::string op_name =
       "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
   PrintOpCall(op, op_name, {1, 3}, {3, 6});
+}
+
+// args = [name, dst, sum_out, max_out, src, expmax_out, in_sum, in_max, tmp]
+// —— 8 个 buffer 指针（ROWS/COLS/TMP_BYTES 已编译期化进 name 模板串，
+// s27 诊断实验）。
+void CodeGenTileLangAscend::SoftmaxFlashUpdateExperimentCodegen(
+    const CallNode *op) {
+  std::string op_name =
+      "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
+  PrintOpCall(op, op_name, {1, 9}, {9, 9});
+}
+
+// args = [name, dst, src, fold_tmp, br_tmp, rows, cols]
+// —— 4 个 buffer 指针 + 2 个标量（s28a fold+BlockReduce 行归约）。
+void CodeGenTileLangAscend::ReduceFoldExperimentCodegen(const CallNode *op) {
+  std::string op_name =
+      "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
+  PrintOpCall(op, op_name, {1, 5}, {5, 7});
 }
 
 } // namespace codegen

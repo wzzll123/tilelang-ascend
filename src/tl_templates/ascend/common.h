@@ -8,6 +8,11 @@
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/layout/layout.hpp"
 
+// 厂商融合 softmax（诊断实验专用——s27 vec 侧 A/B 定价，交付 kernel 仍禁高阶
+// API，见 no-high-level-api 纪律；本 helper 仅供 ascend_softmaxflash_update_
+// experiment 内建调用）。
+#include "adv_api/activation/softmaxflashv2.h"
+
 #if defined(__has_include)
 #if __has_include("version/cann_version.h")
 #include "version/cann_version.h"
@@ -1732,6 +1737,82 @@ div_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
                                      dstRepStride, src0RepStride,
                                      src1RepStride);
   AscendC::Div<T, false>(dst, src0, src1, mask, repeatTime, params);
+}
+
+// Fused online-softmax update via vendor SoftmaxFlashV2 (fp32, isUpdate,
+// WITHOUT_BRC) —— s27 诊断实验专用。语义（对齐 FIA 调用形态）：
+//   m_new = max(in_max, rowmax(src)); expmax_out = exp(in_max - m_new);
+//   max_out = m_new; dst = exp(src - m_new)（in-place，isReuseSource=true）;
+//   sum_out = expmax_out * in_sum + rowsum(dst)。
+// in_max/expmax_out 允许同槽（API 内部先读后写）；sum_out/in_sum 允许同槽。
+// tmp 为任意 dtype 的 UB 临时区，按字节 reinterpret；[64,128] fp32 需
+// >= 18432B（tmpBuffer0 [M,8] + reduceBuffer [M,64]，v220 impl 实证）。
+// cfg 是引用型模板参数（const SoftmaxConfig&），必须静态存储期——
+// 放命名空间作用域（同 FIA 的 FIA_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC）。
+constexpr AscendC::SoftmaxConfig kSoftmaxFlashUpdateCfg = {
+    false, 0, 0, AscendC::SoftmaxMode::SOFTMAX_OUTPUT_WITHOUT_BRC};
+
+// ROWS/COLS/TMP_BYTES 全编译期化：tiling 在编译期 constexpr 求值，
+// 运行期零标量开销（初版每拍跑 SoftMaxFlashV2TilingFunc 含整数除法，
+// 打在 91.5% 占用的 AIV scalar 管上——A/B 公平性修正）。
+template <typename T, uint32_t ROWS, uint32_t COLS, uint32_t TMP_BYTES,
+          typename TmpT>
+CATLASS_DEVICE void softmax_flash_update(
+    LocalTensor<T> const &dst, LocalTensor<T> const &sumOut,
+    LocalTensor<T> const &maxOut, LocalTensor<T> const &src,
+    LocalTensor<T> const &expMaxOut, LocalTensor<T> const &inSum,
+    LocalTensor<T> const &inMax, LocalTensor<TmpT> const &tmpBuf) {
+  constexpr SoftMaxShapeInfo shape{ROWS, COLS, ROWS, COLS};
+  LocalTensor<uint8_t> tmp = tmpBuf.template ReinterpretCast<uint8_t>();
+  constexpr SoftMaxTiling tiling = AscendC::SoftMaxFlashV2TilingFunc(
+      shape, sizeof(T), sizeof(T), TMP_BYTES, true, false);
+  AscendC::SoftmaxFlashV2<T, true, true, false, false,
+                          kSoftmaxFlashUpdateCfg>(dst, sumOut, maxOut, src,
+                                                  expMaxOut, inSum, inMax, tmp,
+                                                  tiling, shape);
+}
+
+// reduce_fold_max/sum：fold + 两级 BlockReduce 的行归约快路径（s28a）。
+// 对齐官方 NewReduce 的 K∈[128,512) 折叠分支（softmax_common_nd_reduce.h:186）
+// 与 catlass RowmaxSPECTILE（block_epilogue_online_softmax_no_mask.hpp:249），
+// 替代 AscendC::ReduceMax/ReduceSum(AR) 通用 API 的 Adds 初值拷贝路径
+// （reduce_common_util_v220_impl.h:222 DoReduceByRep：先 Adds 拷 4096 元素再
+// 折叠 = 4 指令；本路径 fold + 2×BR = 3 指令且少一遍全幅读）。
+// 形状约束：cols==128（fold 一次 128→64；其它 64 的 2 倍幂未推广），
+// rows<=255（repeat 上限）。foldTmp [rows,64]，brTmp [rows,8]。
+// mask 语义：BlockReduce base API 的 int mask=每 repeat 有效元素数（64=全有效），
+// 与 s14c 的 DSL 调用约定一致。
+template <typename T>
+CATLASS_DEVICE void reduce_fold_max(LocalTensor<T> const &dst,
+                                    LocalTensor<T> const &src,
+                                    LocalTensor<T> const &foldTmp,
+                                    LocalTensor<T> const &brTmp,
+                                    const uint32_t rows, const uint32_t cols) {
+  // fold：tmp[r, :] = max(src[r, 0:64], src[r, 64:128])，行间跨步 cols/8 块
+  AscendC::Max<T, false>(foldTmp, src, src[64], (uint64_t)0, rows,
+                         AscendC::BinaryRepeatParams(1, 1, 1, 8, cols / 8,
+                                                     cols / 8));
+  AscendC::PipeBarrier<PIPE_V>();
+  // 一级：[rows,64] → [rows,8]（行内 64 元素 → 每 8 元素块一个部分值）
+  AscendC::BlockReduceMax<T>(brTmp, foldTmp, rows, 64, 1, 1, 8);
+  AscendC::PipeBarrier<PIPE_V>();
+  // 二级：[rows,8] → [rows,1]
+  AscendC::BlockReduceMax<T>(dst, brTmp, rows * 8 / 64, 64, 1, 1, 8);
+}
+
+template <typename T>
+CATLASS_DEVICE void reduce_fold_sum(LocalTensor<T> const &dst,
+                                    LocalTensor<T> const &src,
+                                    LocalTensor<T> const &foldTmp,
+                                    LocalTensor<T> const &brTmp,
+                                    const uint32_t rows, const uint32_t cols) {
+  AscendC::Add<T, false>(foldTmp, src, src[64], (uint64_t)0, rows,
+                         AscendC::BinaryRepeatParams(1, 1, 1, 8, cols / 8,
+                                                     cols / 8));
+  AscendC::PipeBarrier<PIPE_V>();
+  AscendC::BlockReduceSum<T>(brTmp, foldTmp, rows, 64, 1, 1, 8);
+  AscendC::PipeBarrier<PIPE_V>();
+  AscendC::BlockReduceSum<T>(dst, brTmp, rows * 8 / 64, 64, 1, 1, 8);
 }
 
 // Strided masked exp for the narrow online-softmax window: exp only the `mask`

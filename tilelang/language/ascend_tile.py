@@ -1047,6 +1047,123 @@ def brcb_experiment(
     )
 
 
+def softmaxflash_update_experiment(
+    dst: Buffer | BufferRegion,
+    sum_out: Buffer | BufferRegion,
+    max_out: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    expmax_out: Buffer | BufferRegion,
+    in_sum: Buffer | BufferRegion,
+    in_max: Buffer | BufferRegion,
+    tmp: Buffer | BufferRegion,
+    rows: PrimExpr,
+    cols: PrimExpr,
+):
+    """Fused online-softmax update via vendor SoftmaxFlashV2 (fp32, isUpdate,
+    WITHOUT_BRC) —— s27 vec 侧诊断 A/B 专用，交付 kernel 禁用（no-high-level-api
+    纪律的受控例外）。
+
+    AscendC backend: emits ``tl::ascend::softmax_flash_update<float>(...)``.
+    Semantics: m_new = max(in_max, rowmax(src)); expmax_out = exp(in_max -
+    m_new); max_out = m_new; dst = exp(src - m_new) in-place; sum_out =
+    expmax_out * in_sum + rowsum(dst). in_max 与 expmax_out 允许同槽（API
+    先读后写）；sum_out 与 in_sum 允许同槽。tmp 按字节 reinterpret，
+    [64,128] fp32 至少 18432B。
+    ROWS/COLS/TMP_BYTES 全部编译期化进模板串——tiling constexpr 求值，
+    运行期零标量开销。
+    """
+    def _w(x):
+        if isinstance(x, BufferRegion):
+            return _handle_buffer_region(x, "w")[0]
+        return x.access_ptr("w")
+
+    def _r(x):
+        if isinstance(x, BufferRegion):
+            return _handle_buffer_region(x, "r")[0]
+        return x.access_ptr("r")
+
+    if isinstance(tmp, BufferRegion):
+        tmp_extent = _handle_buffer_region(tmp, "r")[1]
+    else:
+        tmp_extent = tmp.shape
+    tmp_bytes = 1
+    for x in tmp_extent:
+        tmp_bytes *= int(x)
+    tmp_bytes *= int(DataType(tmp.dtype).bits) // 8
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_softmaxflash_update_experiment"),
+        f"softmax_flash_update<float, {int(rows)}, {int(cols)}, {tmp_bytes}>",
+        _w(dst),
+        _w(sum_out),
+        _w(max_out),
+        _r(src),
+        _w(expmax_out),
+        _r(in_sum),
+        _r(in_max),
+        _r(tmp),
+    )
+
+
+def reduce_fold_max_experiment(
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    fold_tmp: Buffer | BufferRegion,
+    br_tmp: Buffer | BufferRegion,
+    rows: PrimExpr,
+    cols: PrimExpr,
+):
+    """fold + 两级 BlockReduce 的行 max（s28a，对齐官方 NewReduce 折叠分支）。
+
+    AscendC backend: emits ``tl::ascend::reduce_fold_max<float>(...)``.
+    src [rows, cols]（cols 当前只承诺 128）；fold_tmp [rows, 64]；
+    br_tmp [rows, 8]；dst [rows]。数学：dst[r] = max_c(src[r, c])。
+    """
+    return _reduce_fold_impl("tl.ascend_reduce_fold_max_experiment",
+                             "reduce_fold_max<float>", dst, src, fold_tmp,
+                             br_tmp, rows, cols)
+
+
+def reduce_fold_sum_experiment(
+    dst: Buffer | BufferRegion,
+    src: Buffer | BufferRegion,
+    fold_tmp: Buffer | BufferRegion,
+    br_tmp: Buffer | BufferRegion,
+    rows: PrimExpr,
+    cols: PrimExpr,
+):
+    """fold + 两级 BlockReduce 的行 sum（s28a）。签名同 reduce_fold_max_experiment，
+    数学：dst[r] = sum_c(src[r, c])。"""
+    return _reduce_fold_impl("tl.ascend_reduce_fold_sum_experiment",
+                             "reduce_fold_sum<float>", dst, src, fold_tmp,
+                             br_tmp, rows, cols)
+
+
+def _reduce_fold_impl(op_name, func_name, dst, src, fold_tmp, br_tmp, rows, cols):
+    def _w(x):
+        if isinstance(x, BufferRegion):
+            return _handle_buffer_region(x, "w")[0]
+        return x.access_ptr("w")
+
+    def _r(x):
+        if isinstance(x, BufferRegion):
+            return _handle_buffer_region(x, "r")[0]
+        return x.access_ptr("r")
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get(op_name),
+        func_name,
+        _w(dst),
+        _r(src),
+        _w(fold_tmp),
+        _w(br_tmp),
+        rows,
+        cols,
+    )
+
+
 def binary_op(
     dst: Buffer | BufferRegion,
     src0: Buffer | BufferRegion,

@@ -243,6 +243,10 @@ private:
 
   void BrcbExperimentCodegen(const CallNode *op);
 
+  void SoftmaxFlashUpdateExperimentCodegen(const CallNode *op);
+
+  void ReduceFoldExperimentCodegen(const CallNode *op);
+
 private:
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
   bool IsScopePartOfType() const final { return false; }
