@@ -23,6 +23,7 @@ from tilelang.simulator import (
     Pipe,
     PerformanceReport,
     ProgramValidationError,
+    ScheduleResult,
     SimulationStats,
     SimulatorConfig,
     SimulatorConfigError,
@@ -306,6 +307,29 @@ def test_performance_report_extracts_only_actual_scheduler_critical_edges() -> N
     assert critical["operation_cycles"] == 12
     assert [step["task_id"] for step in critical["steps"]] == ["load", "mma"]
     assert critical["steps"][0]["to_successor"] == "explicit"
+
+
+def test_performance_report_summarizes_inactive_time_and_copy_compute_overlap() -> None:
+    records = (
+        ExecutionRecord("copy", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 0, 10),
+        ExecutionRecord("vector", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 3, 8),
+        ExecutionRecord("late", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 15, 20),
+        ExecutionRecord("other", "mma", 1, Lane.CUBE, Pipe.MATRIX, 0, 20),
+    )
+    schedule = ScheduleResult(records, SimulationStats.from_records(records))
+
+    document = PerformanceReport.from_schedule(
+        schedule, SimulatorConfig(platform="A2")
+    ).to_dict()
+
+    assert document["top_inactive_intervals"] == [
+        {"core_id": 0, "start_cycle": 10, "end_cycle": 15, "duration_cycles": 5}
+    ]
+    assert document["copy_compute_overlap"] == {
+        "scope": "per-core union of copy and compute intervals; not a bandwidth estimate",
+        "total_per_core_cycles": 5,
+        "by_core": [{"core_id": 0, "cycles": 5}],
+    }
 
 
 def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:

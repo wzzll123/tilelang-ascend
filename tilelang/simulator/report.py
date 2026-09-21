@@ -36,6 +36,7 @@ class PerformanceReport:
     trace_path: str | None
     stats: SimulationStats
     critical_path: Mapping[str, Any]
+    schedule_records: tuple[ExecutionRecord, ...] = ()
 
     @classmethod
     def from_stats(
@@ -81,6 +82,7 @@ class PerformanceReport:
             trace_path=None if trace_path is None else str(trace_path),
             stats=result.stats,
             critical_path=cls._critical_chain(result.records),
+            schedule_records=result.records,
         )
 
     @staticmethod
@@ -193,8 +195,126 @@ class PerformanceReport:
                 for reason in major_stalls
             ],
             "critical_path": dict(self.critical_path),
+            "top_inactive_intervals": self._top_inactive_intervals(),
+            "copy_compute_overlap": self._copy_compute_overlap(),
             "trace_path": self.trace_path,
         }
+
+    def _operation_records(self) -> tuple[ExecutionRecord, ...]:
+        """Return records retained by ``from_schedule`` when available."""
+        return tuple(
+            record for record in self.schedule_records if record.category == "operation"
+        )
+
+    def _top_inactive_intervals(self) -> list[dict[str, int]]:
+        """Return largest core-level intervals without any operation running.
+
+        A core can still be blocked on a flag during such an interval, so this
+        intentionally says *inactive*, not "hardware idle".  Flag-blocking
+        time remains separately available in ``major_stalls``.
+        """
+        by_core: dict[int, list[tuple[int, int]]] = {}
+        for record in self._operation_records():
+            if record.duration_cycles:
+                by_core.setdefault(record.core_id, []).append(
+                    (record.start_cycle, record.end_cycle)
+                )
+        makespan = self.stats.makespan_cycles
+        intervals: list[dict[str, int]] = []
+        for core_id, raw_intervals in by_core.items():
+            cursor = 0
+            for start, end in self._merge_intervals(raw_intervals):
+                if start > cursor:
+                    intervals.append(
+                        {
+                            "core_id": core_id,
+                            "start_cycle": cursor,
+                            "end_cycle": start,
+                            "duration_cycles": start - cursor,
+                        }
+                    )
+                cursor = max(cursor, end)
+            if cursor < makespan:
+                intervals.append(
+                    {
+                        "core_id": core_id,
+                        "start_cycle": cursor,
+                        "end_cycle": makespan,
+                        "duration_cycles": makespan - cursor,
+                    }
+                )
+        return sorted(
+            intervals,
+            key=lambda interval: (
+                -interval["duration_cycles"], interval["core_id"], interval["start_cycle"]
+            ),
+        )[:5]
+
+    def _copy_compute_overlap(self) -> dict[str, Any]:
+        """Measure per-core overlap of copy pipes with compute pipes.
+
+        This is a union-of-intervals calculation, so overlapping work on two
+        copy pipes is counted once.  It is schedule information, not a memory
+        bandwidth or hardware-throughput estimate.
+        """
+        copies: dict[int, list[tuple[int, int]]] = {}
+        compute: dict[int, list[tuple[int, int]]] = {}
+        for record in self._operation_records():
+            if not record.duration_cycles:
+                continue
+            interval = (record.start_cycle, record.end_cycle)
+            if self._is_copy(record):
+                copies.setdefault(record.core_id, []).append(interval)
+            elif record.pipe.value in {"m", "v", "fix"}:
+                compute.setdefault(record.core_id, []).append(interval)
+
+        by_core = []
+        for core_id in sorted(set(copies) & set(compute)):
+            copy_intervals = self._merge_intervals(copies[core_id])
+            compute_intervals = self._merge_intervals(compute[core_id])
+            overlap = self._intersection_length(copy_intervals, compute_intervals)
+            if overlap:
+                by_core.append({"core_id": core_id, "cycles": overlap})
+        return {
+            "scope": "per-core union of copy and compute intervals; not a bandwidth estimate",
+            "total_per_core_cycles": sum(item["cycles"] for item in by_core),
+            "by_core": by_core[:5],
+        }
+
+    @staticmethod
+    def _is_copy(record: ExecutionRecord) -> bool:
+        operation = record.operation.lower()
+        return (
+            operation.startswith("copy")
+            or "datacopy" in operation
+            or "data_copy" in operation
+        )
+
+    @staticmethod
+    def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    @staticmethod
+    def _intersection_length(
+        left: list[tuple[int, int]], right: list[tuple[int, int]]
+    ) -> int:
+        total = 0
+        left_index = right_index = 0
+        while left_index < len(left) and right_index < len(right):
+            start = max(left[left_index][0], right[right_index][0])
+            end = min(left[left_index][1], right[right_index][1])
+            total += max(0, end - start)
+            if left[left_index][1] <= right[right_index][1]:
+                left_index += 1
+            else:
+                right_index += 1
+        return total
 
     def to_text(self) -> str:
         """Return a short, stable human-readable summary."""

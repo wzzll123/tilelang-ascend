@@ -775,7 +775,9 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   摘要、trace path 与 timing calibration；明确 PTO fallback 不是实测 latency。~~
 - [x] ~~从 schedule records 提取严格的 schedule-derived 关键链：只纳入显式执行依赖、
   同 resource FIFO 和已匹配的 flag/barrier producer；报告明确其不是硬件 timing proof。~~
-- [ ] 为 `PerformanceReport` 补 top-N idle interval、copy/compute overlap 与瓶颈 pipe 归因。
+- [x] ~~为 `PerformanceReport` 补 top-N core inactive interval 与 per-core copy/compute
+  overlap；两项均标明它们是 schedule interval 统计，而非带宽/硬件空闲度量。~~
+- [ ] 为 `PerformanceReport` 补瓶颈 pipe 归因。
 - [ ] 为 trace comparison 实现两个 schedule 的 makespan、critical path、utilization、wait
   和 overlap 差异报告，供 compiler/pass 回归与大模型分析。
 - [ ] 给 simulator examples 增加 `--report`，写出大模型上下文友好的摘要 JSON；trace 仍为
