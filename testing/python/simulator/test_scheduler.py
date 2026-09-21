@@ -399,6 +399,34 @@ def test_wait_without_matching_flag_reports_deadlock() -> None:
         ).run(_program(wait_flag))
 
 
+def test_deadlock_diagnostic_includes_span_and_outstanding_flag_producer() -> None:
+    set_flag = Task(
+        "set", "set_flag", 0, Lane.CUBE, Pipe.MTE2, 1,
+        metadata={
+            "src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 6,
+            "span": "producer.py:10",
+        },
+    )
+    wait_flag = Task(
+        "wait", "wait_flag", 0, Lane.CUBE, Pipe.MTE1, 1,
+        metadata={
+            "src_pipe": "mte2", "dst_pipe": "mte1", "flag_id": 7,
+            "span": "consumer.py:20",
+        },
+    )
+
+    with pytest.raises(SimulationDeadlockError) as error:
+        DiscreteEventScheduler(
+            synchronization=FlagBarrierSynchronizationModel()
+        ).run(_program(set_flag, wait_flag))
+
+    message = str(error.value)
+    assert "id=7" in message
+    assert "span=consumer.py:20" in message
+    assert "outstanding=1" in message
+    assert "producer=set@producer.py:10" in message
+
+
 def test_cross_flag_fans_out_to_both_vector_lanes_and_joins_before_cube() -> None:
     tasks = (
         Task(

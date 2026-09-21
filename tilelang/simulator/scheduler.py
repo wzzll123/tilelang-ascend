@@ -188,7 +188,12 @@ class DiscreteEventScheduler:
             if not made_progress:
                 if not config.deadlock_detect:
                     continue
-                details = "; ".join(f"{task_id}: {blocked_details.get(task_id, 'blocked')}" for task_id in sorted(pending))
+                details = "; ".join(
+                    self._format_blocked_task(
+                        task_by_id[task_id], blocked_details.get(task_id, "blocked")
+                    )
+                    for task_id in sorted(pending)
+                )
                 cycle = self._wait_cycle(
                     pending,
                     tasks,
@@ -202,8 +207,13 @@ class DiscreteEventScheduler:
                     else "; wait-for graph has no cycle; all remaining tasks are blocked and no future event can fire"
                 )
                 history = self._recent_history(records, config.deadlock_history_limit)
+                diagnostic_hook = getattr(self.synchronization, "deadlock_diagnostics", None)
+                synchronization_state = (
+                    diagnostic_hook() if callable(diagnostic_hook) else "unavailable"
+                )
                 raise SimulationDeadlockError(
-                    f"DEADLOCK (global no-progress): {len(pending)} blocked task(s): {details}{cycle_detail}; recent events: {history}"
+                    f"DEADLOCK (global no-progress): {len(pending)} blocked task(s): {details}"
+                    f"{cycle_detail}; sync state: {synchronization_state}; recent events: {history}"
                 )
 
         if config.flag_balance_check != "off":
@@ -297,6 +307,29 @@ class DiscreteEventScheduler:
         if not recent:
             return "none"
         return ", ".join(f"{record.task_id}@{record.end_cycle}" for record in recent)
+
+    @staticmethod
+    def _format_blocked_task(task: Task, detail: str) -> str:
+        """Attach source and region context without assuming every task is memory work."""
+        context = []
+        span = task.metadata.get("span")
+        if span:
+            context.append(f"span={span}")
+        regions = []
+        for key in ("src", "dst"):
+            region = task.metadata.get(key)
+            if hasattr(region, "buffer") and hasattr(region, "scope"):
+                regions.append(f"{key}={region.buffer}:{region.scope.value}")
+        for key in ("src_regions", "dst_regions"):
+            values = task.metadata.get(key)
+            if isinstance(values, (tuple, list)):
+                for region in values:
+                    if hasattr(region, "buffer") and hasattr(region, "scope"):
+                        regions.append(f"{key}={region.buffer}:{region.scope.value}")
+        if regions:
+            context.append("regions=" + ",".join(dict.fromkeys(regions)))
+        suffix = f" [{'; '.join(context)}]" if context else ""
+        return f"{task.task_id}: {detail}{suffix}"
 
     @staticmethod
     def _validate_dependencies(tasks: tuple[Task, ...], task_by_id: Mapping[str, Task]) -> None:

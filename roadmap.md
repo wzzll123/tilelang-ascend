@@ -724,7 +724,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
 - [ ] 将 hazard 诊断扩展到带 source span 的动态精确 address range。
 - [ ] 执行 software-pipeline prologue、steady state、epilogue、stage/ring index 和 wrap。
 - [ ] 检查 ring-slot reuse、in-flight memory hazard 和 flag 配对协议。
-- [ ] 将 deadlock 报告扩展到 outstanding producer、flag ID、memory region 和 source span。
+- [x] ~~将 deadlock 报告扩展到 outstanding producer、flag ID、可用 memory region 和 source
+  span；同步状态机提供只读 credit/collective snapshot，不改变调度语义。~~
 
 ## Trace 与性能诊断
 
