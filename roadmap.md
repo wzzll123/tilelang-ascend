@@ -779,8 +779,8 @@ scheduler 和测试，而不是先铺大量不可执行的 operation 名称。�
   overlap；两项均标明它们是 schedule interval 统计，而非带宽/硬件空闲度量。~~
 - [x] ~~为 `PerformanceReport` 补 schedule-derived resource pressure：按 FIFO queued
   task-cycles、utilization 和 operation count 排序，明确不是物理 queue depth 或硬件饱和度。~~
-- [ ] 为 trace comparison 实现两个 schedule 的 makespan、critical path、utilization、wait
-  和 overlap 差异报告，供 compiler/pass 回归与大模型分析。
+- [x] ~~实现两个 `PerformanceReport` 的 schedule comparison：输出 makespan、critical-chain
+  span、utilization、wait 和 copy/compute overlap 差异，供 compiler/pass 回归与大模型分析。~~
 - [ ] 给 simulator examples 增加 `--report`，写出大模型上下文友好的摘要 JSON；trace 仍为
   可选深度证据。
 - [ ] 在报告中区分 `pto-perf-sim-derived-fallback`、将来 A2/A3 measured profile 和未知

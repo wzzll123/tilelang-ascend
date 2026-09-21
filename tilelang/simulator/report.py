@@ -326,6 +326,98 @@ class PerformanceReport:
         }
 
     @staticmethod
+    def compare(
+        baseline: "PerformanceReport", candidate: "PerformanceReport"
+    ) -> dict[str, Any]:
+        """Return a compact, schedule-derived comparison of two reports.
+
+        ``candidate - baseline`` is used consistently for deltas. Both reports
+        must describe the same platform: comparing A2 to A3 schedules has no
+        stable interpretation without a separate normalization model.
+        """
+        if baseline.platform != candidate.platform:
+            raise ValueError(
+                "cannot compare simulator reports from different platforms: "
+                f"{baseline.platform} != {candidate.platform}"
+            )
+        baseline_document = baseline.to_dict()
+        candidate_document = candidate.to_dict()
+        baseline_schedule = baseline_document["schedule"]
+        candidate_schedule = candidate_document["schedule"]
+        baseline_makespan = int(baseline_schedule["makespan_cycles"])
+        candidate_makespan = int(candidate_schedule["makespan_cycles"])
+        makespan_delta = candidate_makespan - baseline_makespan
+
+        baseline_utilization = baseline_schedule["utilization_by_resource"]
+        candidate_utilization = candidate_schedule["utilization_by_resource"]
+        resource_changes = []
+        for resource in sorted(set(baseline_utilization) | set(candidate_utilization)):
+            before = float(baseline_utilization.get(resource, 0.0))
+            after = float(candidate_utilization.get(resource, 0.0))
+            resource_changes.append(
+                {
+                    "resource": resource,
+                    "baseline_utilization": before,
+                    "candidate_utilization": after,
+                    "delta": after - before,
+                }
+            )
+        resource_changes.sort(
+            key=lambda item: (-abs(item["delta"]), item["resource"])
+        )
+
+        baseline_waits = baseline_schedule["wait_cycles_by_reason"]
+        candidate_waits = candidate_schedule["wait_cycles_by_reason"]
+        wait_changes = []
+        for reason in sorted(set(baseline_waits) | set(candidate_waits)):
+            before = int(baseline_waits.get(reason, 0))
+            after = int(candidate_waits.get(reason, 0))
+            wait_changes.append(
+                {
+                    "reason": reason,
+                    "baseline_cycles": before,
+                    "candidate_cycles": after,
+                    "delta_cycles": after - before,
+                }
+            )
+        wait_changes.sort(key=lambda item: (-abs(item["delta_cycles"]), item["reason"]))
+
+        return {
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "scope": (
+                "comparison of simulator schedules; candidate minus baseline; "
+                "not a measured hardware-performance comparison"
+            ),
+            "platform": candidate.platform,
+            "timing_comparable": (
+                baseline.calibration == candidate.calibration
+                and baseline.timing_estimator == candidate.timing_estimator
+            ),
+            "makespan_cycles": {
+                "baseline": baseline_makespan,
+                "candidate": candidate_makespan,
+                "delta": makespan_delta,
+                "ratio": (
+                    None if baseline_makespan == 0 else candidate_makespan / baseline_makespan
+                ),
+            },
+            "critical_chain_span_cycles": {
+                "baseline": baseline_document["critical_path"].get("span_cycles"),
+                "candidate": candidate_document["critical_path"].get("span_cycles"),
+            },
+            "copy_compute_overlap_per_core_cycles": {
+                "baseline": baseline_document["copy_compute_overlap"]["total_per_core_cycles"],
+                "candidate": candidate_document["copy_compute_overlap"]["total_per_core_cycles"],
+                "delta": (
+                    candidate_document["copy_compute_overlap"]["total_per_core_cycles"]
+                    - baseline_document["copy_compute_overlap"]["total_per_core_cycles"]
+                ),
+            },
+            "top_resource_utilization_changes": resource_changes[:5],
+            "top_wait_cycle_changes": wait_changes[:5],
+        }
+
+    @staticmethod
     def _is_copy(record: ExecutionRecord) -> bool:
         operation = record.operation.lower()
         return (

@@ -365,6 +365,41 @@ def test_performance_report_ranks_schedule_resource_pressure() -> None:
     ]
 
 
+def test_performance_report_compares_two_schedule_summaries() -> None:
+    baseline_records = (
+        ExecutionRecord("copy", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 0, 10),
+        ExecutionRecord("vector", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 0, 10),
+        ExecutionRecord(
+            "wait", "wait", 0, Lane.VECTOR_0, Pipe.SCALAR, 0, 3,
+            category="wait", stall_reason="local flag",
+        ),
+    )
+    candidate_records = (
+        ExecutionRecord("copy", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 0, 8),
+        ExecutionRecord("vector", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 0, 8),
+    )
+    config = SimulatorConfig(platform="A2")
+    baseline = PerformanceReport.from_schedule(
+        ScheduleResult(baseline_records, SimulationStats.from_records(baseline_records)), config
+    )
+    candidate = PerformanceReport.from_schedule(
+        ScheduleResult(candidate_records, SimulationStats.from_records(candidate_records)), config
+    )
+
+    comparison = PerformanceReport.compare(baseline, candidate)
+
+    assert comparison["timing_comparable"] is True
+    assert comparison["makespan_cycles"] == {
+        "baseline": 10, "candidate": 8, "delta": -2, "ratio": 0.8,
+    }
+    assert comparison["copy_compute_overlap_per_core_cycles"] == {
+        "baseline": 10, "candidate": 8, "delta": -2,
+    }
+    assert comparison["top_wait_cycle_changes"] == [
+        {"reason": "local flag", "baseline_cycles": 3, "candidate_cycles": 0, "delta_cycles": -3}
+    ]
+
+
 def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:
     dynamic = AffineInt.variable("count")
     records = (
