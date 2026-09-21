@@ -332,6 +332,39 @@ def test_performance_report_summarizes_inactive_time_and_copy_compute_overlap() 
     }
 
 
+def test_performance_report_ranks_schedule_resource_pressure() -> None:
+    records = (
+        ExecutionRecord("first", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 0, 5),
+        ExecutionRecord(
+            "queued", "copy_gm_to_ub", 0, Lane.VECTOR_0, Pipe.MTE2, 5, 10,
+            metadata={"queue_enter_cycle": 0},
+        ),
+        ExecutionRecord("vector", "add", 0, Lane.VECTOR_0, Pipe.VECTOR, 0, 10),
+    )
+    schedule = ScheduleResult(records, SimulationStats.from_records(records))
+
+    pressure = PerformanceReport.from_schedule(
+        schedule, SimulatorConfig(platform="A2")
+    ).to_dict()["resource_pressure"]
+
+    assert pressure["top_resources"] == [
+        {
+            "resource": "core-0/vector0/mte2",
+            "busy_cycles": 10,
+            "utilization": 1.0,
+            "operation_count": 2,
+            "fifo_queued_task_cycles": 5,
+        },
+        {
+            "resource": "core-0/vector0/v",
+            "busy_cycles": 10,
+            "utilization": 1.0,
+            "operation_count": 1,
+            "fifo_queued_task_cycles": 0,
+        },
+    ]
+
+
 def test_stats_skip_unresolved_dynamic_memory_bytes() -> None:
     dynamic = AffineInt.variable("count")
     records = (

@@ -25,8 +25,9 @@ class PerformanceReport:
     """A compact schedule summary intended for people and automated consumers.
 
     The report deliberately summarizes an already-produced schedule.  It does
-    not claim a critical path or measured hardware timing when the selected
-    profile is an analytical PTO fallback.
+    not claim measured hardware timing when the selected profile is an
+    analytical PTO fallback. Its critical chain and resource pressure fields
+    are explicitly schedule-derived.
     """
 
     platform: str
@@ -197,6 +198,7 @@ class PerformanceReport:
             "critical_path": dict(self.critical_path),
             "top_inactive_intervals": self._top_inactive_intervals(),
             "copy_compute_overlap": self._copy_compute_overlap(),
+            "resource_pressure": self._resource_pressure(),
             "trace_path": self.trace_path,
         }
 
@@ -279,6 +281,48 @@ class PerformanceReport:
             "scope": "per-core union of copy and compute intervals; not a bandwidth estimate",
             "total_per_core_cycles": sum(item["cycles"] for item in by_core),
             "by_core": by_core[:5],
+        }
+
+    def _resource_pressure(self) -> dict[str, Any]:
+        """Rank resources by FIFO queueing first, then busy utilization.
+
+        Queue delay is summed per task (not unioned): it measures how much task
+        delay this resource contributed in this schedule. It is not a claim
+        about hardware queue depth or physical saturation.
+        """
+        pressure: dict[str, dict[str, int]] = {}
+        for record in self._operation_records():
+            resource = f"core-{record.core_id}/{record.resource}"
+            entry = pressure.setdefault(
+                resource, {"operation_count": 0, "fifo_queued_task_cycles": 0}
+            )
+            entry["operation_count"] += 1
+            queued_at = record.metadata.get("queue_enter_cycle")
+            if isinstance(queued_at, int) and queued_at < record.start_cycle:
+                entry["fifo_queued_task_cycles"] += record.start_cycle - queued_at
+        resources = [
+            {
+                "resource": resource,
+                "busy_cycles": self.stats.busy_cycles_by_resource.get(resource, 0),
+                "utilization": self.stats.utilization_by_resource.get(resource, 0.0),
+                "operation_count": entry["operation_count"],
+                "fifo_queued_task_cycles": entry["fifo_queued_task_cycles"],
+            }
+            for resource, entry in pressure.items()
+        ]
+        resources.sort(
+            key=lambda item: (
+                -item["fifo_queued_task_cycles"],
+                -item["utilization"],
+                item["resource"],
+            )
+        )
+        return {
+            "scope": (
+                "schedule-derived FIFO queued task-cycles then utilization; "
+                "not physical queue depth or hardware saturation"
+            ),
+            "top_resources": resources[:5],
         }
 
     @staticmethod
