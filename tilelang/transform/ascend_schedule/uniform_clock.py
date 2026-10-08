@@ -108,7 +108,9 @@ def certify_uniform_clock(function, owner):
     extent = analyzer.const_int_bound(owner.extent)
     low, high = integer_limits(owner.loop_var)
     if (extent.min_value < 0 or minimum.min_value < low or
-            minimum.max_value + max(0, extent.max_value - 1) > high or
+            # Native for termination computes min+extent, and the final ++ must
+            # fit too. Last-index-only bounds would admit INT_MAX + one trip.
+            minimum.max_value + extent.max_value > high or
             minimum.max_value - minimum.min_value + max(0, extent.max_value - 1) > high):
         raise ValueError("uniform clock owner index or relative clock may overflow")
     return UniformClock(analyzer, int(extent.min_value), int(extent.max_value))

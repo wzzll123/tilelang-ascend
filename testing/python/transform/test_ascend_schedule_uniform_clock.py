@@ -36,6 +36,15 @@ def test_empty_and_short_static_clocks_remain_legal(iterations):
     assert certificate.extent_min == certificate.extent_max == iterations
 
 
+def test_loop_end_condition_must_not_overflow_even_if_last_index_fits():
+    from tilelang.transform.ascend_schedule.uniform_clock import certify_uniform_clock
+    function, owner, _, _ = fixture(lambda c, v: tir.IntImm("int32", 1))
+    owner = tir.For(owner.loop_var, 2147483647, 1, tir.ForKind.SERIAL, owner.body)
+    function = function.with_body(owner)
+    with pytest.raises(ValueError, match="clock"):
+        certify_uniform_clock(function, owner)
+
+
 @pytest.mark.parametrize("bad",
                          ["vid", "load", "call", "unbound", "overflow", "zero_divisor", "negative"])
 def test_unproven_clocks_fail_closed(bad):
