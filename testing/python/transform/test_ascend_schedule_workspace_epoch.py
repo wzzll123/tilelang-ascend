@@ -94,8 +94,8 @@ def test_partial_or_unowned_collective_write_is_rejected(bad):
 
 
 @pytest.mark.parametrize("bad", [
-    "alias_view", "sibling_source", "dynamic_scope", "extra_axis", "source_offset",
-    "source_elem_offset", "source_shape", "invalid_relu"
+    "alias_view", "sibling_source", "dynamic_scope", "extra_axis", "malformed_axis",
+    "source_offset", "source_elem_offset", "source_shape", "invalid_relu"
 ])
 def test_uncertified_physical_geometry_and_ancestors_are_rejected(bad):
     from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch_write
@@ -110,10 +110,12 @@ def test_uncertified_physical_geometry_and_ancestors_are_rejected(bad):
                                     **dict(function.buffer_map), handle: alias
                                 },
                                 attrs=function.attrs)
-    elif bad in ("dynamic_scope", "extra_axis"):
+    elif bad in ("dynamic_scope", "extra_axis", "malformed_axis"):
         if bad == "dynamic_scope":
             wrap = lambda n: tir.AttrStmt(
                 tir.IntImm("int32", 0), "resource_scope", tir.Var("dynamic_core", "int32"), n)
+        elif bad == "malformed_axis":
+            wrap = lambda n: tir.AttrStmt(tir.Var("bad_axis", "int32"), "thread_extent", 2, n)
         else:
             axis = tir.IterVar(None, tir.Var("unknown_lane", "int32"), tir.IterVar.ThreadIndex,
                                "threadIdx.y")
@@ -181,12 +183,13 @@ def test_uncertified_physical_geometry_and_ancestors_are_rejected(bad):
         certify_workspace_epoch_write(function, buffer, call, "C")
 
 
-def test_relu_does_not_change_full_write_coverage():
+@pytest.mark.parametrize("value", ["true", "false", "0", "1"])
+def test_relu_does_not_change_full_write_coverage(value):
     from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch_write
     function = prepared(3)
     buffer, call = writer(function, "C")
     args = list(call.args)
-    args[0] = tir.StringImm(args[0].value.replace("false>", "true>"))
+    args[0] = tir.StringImm(args[0].value.replace("false>", value + ">"))
     changed = tir.Call(call.dtype, call.op, args)
     function = function.with_body(
         tir.stmt_functor.ir_transform(function.body, None, lambda n: changed
@@ -330,3 +333,230 @@ def test_narrowing_source_address_cast_checks_preconversion_bounds():
                                       if n.same_as(call) else None))
     with pytest.raises(ValueError, match="overflow"):
         certify_workspace_epoch_write(function, buffer, changed, "V")
+
+
+def reader_pair(function, core):
+    from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks
+    extraction = extract_tasks(owner_of(function).body)
+    task = next(t for t in extraction.tasks if t.core == core and t.pipe == "PIPE_MTE2")
+    read = extraction.task_nodes[task.id].value
+    buffer = next(
+        view for view in function.buffer_map.values() if view.data.same_as(read.args[1].args[1]))
+    writes = [
+        extraction.task_nodes[t.id].value
+        for t in extraction.tasks
+        if t.pipe in ("PIPE_FIX", "PIPE_MTE3")
+    ]
+    write = next(call for call in writes if call.args[2].args[1].same_as(buffer.data))
+    return buffer, write, read
+
+
+@pytest.mark.parametrize("core", ["C", "V"])
+@pytest.mark.parametrize("groups", [1, 3])
+def test_real_workspace_readers_share_writer_group_and_owner(core, groups):
+    from tilelang.transform.ascend_schedule.workspace_epoch import (certify_workspace_epoch_read,
+                                                                    certify_workspace_epoch_write)
+    function = prepared(groups)
+    buffer, write, read = reader_pair(function, core)
+    proof = certify_workspace_epoch_write(function, buffer, write, "V" if core == "C" else "C")
+    result = certify_workspace_epoch_read(function, proof, read, core)
+    assert result.owner.same_as(owner_of(function))
+    assert result.writer.call.same_as(write)
+    assert result.pointer.same_as(read.args[1])
+    assert result.participant_intervals == (((0, 512),) if core == "C" else ((0, 256), (256, 512)))
+
+
+@pytest.mark.parametrize("bad", [
+    "other_group", "other_owner", "guard", "partial", "stride", "left_pad", "local_offset",
+    "local_role"
+])
+def test_workspace_reader_must_match_partition_and_full_native_geometry(bad):
+    from tilelang.transform.ascend_schedule.workspace_epoch import (certify_workspace_epoch_read,
+                                                                    certify_workspace_epoch_write)
+    function = prepared(3)
+    buffer, write, read = reader_pair(function, "V")
+    proof = certify_workspace_epoch_write(function, buffer, write, "C")
+    if bad in ("other_owner", "guard"):
+
+        def wrap(node):
+            if isinstance(node, tir.Evaluate) and node.value.same_as(read):
+                if bad == "guard":
+                    return tir.IfThenElse(tir.Var("active", "bool"), node, None)
+                return tir.For(tir.Var("other_epoch", "int32"), 0, 3, tir.ForKind.SERIAL, node)
+            return None
+
+        function = function.with_body(tir.stmt_functor.ir_transform(function.body, None, wrap))
+    else:
+        args = list(read.args)
+        if bad == "other_group":
+            pointer = args[1]
+            args[1] = tir.Call(pointer.dtype, pointer.op,
+                               [*pointer.args[:2], pointer.args[2] + 256, *pointer.args[3:]])
+        elif bad in ("local_offset", "local_role"):
+            pointer = args[2]
+            fields = list(pointer.args)
+            fields[2 if bad == "local_offset" else 4] = tir.IntImm("int32", 1)
+            args[2] = tir.Call(pointer.dtype, pointer.op, fields)
+        elif bad == "partial":
+            args[4] = tir.IntImm("int32", 7)
+        elif bad == "stride":
+            args[3] = tir.IntImm("int32", 17)
+        else:
+            assert len(args) == 7  # padValue is present; leftPad is not.
+            args.append(tir.IntImm("int32", 1))
+        changed = tir.Call(read.dtype, read.op, args)
+        function = function.with_body(
+            tir.stmt_functor.ir_transform(function.body, None, lambda n: changed
+                                          if n.same_as(read) else None))
+        read = changed
+    with pytest.raises(ValueError, match="workspace"):
+        certify_workspace_epoch_read(function, proof, read, "V")
+
+
+@pytest.mark.parametrize("core", ["C", "V"])
+def test_storage_certificate_covers_every_pointer_and_orders_first_write(core):
+    from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch
+    function = prepared(3)
+    buffer, write, read = reader_pair(function, core)
+    certificate = certify_workspace_epoch(function, buffer)
+    assert certificate.writer.call.same_as(write)
+    assert len(certificate.readers) == 1
+    assert certificate.readers[0].call.same_as(read)
+    assert certificate.owner.same_as(owner_of(function))
+
+
+@pytest.mark.parametrize(
+    "bad", ["unknown_reader", "second_writer", "direct_load", "read_first", "handle_escape"])
+def test_storage_certificate_rejects_unaudited_access_and_previous_epoch_reads(bad):
+    from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch
+    function = prepared(3)
+    buffer, write, read = reader_pair(function, "V")
+    owner = owner_of(function)
+    statements = list(owner.body.seq)
+    if bad == "unknown_reader":
+        unknown = tir.Evaluate(
+            tir.call_extern("handle", "unknown_workspace_consumer", buffer.access_ptr("r")))
+        statements.append(tir.AttrStmt(tir.IntImm("int32", 1), "resource_scope", 1, unknown))
+    elif bad == "second_writer":
+        statements.append(statements[0])
+    elif bad == "direct_load":
+        statements.append(
+            tir.Evaluate(tir.BufferLoad(buffer, [tir.IntImm("int32", 0) for _ in buffer.shape])))
+    elif bad == "handle_escape":
+        handle = next(handle for handle, view in function.buffer_map.items()
+                      if view.data.same_as(buffer.data))
+        assert not handle.same_as(buffer.data)
+        statements.append(
+            tir.Evaluate(tir.call_extern("handle", "unknown_workspace_escape", handle)))
+    else:
+        statements[0], statements[1] = statements[1], statements[0]
+    changed = tir.For(
+        owner.loop_var,
+        owner.min,
+        owner.extent,
+        owner.kind,
+        tir.SeqStmt(statements),
+        thread_binding=owner.thread_binding,
+        annotations=owner.annotations)
+    function = function.with_body(
+        tir.stmt_functor.ir_transform(function.body, None, lambda n: changed
+                                      if n.same_as(owner) else None))
+    with pytest.raises(ValueError, match="workspace"):
+        certify_workspace_epoch(function, buffer)
+
+
+@pytest.mark.parametrize("endpoint", ["write", "read"])
+def test_expression_conditional_endpoint_does_not_prove_unconditional_coverage(endpoint):
+    from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch
+    function = prepared(3)
+    buffer, write, read = reader_pair(function, "V")
+    selected = write if endpoint == "write" else read
+    conditional = tir.if_then_else(
+        tir.Var("enabled", "bool"), selected, tir.call_extern("handle", "noop"))
+    function = function.with_body(
+        tir.stmt_functor.ir_transform(function.body, None, lambda n: conditional
+                                      if n.same_as(selected) else None))
+    with pytest.raises(ValueError, match="workspace"):
+        certify_workspace_epoch(function, buffer)
+
+
+def test_reduction_initialization_is_not_an_every_epoch_writer():
+    from tvm import ir
+    from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch
+    function = prepared(3)
+    buffer, write, _ = reader_pair(function, "V")
+    owner = owner_of(function)
+    axis = tir.IterVar(ir.Range(0, 3), tir.Var("reduce_epoch", "int32"), tir.IterVar.CommReduce)
+
+    def wrap(node):
+        if isinstance(node, tir.Evaluate) and node.value.same_as(write):
+            block = tir.Block([axis], [], [], "reduction", tir.Evaluate(0), init=node)
+            return tir.BlockRealize([owner.loop_var], True, block)
+        return None
+
+    function = function.with_body(tir.stmt_functor.ir_transform(function.body, None, wrap))
+    with pytest.raises(ValueError, match="workspace"):
+        certify_workspace_epoch(function, buffer)
+
+
+@pytest.mark.parametrize("kind", ["unbound_int64", "uint64_multiply"])
+def test_unknown_integer_bounds_are_not_finite_address_proofs(kind):
+    from tvm import arith, ir
+    from tilelang.transform.ascend_schedule.workspace_epoch import _checked_address_arithmetic
+    analyzer = arith.Analyzer()
+    if kind == "unbound_int64":
+        expression = tir.Var("unknown", "int64")
+    else:
+        cid = tir.Var("large_cid", "uint64")
+        analyzer.bind(cid, ir.Range(0, 5))
+        scale = tir.IntImm("uint64", 1 << 62)
+        expression = ((cid * scale) // scale) * tir.IntImm("uint64", 256)
+    with pytest.raises(ValueError, match="overflow|unbounded"):
+        _checked_address_arithmetic(expression, analyzer)
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("sq", [128, 130])
+@pytest.mark.parametrize("kv", [192, 130])
+@pytest.mark.parametrize("causal", [False, True])
+def test_native_fa_scheduler_input_has_certified_group_workspaces(platform, sq, kv, causal):
+    """Actual native input geometry, not a full scheduler/hardware acceptance test."""
+    from unittest.mock import patch
+    import tvm
+    from examples.flash_attention_auto128.fa_auto128 import (FlashAttentionConfig,
+                                                             flash_attention_auto128_fwd,
+                                                             pass_configs)
+    from tilelang.engine.phase import LowerAndLegalize
+    from tilelang.transform.ascend_schedule.conditions import normalize_conditions
+    from tilelang.transform.ascend_schedule.core_scopes import normalize_core_scopes
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+    from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks
+    from tilelang.transform.ascend_schedule.uniform_clock import certify_uniform_clock
+    from tilelang.transform.ascend_schedule.workspace_epoch import certify_workspace_epoch
+    from tilelang.transform.ascend_schedule.workspace_tasks import prepare_cross_core_copies
+
+    function = flash_attention_auto128_fwd.__wrapped__(
+        FlashAttentionConfig(1, 1, sq, kv, 128, causal=causal)).with_attr("npu_platform", platform)
+    target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
+    # Observe the real scheduler input before it creates slots, flags and waves.
+    with patch("tilelang.transform.ascend_schedule.entry.schedule_module", lambda mod, *_: mod), \
+            tvm.transform.PassContext(config=pass_configs):
+        mod = prepare_cross_core_copies(LowerAndLegalize(tvm.IRModule({"main": function}), target))
+    function = normalize_conditions(decompose_function_gemms(mod["main"], root_scratch=True))
+    function = normalize_core_scopes(function, extract_tasks(function))
+    extraction = extract_tasks(function)
+    assert not extraction.scalar_bindings and not any(task.guard for task in extraction.tasks)
+    generated = {int(index) for index in function.attrs["auto_gm_indices"]}
+    proofs = [
+        certify_workspace_epoch(function, function.buffer_map[param])
+        for index, param in enumerate(function.params)
+        if index in generated
+    ]
+    assert len(proofs) == 3
+    assert {proof.writer.group_byte_extent for proof in proofs} == {8192, 4096, 16384}
+    for proof in proofs:
+        assert proof.writer.group_count == (sq + 31) // 32
+        assert proof.writer.version_pitch_elements == proof.writer.group_pitch_elements * proof.writer.group_count
+        assert len(proof.readers) == 1
+        assert proof.owner.same_as(proofs[0].owner)
+        certify_uniform_clock(function, proof.owner)

@@ -174,3 +174,34 @@ claimed for this isolated writer certificate.
 Nine-file regression including this certificate:151 tests pass locally, with
 17744 existing TVM/Python AST deprecation warnings. The local test wrapper now
 includes this suite by default; the actual library paths remain printed.
+
+The subsequent reader certificate revalidates the writer against the current
+function, requires matching group/participant axes and the exact same serial
+owner, verifies complete GM→UB/GM→L1 geometry and a dominating aligned local
+destination. The aggregate `certify_workspace_epoch` audits every pointer use:
+one writer must precede all readers, while direct load/store, unknown helpers,
+RMW, multiple writers and escaped data or parameter handles are rejected.
+Native endpoints must be direct Evaluate statements, not calls hidden in
+expression-level conditionals. Blocks with initialization need a separate
+execution proof; a reduction init is not an every-epoch writer. Bounds with
+TVM infinity sentinels are rejected before native integer range checks.
+
+The workspace suite now has70 cases. It includes16 actual FA lowering inputs
+across A2/A3, Q128/130, KV192/130 and causal/noncausal, with three generated
+workspaces each. It observes the real scheduler input by suppressing only the
+scheduling entry in the test; native workspace lowering, GEMM decomposition
+and core normalization still run. This is not a full scheduler or hardware
+test. All three certificates and the existing participant-uniform owner-clock
+proof pass in each input. Source-level `enRelu` spellings0/1 and true/false are
+accepted consistently. Group-dependent causal loop extents do not imply a
+participant-dependent clock or a guarded DMA endpoint.
+
+Production integration still needs a typed partition lifecycle planner rather
+than L1's whole-allocation `full_overwrite` projection, a common joint stage /
+version plan, explicit accounting of host-allocated GM workspace bytes, and
+the existing mode2 ready/release/seed/drain reconstruction. This certificate
+alone does not authorize a physical version rewrite or claim hardware speedup.
+
+The nine-file compiler regression after reader/all-endpoint integration passes
+195 tests, with65232 existing TVM/Python AST deprecation warnings. No simulator
+path was added or used in these native-input tests.
