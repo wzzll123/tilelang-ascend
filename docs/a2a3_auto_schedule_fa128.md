@@ -761,3 +761,31 @@ TILELANG_LIBRARY_PATH to the independent `build-auto-schedule`, and prepend
 both library directories to LD_LIBRARY_PATH. Use the original designer
 `verification_tilelang.py <task-root> --case 0 --json <report>` with the
 explicit selector and card environment above. Do not switch global installs.
+
+The fourteen-case precision run then completed with exit code 0 and **PASS**:
+`0,2,6,7,10,12,13,14,15,16,36,37,41,42`, every comparison matched. Causal
+cases 10/36/37/41 arrived with the existing Boolean argument preserved, not
+silently treated as noncausal. The raw script report is archived at
+`examples/flash_attention_auto128/results/a2-card6-precision-14cases.json`.
+The raw report retains legacy `atol/rtol=0.01` metadata; the executed verifier
+does not use those fields for this comparison. It calls `_compare_cannbench`
+with the imported dtype precision threshold and CPU original-dtype native
+reference. Preserve the raw artifact, but do not describe it as an allclose
+0.01 precision gate.
+This remains one precision run: explicit finite-output checks, repeated
+stability, baseline/performance measurement, coordinated automatic pipeline
+and A3 hardware validation are not claimed. In particular fixed case42 has
+Sq=Skv=192 (aligned for this 32x64 baseline); fourteen-case success alone does
+not constitute hardware proof for arbitrary Q/KV tails.
+
+Read-only py-spy sampling during a long interval showed the existing CPU
+reference `model.py::forward -> torch.einsum` inside `_run_case` line180;
+it was not a device-sync wait. Do not record the entire validation wall time
+as kernel performance, or change the golden/native reference to accelerate it.
+
+Next compiler performance gaps identified from executable code: the CV owner
+and three-phase path only admit static IntImm clocks; causal KV pruning needs
+a shared bounded participant-uniform clock proof over cid (not vid or tensor
+loads). Coordinated K/V/P/workspace versions are not materialized yet, and
+lexical execution order is retained despite solver report ordering. Rings
+alone must not be reported as completed automatic software pipelining.

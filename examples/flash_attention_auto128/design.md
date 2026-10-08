@@ -65,6 +65,12 @@ that single pass is not all-case correctness, stability or performance proof.
 CPU primitive/integration regressions are supplementary, not a hardware gate.
 A3 has native/platform regression only, no hardware validation.
 
+The first fourteen-case A2 precision run subsequently completed: every fixed
+case matched the original verifier. Raw report:
+results/a2-card6-precision-14cases.json. This is one run, not the stability or
+performance gate. Fixed case42 has Sq=Skv=192, so it does not exercise arbitrary
+Q/KV tails for the current 32x64 tiling.
+
 Final required gates remain: finite outputs, all fourteen cases, repetitions,
 baseline/candidate three-run warmup3/repeat20 comparison, geomean ratio >=.90,
 and msprof overlap analysis. No tolerance or golden may be changed to obtain
