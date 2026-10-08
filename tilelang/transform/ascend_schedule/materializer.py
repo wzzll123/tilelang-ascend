@@ -98,7 +98,9 @@ def materialize_flat_function(function, extraction, platform):
             any(task.guard not in (None, ()) for task in tasks)):
         raise MaterializationError("structured loop/guard/scalar materializer is not integrated")
     owner_loop = None
-    if any(extraction.loops.values()):
+    phased = any(extraction.loops.values()) and any(
+        not context for context in extraction.loops.values())
+    if any(extraction.loops.values()) and not phased:
         contexts = [extraction.loops[task.id] for task in tasks]
         if (any(len(context) != 1 for context in contexts) or
                 any(not context[0].same_as(contexts[0][0]) for context in contexts)):
@@ -142,6 +144,9 @@ def materialize_flat_function(function, extraction, platform):
     scalar_variables = [var for var in function.params if str(var.dtype) != "handle"]
     if owner_loop is not None:
         scalar_variables.append(owner_loop.loop_var)
+    if phased:
+        scalar_variables.extend(
+            context[0].loop_var for context in extraction.loops.values() if context)
     scope_names = {
         "shared.ub": "UB",
         "shared.l1": "L1",
@@ -203,6 +208,10 @@ def materialize_flat_function(function, extraction, platform):
                      default=1)
     dependencies = list(
         analyze_dependencies(tasks, max_distance=slot_count if owner_loop is not None else 0))
+    if phased:
+        body_tasks = tuple(task for task in tasks if extraction.loops[task.id])
+        dependencies.extend(
+            dep for dep in analyze_dependencies(body_tasks, max_distance=1) if dep.distance)
     # Preserve actual hardware FIFO in the feasibility model as well as emission.
     from .model import Dependency
     last = {}
@@ -228,12 +237,18 @@ def materialize_flat_function(function, extraction, platform):
         capacities=allocation_budgets(platform),
         resource_model=platform)
     report.update(
-        materialization=("single CV owner loop"
-                         if len({task.core for task in tasks}) > 1 else "single local owner loop")
-        if owner_loop is not None else "flat local/CV epoch",
+        materialization="prefix/owner/suffix phases" if phased else
+        ("single CV owner loop" if len({task.core for task in tasks}) > 1 else
+         "single local owner loop") if owner_loop is not None else "flat local/CV epoch",
         timing="unit-cost feasibility; not calibrated NPU timing",
         alias_policy="disjoint physical allocations until async alias contracts are integrated")
-    if owner_loop is not None:
+    if phased:
+        from .phases import emit_three_phase_sync
+        try:
+            result = emit_three_phase_sync(function, extraction)
+        except LocalSyncError as error:
+            raise MaterializationError(str(error)) from error
+    elif owner_loop is not None:
         body_extraction = replace(extraction, loops={task.id: () for task in tasks})
         try:
             if len({task.core for task in tasks}) > 1:

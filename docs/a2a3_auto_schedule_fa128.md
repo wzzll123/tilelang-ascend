@@ -440,6 +440,32 @@ previously documented row-expand diagnostic mismatch remains the exclusion.
 Whole-FA guard/scalar reconstruction, coordinated C/V multiversion owners and
 NPU correctness/stability/performance acceptance remain incomplete.
 
+Whole-function phase follow-up: automatic entry now reconstructs an
+unconditional prefix, one regular static serial owner, and suffix. Boundary
+RAW/WAR/WAW use whole-storage envelopes and one-shot notifications outside the
+complete initialization/body/drain protocol. Prefix-to-suffix protection is
+retained for zero owner iterations. Persisted accumulator allocations remain
+single-version. Every helper shares a function-level event registry: local
+pools are per core/destination pipe, cross IDs are globally owned, and lexical
+wait submission does not permit reuse. Channel exhaustion remains an error.
+
+The admission validator checks complete lexical task occurrence, unique node
+identity, matching noncontradictory core scopes, a common two-Vector context,
+core-neutral mixed-owner cuts and allocation domination. This matters because
+native nested AIC/AIV conditions do not behave like simulator lane replacement.
+The boundary wrapper is attached to the whole protocol, never to the repeated
+For or an enclosing SeqStmt that also contains prefix operations.
+
+A2/A3 tests execute persistent numeric accumulation for 0/1/3 iterations and
+shared C/V FIX/workspace/Vector/store phases, with sync-only balance and native
+target/source generation. Removed waits are detected (balance or hazard);
+this is not a universal timing-race claim. Negative scopes, repeated task
+nodes, unrelated allocation lifetimes and nested participant groups fail
+closed. Expanded local regression: **781 passed, 1 deselected**, 66 subtests.
+This remains single-version three-phase reconstruction: mutable scalar
+controls, guarded owners, coordinated multiversion FA scheduling and original
+14-case NPU performance acceptance are not yet complete.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

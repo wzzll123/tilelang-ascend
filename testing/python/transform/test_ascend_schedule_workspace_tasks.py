@@ -351,3 +351,100 @@ def test_l0c_to_ub_exposes_fix_write_and_vector_mte2_read(platform):
     assert int(automatic.attrs["tl.ascend.schedule_materialized"]) == 1
     assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "acc", automatic)
     assert_automatic_cv_loop(prepared["main"], platform, "acc")
+    assert_automatic_cv_phases(prepared["main"], platform, ub, out)
+
+
+def assert_automatic_cv_phases(function, platform, ub, out):
+    import numpy as np
+    from tilelang.simulator import (build_kernel_program, FunctionalSimulator, SimulatorConfig,
+                                    BufferRegion, MemoryScope)
+    from tilelang.engine.phase import OptimizeForTarget
+    import tilelang.language as T
+
+    axes = []
+    tir.stmt_functor.post_order_visit(
+        function.body, lambda node: axes.append(node.node.var) if isinstance(node, tir.AttrStmt) and
+        node.attr_key == "thread_extent" and node.node.thread_tag == "threadIdx.x" else None)
+    vid = axes[0]
+    output = tir.decl_buffer((16, 16), "float32", name="phase_output", scope="global")
+    handle = tir.Var("phase_output_handle", "handle")
+    for extent in (0, 1, 3):
+
+        def wrap(node, extent=extent):
+            if isinstance(node, tir.Block) and node.name_hint == "root":
+                prefix = tir.AttrStmt(
+                    tir.IntImm("int32", 1), "resource_scope", 1,
+                    tir.SeqStmt(
+                        [tir.Evaluate(T.tile.fill(ub, 0)),
+                         tir.Evaluate(T.tile.fill(out, 0))]))
+                owner = tir.For(
+                    tir.Var("phase_epoch", "int32"), 3, extent, tir.ForKind.SERIAL, node.body)
+                suffix = tir.AttrStmt(
+                    tir.IntImm("int32", 1), "resource_scope", 1,
+                    tir.Evaluate(
+                        tir.call_extern("handle", "copy_ub_to_gm<float,16,8>", out.access_ptr("r"),
+                                        output.access_ptr("w", offset=vid * 128), 16, 8, 16)))
+                return tir.Block(node.iter_vars, node.reads, node.writes, node.name_hint,
+                                 tir.SeqStmt([prefix, owner, suffix]), node.init,
+                                 node.alloc_buffers, node.match_buffers, node.annotations)
+            return None
+
+        body = tir.stmt_functor.ir_transform(function.body, None, wrap)
+        buffers = dict(function.buffer_map.items())
+        buffers[handle] = output
+        candidate = tir.PrimFunc([*function.params, handle], body, function.ret_type, buffers,
+                                 function.attrs)
+        automatic = schedule_module(
+            tvm.IRModule({"main": candidate}), "ascendc", {"tl.ascend_auto_schedule": True})["main"]
+        if extent == 1:
+            from tilelang.transform.ascend_schedule.entry import AutoScheduleError
+
+            def enclose_cut(node):
+                if isinstance(node, tir.For):
+                    return tir.AttrStmt(tir.IntImm("int32", 0), "resource_scope", 0, node)
+                return None
+
+            enclosed = candidate.with_body(
+                tir.stmt_functor.ir_transform(candidate.body, None, enclose_cut))
+            with pytest.raises(AutoScheduleError, match="core-neutral shared cut"):
+                schedule_module(
+                    tvm.IRModule({"main": enclosed}), "ascendc", {"tl.ascend_auto_schedule": True})
+
+            axes = []
+            tir.stmt_functor.post_order_visit(
+                candidate.body,
+                lambda node, axes=axes: axes.append(node.node)
+                if isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent" and node.node
+                .thread_tag == "threadIdx.x" else None)
+            axis = axes[0]
+
+            def nested_participants(node, axis=axis):
+                if isinstance(node, tir.For):
+                    return tir.AttrStmt(axis, "thread_extent", 2, node)
+                return None
+
+            nested = candidate.with_body(
+                tir.stmt_functor.ir_transform(candidate.body, None, nested_participants))
+            with pytest.raises(AutoScheduleError, match="participant context must be shared"):
+                schedule_module(
+                    tvm.IRModule({"main": nested}), "ascendc", {"tl.ascend_auto_schedule": True})
+        for sync_only in (False, True):
+            sim = FunctionalSimulator(
+                build_kernel_program(automatic, platform=platform),
+                SimulatorConfig(platform=platform, sync_only=sync_only, flag_balance_check="error"))
+            if extent:
+                sim.write(
+                    BufferRegion("acc", MemoryScope.L0C, (256,), "float32", core_id=0),
+                    np.ones(256))
+            sim.run()
+            if not sync_only:
+                np.testing.assert_array_equal(
+                    sim.read(BufferRegion("phase_output", MemoryScope.GM, (16, 16), "float32")),
+                    np.full((16, 16), 2 if extent else 0))
+        native = tvm.IRModule({"probe": automatic.with_attr("global_symbol", "probe")})
+        with tvm.transform.PassContext(config={"tl.ascend_auto_schedule": True}):
+            native = OptimizeForTarget(native, function.attrs["target"], platform)
+        source = tvm.get_global_func("target.build.tilelang_ascend")(native,
+                                                                     function.attrs["target"],
+                                                                     platform).get_source()
+        assert "CrossCoreSetFlag<0x2," in source

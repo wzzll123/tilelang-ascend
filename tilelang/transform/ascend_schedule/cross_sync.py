@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from .local_sync import LocalSyncError, emit_local_sync, _pipe
 
 
-def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids):
+def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids, registry=None):
     """Keep each operation in its original C/V scope and add real fences.
 
     A2/A3 CrossCoreWaitFlag executes on scalar control (no destination pipe
@@ -16,6 +16,10 @@ def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids)
     loop reuse, guards and initialization/drain require the owner protocol.
     """
     from tvm import tir
+    from .events import EventRegistry
+    registry = EventRegistry(
+        local_ids=local_ids, cross_ids=cross_ids) if registry is None else registry
+    registry.require_ids(local_ids=local_ids, cross_ids=cross_ids)
 
     vector_extents = []
 
@@ -66,7 +70,8 @@ def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids)
             scalar_bindings=())
         emitted = emit_local_sync(
             local, [d for d in dependencies if d.source in ids and d.target in ids],
-            event_ids=local_ids)
+            event_ids=local_ids,
+            registry=registry)
         for assignment in emitted.assignments:
             before[assignment.target].append(local_flag("wait", assignment))
             after[assignment.source].append(local_flag("set", assignment))
@@ -76,7 +81,9 @@ def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids)
         key=lambda pair: (positions[pair[0]], positions[pair[1]]))
     if len(pairs) > len(cross_ids):
         raise LocalSyncError("mode-2 channel capacity exhausted")
-    for (source, target), event in zip(pairs, cross_ids):
+    for source, target in pairs:
+        event = registry.allocate(by_id[source].core, _pipe(by_id[source].pipe), by_id[target].core,
+                                  _pipe(by_id[target].pipe)).event_id
         after[source].append(
             tir.Evaluate(
                 tir.call_intrin("handle", tir.op.Op.get("tl.ascend_set_cross_flag"),
@@ -110,7 +117,9 @@ def emit_mode2_loop_sync(function,
                          *,
                          cross_ids,
                          local_ids,
-                         slot_counts=None):
+                         slot_counts=None,
+                         registry=None,
+                         protocol_wrapper=None):
     """Materialize per-edge slot protocols in a shared regular CV owner loop.
 
     Every cross-pipe edge owns ready/release channels for each certified slot.
@@ -167,16 +176,13 @@ def emit_mode2_loop_sync(function,
             if key in pairs and pairs[key] != count:
                 raise LocalSyncError("conflicting slot counts for one dependency channel")
             pairs[key] = count
-    used_cross, local_pools = set(), {}
+    from .events import EventRegistry
+    registry = EventRegistry(
+        local_ids=local_ids, cross_ids=cross_ids) if registry is None else registry
+    registry.require_ids(local_ids=local_ids, cross_ids=cross_ids)
 
     def channel(a, b):
-        cross = a.core != b.core
-        pool = used_cross if cross else local_pools.setdefault((a.core, _pipe(b.pipe)), set())
-        candidates = cross_ids if cross else local_ids
-        event = next((i for i in candidates if i not in pool), None)
-        if event is None:
-            raise LocalSyncError("mode-2 owner event channel capacity exhausted")
-        pool.add(event)
+        event = registry.allocate(a.core, _pipe(a.pipe), b.core, _pipe(b.pipe)).event_id
         return a.core, _pipe(a.pipe), b.core, _pipe(b.pipe), event
 
     def flag(kind, key, *, scoped=False):
@@ -233,6 +239,8 @@ def emit_mode2_loop_sync(function,
                         loop.annotations, getattr(loop, "span", None))
     sequence = [*initialize, rewritten, *drain]
     replacement = sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
+    if protocol_wrapper is not None:
+        replacement = protocol_wrapper(replacement)
     found = []
 
     def replace_owner(node):

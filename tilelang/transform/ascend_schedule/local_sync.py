@@ -60,7 +60,7 @@ def _pipe(value):
     return value
 
 
-def emit_local_sync(extraction, dependencies, *, event_ids, order=None):
+def emit_local_sync(extraction, dependencies, *, event_ids, order=None, registry=None):
     """Return a SeqStmt with producer sets and consumer waits plus channel proofs.
 
     ``order`` contains original task IDs, not solver indexes. Every edge must be
@@ -128,19 +128,17 @@ def emit_local_sync(extraction, dependencies, *, event_ids, order=None):
         if dependency.kind not in kinds:
             kinds.append(dependency.kind)
 
-    assignments, pools = [], {}
+    from .events import EventRegistry
+    registry = EventRegistry(local_ids=event_ids, cross_ids=()) if registry is None else registry
+    registry.require_ids(local_ids=event_ids)
+    assignments = []
     pairs = sorted(hazards, key=lambda pair: (positions[pair[0]], positions[pair[1]]))
     for source, target in pairs:
-        key = core, pipes[target]
-        pool = pools.setdefault(key, {})
-        selected = next((event for event in event_ids if event not in pool), None)
-        if selected is None:
-            raise EventCapacityError(f"event capacity exhausted for core/destination {key}")
+        selected = registry.allocate(core, pipes[source], core, pipes[target]).event_id
         assignment = ChannelAssignment(source, target, core, pipes[source], pipes[target], selected,
                                        positions[source], positions[target],
                                        tuple(hazards[(source, target)]))
         assignments.append(assignment)
-        pool[selected] = assignment
         execution_edges.append(ExecutionEdge(source, target, "sync"))
 
     # Lazy import leaves validation/contract users independent of the native runtime.
@@ -182,7 +180,7 @@ def emit_local_sync(extraction, dependencies, *, event_ids, order=None):
                             "event IDs supplied by caller; no ID reuse within destination pools"))
 
 
-def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
+def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1, registry=None):
     """Emit bounded-credit local protocols around one unconditional serial loop.
 
     The extraction describes the flat loop *body*, not the surrounding For.
@@ -239,15 +237,13 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
         if pipes[d.source] != pipes[d.target]:
             pairs[d.source, d.target, d.distance] = None
 
-    pools = {}
+    from .events import EventRegistry
+    registry = EventRegistry(local_ids=event_ids, cross_ids=()) if registry is None else registry
+    registry.require_ids(local_ids=event_ids)
+    core = tasks[0].core
 
     def channel(source_pipe, destination_pipe):
-        used = pools.setdefault(destination_pipe, set())
-        event = next((i for i in event_ids if i not in used), None)
-        if event is None:
-            raise EventCapacityError(
-                f"loop event capacity exhausted for destination {destination_pipe}")
-        used.add(event)
+        event = registry.allocate(core, source_pipe, core, destination_pipe).event_id
         return source_pipe, destination_pipe, event
 
     def flag(kind, key):
@@ -280,6 +276,8 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
         statements.extend(before[task.id])
         statements.append(extraction.task_nodes[task.id])
         statements.extend(after[task.id])
-    rewritten = tir.For(loop.loop_var, loop.min, loop.extent, loop.kind, tir.SeqStmt(statements),
+    loop_body = statements[0] if len(statements) == 1 else tir.SeqStmt(statements)
+    rewritten = tir.For(loop.loop_var, loop.min, loop.extent, loop.kind, loop_body,
                         loop.thread_binding, loop.annotations, getattr(loop, "span", None))
-    return tir.SeqStmt([*initialize, rewritten, *drain])
+    sequence = [*initialize, rewritten, *drain]
+    return sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
