@@ -87,6 +87,51 @@ def assert_mode2_execution(function, extracted, dependencies, platform, source_n
     with pytest.raises(MemoryHazardError):
         simulator(bad_wait, delayed_producer=True).run()
 
+    from tilelang.transform.ascend_schedule.cross_sync import emit_mode2_loop_sync
+    for extent in (0, 1, 2, 5):
+        owners = []
+
+        def wrap(node, extent=extent, owners=owners):
+            if isinstance(node, tir.Block) and node.name_hint == "root":
+                owner = tir.For(tir.Var("epoch", "int32"), 3, extent, tir.ForKind.SERIAL, node.body)
+                owners.append(owner)
+                return tir.Block(node.iter_vars, node.reads, node.writes, node.name_hint, owner,
+                                 node.init, node.alloc_buffers, node.match_buffers,
+                                 node.annotations)
+            return None
+
+        candidate = function.with_body(tir.stmt_functor.ir_transform(function.body, None, wrap))
+        assert len(owners) == 1
+        owner = owners[0]
+        loop_extraction = extract_tasks(owner.body)
+        loop_dependencies = analyze_dependencies(loop_extraction.tasks, max_distance=1)
+        synchronized = emit_mode2_loop_sync(
+            candidate,
+            owner,
+            loop_extraction,
+            loop_dependencies,
+            cross_ids=(0, 1, 2, 3),
+            local_ids=(0, 1, 2, 3))
+        simulator(synchronized).run()
+        simulator(synchronized, delayed_producer=True).run()
+        missing_set = synchronized.with_body(
+            tir.stmt_functor.ir_transform(synchronized.body, None, remove_set))
+        with pytest.raises(SimulationDeadlockError):
+            simulator(missing_set).run()
+
+        def remove_drain(node):
+            if isinstance(node, tir.SeqStmt):
+                index = next((i for i, child in enumerate(node.seq) if isinstance(child, tir.For)),
+                             None)
+                if index is not None and index < len(node.seq) - 1:
+                    return tir.SeqStmt(list(node.seq)[:index + 1])
+            return None
+
+        missing_drain = synchronized.with_body(
+            tir.stmt_functor.ir_transform(synchronized.body, None, remove_drain))
+        with pytest.raises(SimulationDeadlockError, match="FLAG ACCOUNTING"):
+            simulator(missing_drain).run()
+
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 def test_ub_to_l1_is_two_real_pipes_with_a_shared_gm_dependency(platform):

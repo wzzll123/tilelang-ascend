@@ -277,6 +277,27 @@ bridge reproduced that failure. Excluding that known test yields 742 passed,
 No NPU binary execution or FA acceptance is claimed. Guarded/cyclic cross-core
 owner protocols and whole-function scheduled materialization remain pending.
 
+Mode-2 loop-owner follow-up: unguarded single-slot CV loops now emit both local
+and cross ready/release handshakes, scoped initial credits and final drain.
+Both workspace directions execute on A2/A3 simulator configurations with two
+Vector participants, nonzero loop minima and 0/1/2/5 iterations, under normal
+and delayed-producer timing. Missing cross sets deadlock; missing final drain
+fails runtime flag accounting, including empty loops (local residual credits).
+These are real sync-only runs, not compilation-only tests.
+
+Conservative dependency analysis also emits carried copies of same-epoch
+edges. The emitter does not add a second credit protocol for those copies:
+source(i) -> source(i+1) is actual source-pipe FIFO and the generated
+source(i+1) -> target(i+1) fence proves the carried edge. This execution-path
+proof avoids a false protocol cycle; reverse reuse edges remain fenced.
+Guard/counter owners, mixed version counts and cyclic multiversion cross
+channels are not accepted yet. The enabled whole-function entry still fails
+closed until reconstruction and alias contracts are integrated.
+
+The expanded suites remain **742 passed, 1 deselected**, 66 subtests; the one
+deselected row-expand diagnostic test is the verified pre-existing failure
+described above. No NPU FA hardware/performance result is claimed.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

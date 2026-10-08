@@ -101,3 +101,115 @@ def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids)
     if seen != set(positions):
         raise LocalSyncError("mode-2 extraction does not belong to the supplied function")
     return function.with_body(body)
+
+
+def emit_mode2_loop_sync(function, loop, extraction, dependencies, *, cross_ids, local_ids):
+    """Materialize one-slot ready/release protocols in a shared CV owner loop.
+
+    Every cross-pipe edge owns two channels. Distance-one edges seed ready;
+    same-iteration edges seed release. Drain consumes exactly the remaining
+    initial credit, including when the loop executes zero times. The extraction
+    describes the loop body; conditional/counter owners and multiversion cross
+    channels are not yet supported by this reconstruction.
+    """
+    from tvm import tir
+
+    if not isinstance(loop, tir.For) or loop.kind != tir.ForKind.SERIAL:
+        raise LocalSyncError("mode-2 owner must be a serial loop")
+    dependencies = tuple(dependencies)
+    if any(type(d.distance) is not int or d.distance not in (0, 1) for d in dependencies):
+        raise LocalSyncError("mode-2 owner currently supports dependency distance zero or one")
+    # Validate core/participant/node ownership using the existing flat emitter.
+    emit_mode2_sync(
+        function,
+        extraction, [d for d in dependencies if d.distance == 0],
+        cross_ids=cross_ids,
+        local_ids=local_ids)
+    by_id = {task.id: task for task in extraction.tasks}
+    positions = {task.id: i for i, task in enumerate(extraction.tasks)}
+    before, after = {i: [] for i in by_id}, {i: [] for i in by_id}
+    pairs = {}
+    same_epoch_pairs = {(d.source, d.target) for d in dependencies if d.distance == 0}
+    for d in dependencies:
+        if d.kind not in ("RAW", "WAR", "WAW") or d.source not in by_id or d.target not in by_id:
+            raise LocalSyncError("mode-2 owner requires analyzed RAW/WAR/WAW dependencies")
+        if d.distance == 0 and positions[d.source] >= positions[d.target]:
+            raise LocalSyncError("mode-2 same-epoch edges must preserve lexical order")
+        # Actual pipe FIFO orders source(i) before source(i+1). A real emitted
+        # source(i+1)->target(i+1) fence therefore already proves this carried
+        # edge. Adding another credit protocol would impose a false cycle.
+        if d.distance == 1 and (d.source, d.target) in same_epoch_pairs:
+            continue
+        a, b = by_id[d.source], by_id[d.target]
+        if a.core != b.core or _pipe(a.pipe) != _pipe(b.pipe):
+            pairs[d.source, d.target, d.distance] = None
+    used_cross, local_pools = set(), {}
+
+    def channel(a, b):
+        cross = a.core != b.core
+        pool = used_cross if cross else local_pools.setdefault((a.core, _pipe(b.pipe)), set())
+        candidates = cross_ids if cross else local_ids
+        event = next((i for i in candidates if i not in pool), None)
+        if event is None:
+            raise LocalSyncError("mode-2 owner event channel capacity exhausted")
+        pool.add(event)
+        return a.core, _pipe(a.pipe), b.core, _pipe(b.pipe), event
+
+    def flag(kind, key, *, scoped=False):
+        source_core, source_pipe, target_core, target_pipe, event = key
+        if source_core != target_core:
+            args = (source_pipe, event, 2) if kind == "set" else (event, "")
+            op = "tl.ascend_" + kind + "_cross_flag"
+        else:
+            args = source_pipe, target_pipe, event
+            op = "tl.ascend_" + kind + "_flag"
+        node = tir.Evaluate(tir.call_intrin("handle", tir.op.Op.get(op), *args))
+        if scoped:
+            core = source_core if kind == "set" else target_core
+            code = 0 if core == "C" else 1
+            node = tir.AttrStmt(tir.IntImm("int32", code), "resource_scope", code, node)
+        return node
+
+    initialize, drain = [], []
+    for source, target, distance in pairs:
+        ready = channel(by_id[source], by_id[target])
+        release = channel(by_id[target], by_id[source])
+        before[source].append(flag("wait", release))
+        after[source].append(flag("set", ready))
+        before[target].append(flag("wait", ready))
+        after[target].append(flag("set", release))
+        initial = ready if distance else release
+        initialize.append(flag("set", initial, scoped=True))
+        drain.append(flag("wait", initial, scoped=True))
+    seen = set()
+
+    def task_rewrite(node):
+        if not isinstance(node, tir.Evaluate):
+            return None
+        task_id = next(
+            (i for i, original in extraction.task_nodes.items() if node.same_as(original)), None)
+        if task_id is None:
+            return None
+        seen.add(task_id)
+        sequence = [*before[task_id], node, *after[task_id]]
+        return sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
+
+    body = tir.stmt_functor.ir_transform(loop.body, None, task_rewrite)
+    if seen != set(by_id):
+        raise LocalSyncError("mode-2 tasks must all belong to the certified owner body")
+    rewritten = tir.For(loop.loop_var, loop.min, loop.extent, loop.kind, body, loop.thread_binding,
+                        loop.annotations, getattr(loop, "span", None))
+    sequence = [*initialize, rewritten, *drain]
+    replacement = sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
+    found = []
+
+    def replace_owner(node):
+        if isinstance(node, tir.For) and node.same_as(loop):
+            found.append(node)
+            return replacement
+        return None
+
+    result = tir.stmt_functor.ir_transform(function.body, None, replace_owner)
+    if len(found) != 1:
+        raise LocalSyncError("mode-2 owner must appear exactly once in the function")
+    return function.with_body(result)
