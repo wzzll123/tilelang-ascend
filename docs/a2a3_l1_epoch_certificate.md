@@ -44,3 +44,24 @@ Next integration steps:
    it does not independently choose versions or generate ring synchronization.
 4. Reconstruct executable stage waves together with ready/release selectors,
    initialization and drain. Then run real A2 precision and performance tests.
+
+`l1_prefetch.py` now discovers input-prefetch candidates from the actual task
+graph. All accesses must belong to one owner, each native copy must have geometry
+coverage, and GM sources must be readonly kernel inputs rather than generated
+workspaces. It also runs physical materialization as a proof preflight to reject
+escaped or malformed accesses. Production FA tests identify K/V while rejecting
+Q (prefix access) and P (current-iteration Vector-produced workspace).
+
+The two-stage partition places input writers in stage0 and consumers in stage1.
+Joint feasibility validation keeps persistent allocations single-version and
+counts every fixed allocation against A2/A3 capacities. Candidate slot counts
+currently use the certified lifecycle span+1, rather than optimizing unconstrained
+modulo start residues: a one-version timestamp solution can require a different
+within-wave issue order from the lexical wave materializer. This constraint must
+not be relaxed until the chosen executable order is modeled by the solver.
+
+These discovery/solve functions are not yet called by the production driver.
+Integration must replace original-source same-pipe FIFO constraints with those
+of the reconstructed wave order, without dropping any true RAW/WAR/WAW edges;
+otherwise moving V before the current P workspace receive conflicts with an
+artificial old FIFO edge. Protocol minimization must be rechecked for that order.
