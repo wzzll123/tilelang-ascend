@@ -789,3 +789,54 @@ a shared bounded participant-uniform clock proof over cid (not vid or tensor
 loads). Coordinated K/V/P/workspace versions are not materialized yet, and
 lexical execution order is retained despite solver report ordering. Rings
 alone must not be reported as completed automatic software pipelining.
+
+### Performance harness and faithful baseline dependency preflight
+
+The original designer perf_tilelang.py supports warmup3/repeat20, no-boost and
+no-sol, but one --json path is overwritten for every selected case. A minimal
+--json-dir option now writes case_N.json independently, mutually exclusive
+with the unchanged legacy --json behavior. It changes no profiler schedule,
+statistics, scoring, correctness or cache/clock setting. The external-script
+patch is retained in examples/flash_attention_auto128/perf_report_directory.patch;
+test_perf_report_cli.py covers independent case files, legacy output and option
+conflict via the actual main AST with profiler stubs. Three local tests passed;
+the deployed Docker script's --help confirms the option. Tests need
+FA_PERF_SCRIPT pointing at the external script, and otherwise explicitly skip.
+
+Current baseline source is frozen unchanged at SHA256
+`b345fc6813b7ede3d710e4fb89dd45ee51a64674009987b2433c44bffe606f77`.
+A real v06 verification attempt using compiler607b87c4 failed before device
+execution: binary_mask_experiment is absent. Its actual dependency is not in
+Docker main commit e47171e32f6e64ff613cc6f398ec4c32a7c76d9f, but only in
+uncommitted additions: 153 lines in six frontend/op/codegen/template files.
+The exact dependency patch SHA256 is
+`2d17655a54500418ff4bb6c989553c785def3539fb6a4586cad5f05470ccd977`.
+No main-checkout edits or wholesale dirty-tree import are permitted.
+
+An isolated reference build at
+`/home/wenzhongzhen/tilelang-ascend-wt/fa128-v06-baseline-e471` uses that actual
+baseline compiler commit plus only the audited dependency snapshot. Its native
+build is in progress, not yet recorded as passed. A preliminary clean607b
+reference worktree at `fa128-v06-baseline-deps` remains unused: dependency
+git-apply --check failed, so no patch or partial edit was applied there. The
+primary automatic-schedule branch remains clean and excludes this foreign
+uncommitted feature. Do not silently alias masked binary ops to a different
+implementation or change the frozen v06 source to make it compile.
+
+Any later comparison must state the distinct baseline/candidate compiler
+provenance as well as common TVM/CANN/Python/card conditions. No baseline
+precision or timing value is currently claimed. After baseline precision,
+measure the original harness serially on card6 with no-boost/no-sol, full
+fixed case list, warmup3/repeat20; alternate baseline/auto for three complete
+runs and use unique report directories. Preserve each report's profiler
+directory and kernel_details.csv as raw-duration evidence.
+
+The isolated e471 reference native target subsequently built successfully.
+Its libtilelang_module.so SHA256 is
+`6c5740dca57791696c5165a01942d8163d4078cce5acd451b67499f095bb1c21`.
+Frozen v06 case0 then executed and passed the original card6 verifier.
+The full fourteen-case reference precision run was launched next, with
+TILELANG_CACHE_DIR=/tmp/fa128-v06-cache-e471-binary2d176 to avoid historical
+compiled-kernel cache contamination. It is not yet recorded as passed.
+The default/global cache was not deleted or switched. No performance result
+or baseline/candidate geomean is claimed at this checkpoint.
