@@ -240,3 +240,47 @@ mode2 protocols and waves are emitted. GM bytes cannot be charged against L1
 or UB hardware capacity. No new hardware performance result is attributed to
 these local changes; the frozen prefetch build's three-round performance gate
 has failed at0.107698, with all84 original reports archived separately.
+
+## Joint solver workspace accounting
+
+The joint solver and result validator now distinguish `StorageCost.scope=GM`
+from local hardware scopes. GM version selection remains bounded by each
+storage's max_versions; a caller-supplied host allocation budget additionally
+bounds the sum of world-pitch bytes times selected counts. A GM entry in local
+`capacities` is rejected. Omitting the host budget does not invent device DRAM
+capacity: reports explicitly record selected bytes, a null budget and
+`device_available_memory_verified=false`. Local capacities are unchanged.
+Minimum-allocation checks, Z3 constraints and injected-result validation use
+the same separate workspace rule. Byte sizes must be nonnegative integers;
+NaN/fractional/bool sizes cannot bypass budget comparisons in fallback mode.
+
+Test-first coverage includes local/GM separation, exact and insufficient
+budgets, joint II/version selection under different budgets, immutable carried
+state dependencies and invalid numeric inputs. No new public TileLang pass
+configuration or simulator configuration was added.
+
+## Production FA partition evidence
+
+Read-only analysis of actual native FA input B1/H1/Q128/KV192/D128 identifies
+owner tasks4…34. The existing conservative dependency model rejects a direct
+QK C0 / softmax V1 / PV C2 / output V3 split: correction and shared tmp_ub
+carried edges span V3→V1, and unversioned GM carried WAR ties violate the
+ascending-stage wave order. This is an admission result under current
+footprint proofs, not a hardware measurement or a claim that every conservative
+edge has been independently established as a numerical dependency.
+
+A smaller candidate passed read-only physical TIR and d0…2 dependency checks
+for KV192/130 with causal/noncausal: QK/score tasks4…8 at stage0, the remaining
+softmax→PV→output epoch at stage1, only score GM workspace at two versions.
+The m/l/o, correction, shared temporary and other GM workspaces remain
+single-version. The reader clock stays participant-uniform within each group.
+No events were emitted and no kernel was launched for this candidate yet.
+
+Combining K/V input prefetch could instead use loads at0, QK at1 and the
+remaining epoch at2. Under ascending-wave ordering it requires at least K2,
+V3 and score-GM2 slots; joint local capacity and event allocation must prove
+admission. These are next production integration candidates, not completed
+automatic partition selection or achieved hardware performance.
+
+Twelve-file compiler/solver/report regression after workspace accounting:
+255 tests passed, with65232 existing TVM/Python AST deprecation warnings.

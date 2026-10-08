@@ -85,12 +85,17 @@ def solve_schedule(
     storage: Mapping[str, StorageCost] | None = None,
     reuse_dependencies: Sequence[ReuseDependency] = (),
     capacities: Mapping[str, int] | None = None,
+    host_workspace_budget_bytes: int | None = None,
     manual_stages: Sequence[int] | None = None,
     max_ii: int | None = None,
     timeout_ms: int = 1000,
 ) -> ScheduleResult:
     """Minimize II, then storage versions and starts within a bounded search.
 
+    ``GM`` storage is host-allocated workspace, not a local hardware capacity.
+    Its selected bytes are optionally bounded by host_workspace_budget_bytes;
+    without that budget only max_versions bounds apply, not a claim about free
+    device DRAM. Every other storage scope still requires explicit capacity.
     True dependencies always retain their supplied iteration distance. Only
     ``ReuseDependency`` uses a storage version variable. Pipe issue windows are
     disjoint both inside an II and across its wrap-around boundary. Manual stage
@@ -99,6 +104,11 @@ def solve_schedule(
     """
     tasks, dependencies = tuple(tasks), tuple(dependencies)
     storage, capacities = dict(storage or {}), dict(capacities or {})
+    if "GM" in capacities:
+        raise ValueError("GM workspace budget is not a local hardware capacity")
+    if host_workspace_budget_bytes is not None and (type(host_workspace_budget_bytes) is not int or
+                                                    host_workspace_budget_bytes < 0):
+        raise ValueError("host workspace budget must be a nonnegative integer byte count")
     n = len(tasks)
     if not n:
         raise ValueError("at least one task is required")
@@ -121,13 +131,19 @@ def solve_schedule(
         raise ValueError("reuse dependency references unknown storage")
     versions = {}
     for name, cost in storage.items():
-        if cost.size_bytes < 0 or cost.max_versions < 1:
-            raise ValueError("storage size must be nonnegative and max_versions positive")
+        if type(cost.size_bytes) is not int or cost.size_bytes < 0:
+            raise ValueError("storage byte size must be a nonnegative integer")
+        if cost.max_versions < 1:
+            raise ValueError("storage max_versions must be positive")
         if cost.fixed_versions is not None and not 1 <= cost.fixed_versions <= cost.max_versions:
             raise ValueError("fixed_versions must be within [1, max_versions]")
-        if cost.scope not in capacities:
+        if cost.scope != "GM" and cost.scope not in capacities:
             raise ValueError(f"explicit capacity required for storage scope {cost.scope}")
         versions[name] = cost.fixed_versions or 1
+    minimum_workspace = sum(
+        cost.size_bytes * versions[name] for name, cost in storage.items() if cost.scope == "GM")
+    if host_workspace_budget_bytes is not None and minimum_workspace > host_workspace_budget_bytes:
+        raise ScheduleInfeasible("minimum host workspace exceeds its explicit allocation budget")
     for scope, cap in capacities.items():
         if cap < 0:
             raise ValueError("capacity must be nonnegative")
@@ -225,6 +241,12 @@ def solve_schedule(
             terms = [buf[k] * c.size_bytes for k, c in storage.items() if c.scope == scope]
             if terms:
                 opt.add(z3.Sum(terms) <= cap)
+        if host_workspace_budget_bytes is not None:
+            terms = [
+                buf[name] * cost.size_bytes for name, cost in storage.items() if cost.scope == "GM"
+            ]
+            if terms:
+                opt.add(z3.Sum(terms) <= host_workspace_budget_bytes)
         for d in dependencies:
             opt.add(starts[d.dst] - starts[d.src] >= latency(d) - d.distance * ii)
         for d in reuse_dependencies:

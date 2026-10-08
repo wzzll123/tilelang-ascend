@@ -32,12 +32,19 @@ def validate_schedule_result(
         *,
         storage=None,
         capacities=None,
+        host_workspace_budget_bytes=None,
         reuse_dependencies=(),
         manual_stages=None,
         dependency_kinds=None,
 ) -> None:
     """Check actual dependency, cyclic resource, stage, and memory inequalities."""
     storage, capacities = dict(storage or {}), dict(capacities or {})
+    if "GM" in capacities:
+        raise ReportValidationError("GM workspace budget is not a local hardware capacity")
+    if host_workspace_budget_bytes is not None and (type(host_workspace_budget_bytes) is not int or
+                                                    host_workspace_budget_bytes < 0):
+        raise ReportValidationError(
+            "host workspace budget must be a nonnegative integer byte count")
     n, ii = len(tasks), result.ii
     if type(ii) is not int or ii < 1:
         raise ReportValidationError("selected II must be a positive integer")
@@ -70,10 +77,15 @@ def validate_schedule_result(
             raise ReportValidationError(f"storage version bound violated for {name}")
         if cost.fixed_versions is not None and count != cost.fixed_versions:
             raise ReportValidationError(f"fixed storage versions violated for {name}")
-        if cost.scope not in capacities:
+        if cost.scope != "GM" and cost.scope not in capacities:
             raise ReportValidationError(f"explicit capacity missing for {cost.scope}")
-        if cost.size_bytes < 0:
-            raise ReportValidationError("storage byte size must be nonnegative")
+        if type(cost.size_bytes) is not int or cost.size_bytes < 0:
+            raise ReportValidationError("storage byte size must be a nonnegative integer")
+    workspace_bytes = sum(cost.size_bytes * result.buffer_versions[name]
+                          for name, cost in storage.items()
+                          if cost.scope == "GM")
+    if host_workspace_budget_bytes is not None and workspace_bytes > host_workspace_budget_bytes:
+        raise ReportValidationError("selected host workspace exceeds its allocation budget")
     for scope, cap in capacities.items():
         footprint = sum(cost.size_bytes * result.buffer_versions[name]
                         for name, cost in storage.items()
@@ -108,6 +120,7 @@ def build_schedule_report(
         stages=None,
         storage=None,
         capacities=None,
+        host_workspace_budget_bytes=None,
         resource_model="A2",
         reuse_dependencies=(),
         result=None,
@@ -162,6 +175,7 @@ def build_schedule_report(
             mapped,
             storage=storage,
             capacities=capacities,
+            host_workspace_budget_bytes=host_workspace_budget_bytes,
             reuse_dependencies=reuse_dependencies,
             manual_stages=manual_stages,
             **solver_options)
@@ -171,6 +185,7 @@ def build_schedule_report(
         result,
         storage=storage,
         capacities=capacities,
+        host_workspace_budget_bytes=host_workspace_budget_bytes,
         reuse_dependencies=reuse_dependencies,
         manual_stages=manual_stages,
         dependency_kinds=[d.kind for d in dependencies])
@@ -237,6 +252,16 @@ def build_schedule_report(
         "schema_version": 1,
         "resource_model": resource_model,
         "capacities": capacities,
+        "host_workspace": {
+            "selected_bytes":
+                sum(cost.size_bytes * result.buffer_versions[name]
+                    for name, cost in storage.items()
+                    if cost.scope == "GM"),
+            "budget_bytes":
+                host_workspace_budget_bytes,
+            "device_available_memory_verified":
+                False,
+        },
         "tasks": task_records,
         "dependencies": dependency_records,
         "reuse_dependencies": [{

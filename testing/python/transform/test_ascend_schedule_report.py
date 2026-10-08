@@ -38,6 +38,43 @@ def example():
     return tasks, edges, costs
 
 
+def test_report_distinguishes_workspace_bytes_from_hardware_capacities():
+    tasks, edges, costs = example()
+    result = report.build_schedule_report(
+        tasks,
+        edges,
+        costs,
+        storage={"workspace": solver.StorageCost(4096, "GM", 2, 2)},
+        host_workspace_budget_bytes=8192)
+    assert result["capacities"] == {}
+    assert result["host_workspace"] == {
+        "selected_bytes": 8192,
+        "budget_bytes": 8192,
+        "device_available_memory_verified": False
+    }
+
+
+def test_injected_schedule_cannot_bypass_host_workspace_budget():
+    tasks = [model.Task("t", "V", "V")]
+    selected = solver.ScheduleResult((0,), (0,), (0,), {"workspace": 2}, 1)
+    with pytest.raises(report.ReportValidationError, match="workspace"):
+        report.build_schedule_report(
+            tasks, [], {"t": solver.TaskCost(1, 1, "V")},
+            storage={"workspace": solver.StorageCost(4096, "GM", 2)},
+            result=selected,
+            host_workspace_budget_bytes=4096)
+
+
+@pytest.mark.parametrize("size", [float("nan"), 1.5, True])
+def test_injected_validator_requires_finite_integer_workspace_bytes(size):
+    selected = solver.ScheduleResult((0,), (0,), (0,), {"workspace": 1}, 1)
+    with pytest.raises(report.ReportValidationError, match="byte"):
+        report.validate_schedule_result([solver.TaskCost(1, 1, "V")], [],
+                                        selected,
+                                        storage={"workspace": solver.StorageCost(size, "GM")},
+                                        host_workspace_budget_bytes=10)
+
+
 @pytest.mark.parametrize("resource_model", ["A2", "A3"])
 def test_preserve_all_dependency_kinds_and_distances(resource_model):
     tasks, edges, costs = example()

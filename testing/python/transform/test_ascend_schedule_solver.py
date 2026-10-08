@@ -27,6 +27,70 @@ def test_straight_pipeline():
     assert result.stages == tuple(t // result.ii for t in result.start_times)
 
 
+def test_gm_workspace_is_not_charged_to_local_hardware_capacity():
+    result = solver.solve_schedule([solver.TaskCost(1, 1, "V")], [],
+                                   storage={
+                                       "local": solver.StorageCost(16, "UB", 2, 2),
+                                       "workspace": solver.StorageCost(4096, "GM", 3, 3)
+                                   },
+                                   capacities={"UB": 32})
+    assert not result.fallback and result.buffer_versions == {"local": 2, "workspace": 3}
+
+
+def test_explicit_host_workspace_budget_constrains_versions():
+    kwargs = dict(
+        tasks=[solver.TaskCost(1, 1, "V")],
+        dependencies=[],
+        storage={"workspace": solver.StorageCost(4096, "GM", 3, 3)})
+    assert solver.solve_schedule(
+        **kwargs, host_workspace_budget_bytes=12288).buffer_versions == {
+            "workspace": 3
+        }
+    with pytest.raises(solver.ScheduleInfeasible, match="workspace"):
+        solver.solve_schedule(**kwargs, host_workspace_budget_bytes=12287)
+
+
+@pytest.mark.parametrize("budget", [-1, True, 1.5])
+def test_host_workspace_budget_is_an_explicit_nonnegative_byte_count(budget):
+    with pytest.raises(ValueError, match="workspace"):
+        solver.solve_schedule([solver.TaskCost(1, 1, "V")], [], host_workspace_budget_bytes=budget)
+
+
+def test_gm_cannot_be_presented_as_a_hardware_capacity():
+    with pytest.raises(ValueError, match="workspace"):
+        solver.solve_schedule([solver.TaskCost(1, 1, "V")], [],
+                              storage={"w": solver.StorageCost(16, "GM")},
+                              capacities={"GM": 32})
+
+
+def test_workspace_budget_affects_joint_version_and_ii_selection():
+    kwargs = dict(
+        tasks=[solver.TaskCost(4, 1, "MTE2"),
+               solver.TaskCost(4, 1, "CUBE")],
+        dependencies=[solver.Dependency(0, 1)],
+        storage={"workspace": solver.StorageCost(16, "GM", 4)},
+        reuse_dependencies=[solver.ReuseDependency(1, 0, "workspace")])
+    wide = solver.solve_schedule(**kwargs, host_workspace_budget_bytes=64)
+    narrow = solver.solve_schedule(**kwargs, host_workspace_budget_bytes=16)
+    assert wide.ii == 2 and wide.buffer_versions["workspace"] == 4
+    assert narrow.ii == 8 and narrow.buffer_versions["workspace"] == 1
+
+
+def test_workspace_versions_do_not_relax_persistent_state_dependency():
+    result = solver.solve_schedule([solver.TaskCost(4, 1, "V")], [solver.Dependency(0, 0, 1)],
+                                   storage={"workspace": solver.StorageCost(16, "GM", 4)})
+    assert result.ii == 4 and result.buffer_versions["workspace"] == 1
+
+
+@pytest.mark.parametrize("size", [float("nan"), 1.5, True])
+def test_invalid_workspace_byte_size_cannot_escape_fallback_accounting(size):
+    with pytest.raises(ValueError, match="byte"):
+        solver.solve_schedule([solver.TaskCost(1, 1, "V")], [],
+                              storage={"workspace": solver.StorageCost(size, "GM")},
+                              host_workspace_budget_bytes=10,
+                              timeout_ms=0)
+
+
 def test_carried_dependency_is_not_rewritten_by_buffer_versions():
     result = solver.solve_schedule(
         [solver.TaskCost(4, 1, "CUBE")],
