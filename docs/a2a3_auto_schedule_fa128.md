@@ -141,6 +141,30 @@ mutation checks execute sync-only, not just compile, and reject deleted waits.
 This does not establish full FA scheduling, cross-core protocols or hardware
 correctness. YAPF 0.40.2, Ruff 0.6.5, codespell 2.3.0 and diff checks passed.
 
+The second milestone was subsequently transferred to the independent Docker
+worktree at `f6f2b6a7f1f6a0e83e2a7d0a67e8751b6fa09c6a`: **270 passed**, 66
+warnings, 11.21 seconds, no skips or failures. The worktree was clean. This
+confirms the same suites with Docker's Z3 4.15.4 and older TVM/native runtime;
+the warnings are Python 3.12/older-TVM parser deprecations.
+
+Reproduce CPU validation inside `wzz_cann`:
+
+```bash
+cd /home/wenzhongzhen/tilelang-ascend-wt/auto-schedule-fa128
+export PYTHONPATH=/home/wenzhongzhen/tilelang-ascend-wt/auto-schedule-fa128:/home/wenzhongzhen/tilelang-ascend/3rdparty/tvm/python
+export TVM_LIBRARY_PATH=/home/wenzhongzhen/tilelang-ascend/build/tvm
+export TILELANG_LIBRARY_PATH=/home/wenzhongzhen/tilelang-ascend-wt/auto-schedule-fa128/build-auto-schedule
+export LD_LIBRARY_PATH="$TILELANG_LIBRARY_PATH:$TVM_LIBRARY_PATH:${LD_LIBRARY_PATH:-}"
+/tmp/a2a3-auto-schedule-fa128-venv.JsRZee/bin/python -m pytest -q --disable-warnings \
+  testing/python/transform \
+  testing/python/language/test_ascend_auto_schedule_annotations.py \
+  testing/python/simulator/test_scheduler.py \
+  testing/python/simulator/test_sync_only.py \
+  testing/python/simulator/test_simulator_memory.py \
+  testing/python/simulator/test_deadlock_detect.py \
+  testing/python/language/test_tilelang_ascend_language_auto_platform.py
+```
+
 ## Docker validation gates — not yet run
 
 Task root:
