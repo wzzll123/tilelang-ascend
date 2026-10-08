@@ -333,3 +333,31 @@ allocation dtypes cannot silently escape the assertion. Invalid geometries
 are rejected before lowering. Larger tiles have no real numerical or timing
 validation yet; native generation is not hardware acceptance. The Docker
 2c83b27d campaign remains frozen32x64 until all three rounds finish.
+
+## Combined input/score composition preflight
+
+The component-level combined-prefetch test discovers complete readonly L1
+input epochs after score GM materialization, then re-plans their lifecycle
+against stages0/1/2. On real64x128 FA native input B1/H1/Q130/KV256, it selects
+K2/V3 and retains score GM2. Physical carried dependencies are reanalyzed
+through distance3, checked against ascending-wave order, and passed to the
+existing mode2/local phased emitter. Generated native source and conservative
+local capacity checks pass on A2/A3, with causal/noncausal. A2 noncausal usage:
+UB149120, L1 196608, L0A32768, L0B65536, L0C65536 bytes. Five focused tests pass.
+
+This is **not production integration or a joint optimized report**: normal
+entry remains the previous two-stage selection. GM certificates are audited
+separately from independently certified L1 epochs; local records are not
+silently claimed as generated GM parameters. A production composite must
+construct a coherent joint report, diagnostics and rejection policy before
+entry selection, then receive real numerical/performance validation.
+
+KV130 at this tile size is deliberately rejected for L1 rotation. The native
+helper clears partial tails only when codegen supplies need_clear=true.
+Codegen recognizes a nonzero version base for clear only with compile-time
+full copied rows. A dynamic partial row count does not meet that contract.
+The L1 certificate therefore cannot infer full-slot initialization from the
+offset-zero unrotated copy or access_ptr extent. The negative test preserves
+this boundary. This does not invalidate the current single-version K/V path;
+supporting rotated KV tails requires a separately proven slot-clear contract,
+not weakening the existing geometry certificate.
