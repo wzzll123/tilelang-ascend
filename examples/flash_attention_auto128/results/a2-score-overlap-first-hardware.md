@@ -43,6 +43,14 @@ allocations are `score: GetWithOffset<float>(1024,28800)` and
 `score_recv: GetWithOffset<float>(1024,32896)`: adjacent, disjoint 4096-byte
 regions. This source inspection is not a timing/overlap measurement.
 
+The same cache's actual runtime parameter metadata identifies case42 Q shape
+`[2,4,192,128]`, automatic GM parameter indices `[5,6,7]`, and workspace shapes
+`[96,32,64]`, `[48,32,64]`, `[48,32,128]`. The first allocation therefore has
+196608 float elements: exactly two 98304-element world slots used by the
+generated offsets, not the old single-slot size. This read-only audit loaded
+`params.pkl` with cloudpickle and `auto_gm_idx.pkl` with JSON, matching the
+real KernelCache serialization despite the latter's filename extension.
+
 Reproduce inside Docker after checking healthy idle card6:
 
 ```bash
