@@ -152,6 +152,7 @@ class NativePolicyTests(unittest.TestCase):
         T = self.tvm.tir
         state = T.decl_buffer((1,), "int32", name="state")
         body = T.IfThenElse(state[0] > 0, T.BufferStore(state, T.IntImm("int32", 0), [0]), None)
+        body = T.AttrStmt(T.IntImm("int32", 0), "resource_scope", 0, body)
         mod = self.tvm.IRModule({"main": T.PrimFunc([], body).with_attr("npu_platform", "A2")})
         source = self.tvm.ir.save_json(mod)
         with self.assertRaisesRegex(entry.AutoScheduleError, "materializer"):

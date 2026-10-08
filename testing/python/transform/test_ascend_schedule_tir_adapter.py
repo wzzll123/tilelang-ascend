@@ -105,7 +105,8 @@ class RealTIRContracts(unittest.TestCase):
             T.IfThenElse(scalar > 0, T.BufferStore(buffer, T.IntImm("int32", 0), [0]), None))
         from importlib import import_module
         normalize = import_module(PACKAGE + ".conditions").normalize_conditions
-        result = adapter.extract_tasks(normalize(body))
+        result = adapter.extract_tasks(
+            T.AttrStmt(T.IntImm("int32", 0), "resource_scope", 0, normalize(body)))
         self.assertEqual(len(result.scalar_bindings), 2)
         self.assertEqual(len(result.tasks), 3)
         self.assertTrue(result.tasks[-1].guard)
@@ -234,6 +235,60 @@ class RealTIRContracts(unittest.TestCase):
         result = adapter.extract_tasks(T.PrimFunc([dst.data], T.Evaluate(call)))
         self.assertEqual(len(result.tasks[0].accesses), 1)
         self.assertEqual(result.tasks[0].accesses[0].mode, "W")
+
+    def test_unscoped_scalar_producer_resolves_to_single_operation_core(self):
+        T = self.tir
+        scalar = T.Var("count", "int32")
+        source, destination = T.Var("source", "handle"), T.Var("destination", "handle")
+        for name, core in (("copy_gm_to_l1", "C"), ("AscendC::Duplicate<float>", "V")):
+            args = ([self.pointer(source),
+                     self.pointer(destination, mask=2), scalar]
+                    if core == "C" else [self.pointer(destination, mask=2), 0, scalar])
+            call = T.Evaluate(T.call_extern("handle", name, *args))
+            result = adapter.extract_tasks(T.LetStmt(scalar, T.IntImm("int32", 8), call))
+            self.assertEqual([task.core for task in result.tasks], [core, core])
+            scalar_write = result.scalar_bindings[0].storage
+            self.assertEqual(scalar_write.domain, core)
+            self.assertTrue(
+                any(access.storage is scalar_write and access.reads
+                    for access in result.tasks[1].accesses))
+
+    def test_mixed_core_unscoped_scalar_controls_require_normalization(self):
+        T = self.tir
+        scalar = T.Var("count", "int32")
+        source, destination = T.Var("source", "handle"), T.Var("destination", "handle")
+        c = T.Evaluate(
+            T.call_extern("handle", "copy_gm_to_l1", self.pointer(source),
+                          self.pointer(destination, mask=2), scalar))
+        v = T.Evaluate(
+            T.call_extern("handle", "AscendC::Duplicate<float>", self.pointer(destination, mask=2),
+                          0, scalar))
+        body = T.LetStmt(scalar, T.IntImm("int32", 8), T.SeqStmt([c, v]))
+        with self.assertRaisesRegex(adapter.ExtractionError, "per-core control normalization"):
+            adapter.extract_tasks(body)
+
+    def test_scoped_mixed_scalar_storage_is_core_private(self):
+        T = self.tir
+        scalar = T.Var("same_scalar", "int32")
+        local = T.decl_buffer((1,), "int32", name="same_local", scope="local")
+        children = []
+        for scope in (0, 1):
+            binding = T.LetStmt(scalar, T.IntImm("int32", scope), T.BufferStore(local, scalar, [0]))
+            children.append(T.AttrStmt(T.IntImm("int32", 0), "resource_scope", scope, binding))
+        result = adapter.extract_tasks(T.SeqStmt(children))
+        self.assertEqual([task.core for task in result.tasks], ["C", "C", "V", "V"])
+        c_scalar, v_scalar = [binding.storage for binding in result.scalar_bindings]
+        self.assertIsNot(c_scalar, v_scalar)
+        self.assertEqual((c_scalar.domain, v_scalar.domain), ("C", "V"))
+        self.assertIs(result.tasks[1].accesses[0].storage, c_scalar)
+        self.assertIs(result.tasks[3].accesses[0].storage, v_scalar)
+        self.assertIsNot(result.tasks[1].accesses[-1].storage, result.tasks[3].accesses[-1].storage)
+
+    def test_scalar_only_unscoped_domain_is_not_invented(self):
+        T = self.tir
+        local = T.decl_buffer((1,), "int32", name="local", scope="local")
+        with self.assertRaisesRegex(adapter.ExtractionError, "per-core control normalization"):
+            adapter.extract_tasks(T.BufferStore(local, T.IntImm("int32", 0), [0]))
 
     def test_actual_extern_gm_hop_composites_rejected(self):
         T = self.tir

@@ -32,6 +32,9 @@ Implemented, with CPU tests:
   those footprints stay unknown until helper/layout semantics are established.
 - Actual TIR `LetStmt` condition snapshots at the original position, including
   inside loops; extraction refers to the real bindings without duplicate work.
+- Unscoped scalar tasks resolve only in an unambiguous single-core context.
+  Mixed C/V control requires per-core normalization, not an invented C owner.
+  Scalar Vars and local-buffer identities are private to their execution core.
 - Same-iteration and carried RAW/WAR/WAW analysis, including uncertain regions.
 - Full-overwrite owner eligibility and iteration/counter clock descriptions;
   initial reads, read-modify-write and partial initialization cannot rotate.
@@ -60,6 +63,8 @@ Still required, in order:
    MTE1/M or cross-core GM-hop work cannot be modeled as a single atomic pipe.
 2. Connect the verified condition snapshots and region proofs to the supported
    task/control-flow reconstruction and helper-specific physical byte regions.
+   Duplicate common mixed-core scalar control into the actual C/V programs
+   while preserving provably equivalent guard/owner epochs.
 3. Connect owner/full-footprint proof, per-core cost/storage model and solver to
    real loops; materialize versions, slot selection, prologue/body/epilogue.
 4. Generate local events and A2/A3 mode-2 cross-core ready/release protocols,
@@ -146,6 +151,10 @@ worktree at `f6f2b6a7f1f6a0e83e2a7d0a67e8751b6fa09c6a`: **270 passed**, 66
 warnings, 11.21 seconds, no skips or failures. The worktree was clean. This
 confirms the same suites with Docker's Z3 4.15.4 and older TVM/native runtime;
 the warnings are Python 3.12/older-TVM parser deprecations.
+
+Execution-domain follow-up: **274 local tests**, 66 subtests passed. Pure C and
+pure V scalar producers resolve correctly; explicitly scoped mixed-core scalar
+and local storage stays separate; ambiguous mixed-core controls are rejected.
 
 Reproduce CPU validation inside `wzz_cann`:
 

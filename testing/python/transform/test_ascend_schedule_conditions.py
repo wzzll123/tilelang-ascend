@@ -51,6 +51,10 @@ class ConditionTests(unittest.TestCase):
         return state, T.IfThenElse(state[0] > 0, T.BufferStore(state, T.IntImm("int32", 0), [0]),
                                    T.BufferStore(state, T.IntImm("int32", 1), [0]))
 
+    def extract_in_core(self, node, core=0):
+        T = self.T
+        return adapter.extract_tasks(T.AttrStmt(T.IntImm("int32", 0), "resource_scope", core, node))
+
     def test_buffer_condition_snapshot_is_real_let_before_write(self):
         state, original = self.stateful_if()
         normalized = conditions.normalize_conditions(original)
@@ -60,7 +64,7 @@ class ConditionTests(unittest.TestCase):
         self.assertIsInstance(binding, self.T.LetStmt)
         self.assertTrue(binding.value.same_as(original.condition))
         self.assertTrue(binding.body.condition.same_as(binding.var))
-        result = adapter.extract_tasks(normalized)
+        result = self.extract_in_core(normalized)
         self.assertEqual(len(result.scalar_bindings), 1)
         self.assertEqual(len(result.tasks), 3)  # Actual Let + then/else writes.
         self.assertTrue(result.scalar_bindings[0].var.same_as(binding.var))
@@ -77,7 +81,7 @@ class ConditionTests(unittest.TestCase):
         second = conditions.normalize_conditions(first)
         self.assertTrue(self.tvm.ir.structural_equal(first, second))
         self.assertEqual(len(self.nodes(first, T.LetStmt)), 2)
-        result = adapter.extract_tasks(first)
+        result = self.extract_in_core(first)
         self.assertEqual(len(result.scalar_bindings), 2)
         self.assertEqual(len(result.tasks[-1].guard), 2)
         for initial in (0, 1):
@@ -91,7 +95,7 @@ class ConditionTests(unittest.TestCase):
         self.assertIsInstance(normalized, T.For)
         self.assertIsInstance(normalized.body, T.AttrStmt)
         self.assertIsInstance(normalized.body.body, T.LetStmt)
-        result = adapter.extract_tasks(normalized)
+        result = self.extract_in_core(normalized)
         self.assertTrue(all(len(result.loops[task.id]) == 1 for task in result.tasks))
         for initial in (0, 1):
             self.assertEqual(self.execute(loop, initial), self.execute(normalized, initial))

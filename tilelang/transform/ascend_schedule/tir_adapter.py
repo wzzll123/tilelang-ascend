@@ -86,19 +86,24 @@ def mask_mode(mask: int | None) -> str:
 class Storage:
     id: int
     var: Any = field(repr=False)
+    domain: str | None = None
 
 
 class StorageInterner:
-    """Canonical tokens compared by identity; wrappers are compared by same_as."""
+    """Canonical physical or per-core scalar tokens using Var.same_as identity.
+
+    domain=None denotes physical buffer storage. Scalar Vars and local buffers
+    are private to their C/V execution domain, even with the same TIR Var.
+    """
 
     def __init__(self):
         self.storages = []
 
-    def intern(self, var) -> Storage:
+    def intern(self, var, domain=None) -> Storage:
         for storage in self.storages:
-            if storage.var.same_as(var):
+            if storage.domain == domain and storage.var.same_as(var):
                 return storage
-        storage = Storage(len(self.storages), var)
+        storage = Storage(len(self.storages), var, domain)
         self.storages.append(storage)
         return storage
 
@@ -131,15 +136,18 @@ def extract_tasks(node) -> Extraction:
     branch reads its snapshot token. Bindings retain the original expression
     and statement for reconstruction; this function does not insert snapshots
     into the input TIR or assert initialization/full-overwrite proofs.
+    Unscoped scalar control can be assigned only when all known tasks identify
+    one execution core; mixed/unknown domains require control normalization.
     """
     from tvm import tir
 
     extractor = _Extractor(tir)
     if isinstance(node, tir.PrimFunc):
         for buffer in node.buffer_map.values():
-            extractor.pool.intern(buffer.data)
+            extractor.memory_storage(buffer.data, buffer.scope())
         node = node.body
     extractor.walk(node)
+    extractor.resolve_domains()
     return Extraction(
         tuple(extractor.tasks), extractor.nodes, extractor.stages, extractor.loops,
         tuple(extractor.bindings), tuple(extractor.pool.storages), tuple(extractor.annotations))
@@ -158,6 +166,52 @@ class _Extractor:
 
     def integer(self, expr):
         return int(expr.value) if isinstance(expr, self.tir.IntImm) else None
+
+    def scalar_storage(self, var):
+        return self.pool.intern(var, self.core or "UNRESOLVED")
+
+    def memory_storage(self, var, scope=None):
+        if scope is None:
+            annotation = getattr(var, "type_annotation", None)
+            scope = getattr(annotation, "storage_scope", "")
+        domain = (self.core or "UNRESOLVED") if str(scope).startswith("local") else None
+        return self.pool.intern(var, domain)
+
+    def resolve_domains(self):
+        """Infer only a single proven core; never invent scalar C ownership."""
+        cores = {task.core for task in self.tasks if task.core != "UNRESOLVED"}
+        unresolved = any(task.core == "UNRESOLVED" for task in self.tasks)
+        if unresolved and len(cores) != 1:
+            raise ExtractionError(
+                "Unscoped scalar tasks require per-core control normalization; "
+                f"cannot assign execution ownership from cores {sorted(cores)}. "
+                "Use explicit resource_scope or decompose/duplicate mixed-core controls.")
+        inferred = next(iter(cores)) if len(cores) == 1 else None
+        remap = {}
+        if inferred is not None:
+            for storage in tuple(self.pool.storages):
+                if storage.domain == "UNRESOLVED":
+                    remap[storage] = self.pool.intern(storage.var, inferred)
+        rewritten = []
+        for task in self.tasks:
+            core = inferred if task.core == "UNRESOLVED" else task.core
+            accesses = tuple(
+                replace(access, storage=remap.get(access.storage, access.storage))
+                for access in task.accesses)
+            guard = (
+                tuple((remap.get(storage, storage), branch) for storage, branch in task.guard)
+                if task.guard else None)
+            if any(access.storage.domain not in (None, core) for access in accesses):
+                raise ExtractionError(
+                    "Scalar storage crosses execution cores; per-core control normalization "
+                    "is required before extraction")
+            rewritten.append(replace(task, core=core, accesses=accesses, guard=guard))
+        self.tasks = rewritten
+        self.bindings = [
+            replace(binding, storage=remap.get(binding.storage, binding.storage))
+            for binding in self.bindings
+        ]
+        self.pool.storages = [storage for storage in self.pool.storages if storage not in remap]
 
     def add_task(self, node, pipe, core, accesses):
         accesses = list(accesses)
@@ -186,7 +240,7 @@ class _Extractor:
             if isinstance(expr, self.tir.BufferLoad):
                 reads.append(self.buffer_access(expr.buffer, expr.indices, "R"))
             elif isinstance(expr, self.tir.Var) and str(expr.dtype) != "handle":
-                storage = self.pool.intern(expr)
+                storage = self.scalar_storage(expr)
                 if storage.id not in seen_vars:
                     seen_vars.add(storage.id)
                     reads.append(Access(storage, "R"))
@@ -195,7 +249,7 @@ class _Extractor:
         return reads
 
     def buffer_access(self, buffer, indices, mode):
-        storage = self.pool.intern(buffer.data)
+        storage = self.memory_storage(buffer.data, buffer.scope())
         size = dtype_bytes(buffer.dtype)
         offset = 0
         extents = [self.integer(extent) for extent in buffer.shape]
@@ -238,14 +292,14 @@ class _Extractor:
             start, count = None, None
         else:
             start, count = start * size, count * size
-        return Access(self.pool.intern(var), mode, start, count, alias=var)
+        return Access(self.memory_storage(var), mode, start, count, alias=var)
 
     def bind(self, node, expression, var=None, kind="let"):
         if var is None:
             raise ExtractionError("A predicate needs an actual scalar binding before extraction; "
                                   "normalize_conditions handles runtime IfThenElse conditions")
-        storage = self.pool.intern(var)
-        task_id = self.add_task(node, "PIPE_S", self.core or "C",
+        storage = self.scalar_storage(var)
+        task_id = self.add_task(node, "PIPE_S", self.core or "UNRESOLVED",
                                 self.expression_reads(expression) + [Access(storage, "W")])
         self.bindings.append(ScalarBinding(task_id, storage, expression, var, kind))
         return storage
@@ -262,6 +316,9 @@ class _Extractor:
             name = call.op.name
             arguments = call.args
         config = operation_config(name, self.configs)
+        core = self.operation_core(normalize_operation(name), config.pipe)
+        prior_core = self.core
+        self.core = core
         accesses = []
         for index, mode in config.accesses:
             if index >= len(arguments):
@@ -293,8 +350,8 @@ class _Extractor:
             accesses = [
                 replace(access, offset=None, extent=None, intervals=None) for access in accesses
             ]
-        core = self.operation_core(normalized_name, config.pipe)
         self.add_task(node, config.pipe, core, accesses)
+        self.core = prior_core
 
     def operation_core(self, name, pipe):
         if pipe in ("PIPE_M", "PIPE_FIX", "PIPE_MTE1"):
@@ -326,7 +383,7 @@ class _Extractor:
                     not any(var.same_as(node.condition) for var in self.snapshot_vars)):
                 raise ExtractionError("Runtime IfThenElse needs an actual snapshot LetStmt; "
                                       "call normalize_conditions before extraction")
-            snapshot = self.pool.intern(node.condition)
+            snapshot = self.scalar_storage(node.condition)
             previous = self.guard
             self.guard += ((snapshot, True),)
             self.walk(node.then_case)
@@ -376,7 +433,7 @@ class _Extractor:
             self.walk(node.block.body)
             self.guard = previous
         elif isinstance(node, T.Allocate):
-            self.pool.intern(node.buffer_var)
+            self.memory_storage(node.buffer_var)
             previous = self.guard
             if self.integer(node.condition) != 1:
                 snapshot = self.bind(node, node.condition, kind="allocation_guard")
@@ -387,7 +444,7 @@ class _Extractor:
             reads = self.expression_reads(node.value)
             for index in node.indices:
                 reads.extend(self.expression_reads(index))
-            self.add_task(node, "PIPE_S", self.core or "C",
+            self.add_task(node, "PIPE_S", self.core or "UNRESOLVED",
                           reads + [self.buffer_access(node.buffer, node.indices, "W")])
         elif isinstance(node, T.Evaluate):
             if isinstance(node.value, T.Call):
