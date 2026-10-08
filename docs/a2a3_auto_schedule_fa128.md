@@ -250,6 +250,33 @@ entry becomes executable, its physical-workspace lowering must replace (not
 run twice with) the later legacy workspace pass. Dual-vector/tail numerical
 acceptance and FA hardware gates remain unverified.
 
+Mode-2 flat-slice follow-up: the A2/A3 emitter now combines real local events
+and source-pipe mode-2 sets with scalar cross waits, preserving original C/V
+resource scopes. It requires an explicit two-Vector participant group, flat
+unguarded tasks, distance-zero dependencies and distinct caller-owned channels.
+Both workspace directions now actually execute sync-only with both Vector
+lanes; native source-generation verifies mode 2 and the empty wait-pipe ABI.
+Deleting a cross set deadlocks. Deleting a cross wait reports uninitialized
+GM consumption when the producer is deliberately delayed; this is an
+adversarial scheduling test, not a hardware timing prediction. Correct
+synchronization passes both normal and delayed-producer schedules.
+
+This integration exposed missing simulator operand metadata for native
+WorkspaceReduction's short GM-to-L1/FIX-copy ABI. The bridge now supplies the
+template dimensions and C++ defaults (including zero-tail meaning a full tile)
+while preserving its existing explicit final ABI. A one-task local emitter
+also needed to avoid the old TVM's prohibited single-element SeqStmt.
+
+The standard migration suites pass **327 tests**, 66 subtests. Adding the
+complete `test_tir_bridge.py` gives **742 passed, 1 failed**: the pre-existing
+`test_row_expand_validates_rows_dtype_alignment_and_tag` expects `256-byte`,
+but the existing diagnostic says `32-byte-aligned physical row stride of
+128..4080 elements`. An isolated probe loading the exact pre-change HEAD
+bridge reproduced that failure. Excluding that known test yields 742 passed,
+1 deselected, 66 subtests; this is not claimed as a fully green bridge suite.
+No NPU binary execution or FA acceptance is claimed. Guarded/cyclic cross-core
+owner protocols and whole-function scheduled materialization remain pending.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

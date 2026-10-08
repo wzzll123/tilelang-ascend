@@ -176,10 +176,10 @@ def emit_local_sync(extraction, dependencies, *, event_ids, order=None):
                         tir.call_intrin("handle", tir.op.Op.get("tl.ascend_set_flag"),
                                         assignment.source_pipe, assignment.destination_pipe,
                                         assignment.event_id)))
-    return LocalSyncResult(
-        tir.SeqStmt(statements), tuple(assignments), tuple(execution_edges),
-        ("flat single-core local synchronization only",
-         "event IDs supplied by caller; no ID reuse within destination pools"))
+    return LocalSyncResult(statements[0] if len(statements) == 1 else tir.SeqStmt(statements),
+                           tuple(assignments), tuple(execution_edges),
+                           ("flat single-core local synchronization only",
+                            "event IDs supplied by caller; no ID reuse within destination pools"))
 
 
 def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):

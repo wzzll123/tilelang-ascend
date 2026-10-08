@@ -62,6 +62,12 @@ def test_same_pipe_fifo_needs_no_event(tir):
     assert result.execution_edges[0].kind == "fifo"
 
 
+def test_single_task_needs_no_illegal_single_element_seqstmt(tir):
+    ext = extraction(tir, ["PIPE_V"])
+    result = emitter.emit_local_sync(ext, [], event_ids=())
+    assert result.statement.same_as(ext.task_nodes[0])
+
+
 def test_deduplicate_hazards_but_never_reuse_event_by_lexical_wait_order(tir):
     ext = extraction(tir, ["PIPE_MTE2", "PIPE_V", "PIPE_MTE2", "PIPE_V"])
     deps = [

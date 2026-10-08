@@ -1039,7 +1039,7 @@ class _TirBridge:
         if short == "copy_gm_to_l1_linear":
             return self._gm_to_l1_linear_metadata(arguments, context)
         if short == "copy_gm_to_l1":
-            return self._gm_to_l1_zn_metadata(arguments, context)
+            return self._gm_to_l1_zn_metadata(arguments, context, operation_tag=normalized)
         if short == "copy_ub_to_ub":
             return self._ub_to_ub_metadata(normalized, arguments, context)
         if short == "copy_ub_to_l1":
@@ -1206,15 +1206,31 @@ class _TirBridge:
         self,
         arguments: tuple[Any, ...],
         context: _Context,
+        operation_tag: str | None = None,
     ) -> dict[str, Any]:
         # Final copy ABI: src, dst, realSrcN, validM, validN, dstM, dstN.
+        if len(arguments) == 5 and operation_tag is not None:
+            marker = "copy_gm_to_l1<"
+            start = operation_tag.find(marker)
+            if start >= 0 and operation_tag.endswith(">"):
+                parameters = operation_tag[start + len(marker):-1].split(",")
+                if len(parameters) == 3:
+                    rows, cols = (int(value.strip()) for value in parameters[1:])
+                    valid_m = self.tir.IntImm("int32", rows) if self._const_int(
+                        arguments[3], context.environment) == 0 else arguments[3]
+                    valid_n = self.tir.IntImm("int32", cols) if self._const_int(
+                        arguments[4], context.environment) == 0 else arguments[4]
+                    arguments = (*arguments[:3], valid_m, valid_n, self.tir.IntImm("int32", rows),
+                                 self.tir.IntImm("int32", cols))
         if len(arguments) != 7:
             return {}
-        dimensions = tuple(self._runtime_int(argument, context.environment) for argument in arguments[2:7])
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment) for argument in arguments[2:7])
         if any(value is None for value in dimensions):
             return {}
         if not all(isinstance(value, int) for value in dimensions):
-            raise UnsupportedSimOpError("functional copy_gm_to_l1 requires static source and tile extents")
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires static source and tile extents")
         source_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
         if any(value < 0 for value in dimensions):
             raise ProgramValidationError("GM-to-L1 zN extents must not be negative")
@@ -1248,7 +1264,8 @@ class _TirBridge:
         itemsize = dtype_size_bytes(source.dtype)
         elements_per_c0 = BYTE_PER_C0 // itemsize
         if physical_cols % elements_per_c0:
-            raise UnsupportedSimOpError("functional copy_gm_to_l1 requires a C0-aligned physical tile")
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a C0-aligned physical tile")
         physical_elements = storage_elements("zN", (physical_rows, physical_cols), itemsize)
         self._reserve_layout_capacity(destination_buffer, physical_elements * itemsize, layout="zN")
         destination_spec = self.buffers[destination_buffer]
@@ -1258,7 +1275,8 @@ class _TirBridge:
         tile_bytes = physical_elements * itemsize
         destination_size = _buffer_size_bytes(destination_spec)
         if not isinstance(destination.byte_offset, int):
-            raise UnsupportedSimOpError("functional copy_gm_to_l1 requires a static destination offset")
+            raise UnsupportedSimOpError(
+                "functional copy_gm_to_l1 requires a static destination offset")
         # The codegen treats a destination offset that is a whole-tile multiple
         # as the primary copy owner (tile base or ring-slot base): it may
         # zero-fill the full physical tile before the valid rectangle lands.
@@ -1267,8 +1285,10 @@ class _TirBridge:
         # (dstM, dstN) zN view and writes only the fractal rows its valid
         # rectangle touches, so previously written bands stay intact.
         if destination.byte_offset % tile_bytes == 0:
-            if destination_size is not None and (destination.byte_offset + tile_bytes > destination_size):
-                raise ProgramValidationError("GM-to-L1 zN physical tile exceeds the destination buffer")
+            if destination_size is not None and (destination.byte_offset + tile_bytes
+                                                 > destination_size):
+                raise ProgramValidationError(
+                    "GM-to-L1 zN physical tile exceeds the destination buffer")
             return {
                 "src": source,
                 "dst": destination,
@@ -1283,25 +1303,23 @@ class _TirBridge:
                 },
             }
         elements_per_fractal = BYTE_PER_FRACTAL // itemsize
-        if physical_rows % C0_NUM_PER_FRACTAL == 0 and destination.byte_offset % (elements_per_fractal * itemsize) == 0:
+        if physical_rows % C0_NUM_PER_FRACTAL == 0 and destination.byte_offset % (
+                elements_per_fractal * itemsize) == 0:
             written_rows = -(-valid_rows // C0_NUM_PER_FRACTAL) * C0_NUM_PER_FRACTAL
             band_stride_elements = physical_rows * elements_per_c0
             base_elements = destination.byte_offset // itemsize
             written_elements_per_band = written_rows * elements_per_c0
-            if (
-                destination_size is not None
-                and (base_elements + (physical_cols // elements_per_c0 - 1) * band_stride_elements + written_elements_per_band) * itemsize
-                > destination_size
-            ):
-                raise ProgramValidationError("GM-to-L1 zN sub-tile bands exceed the destination buffer")
+            if (destination_size is not None and
+                (base_elements + (physical_cols // elements_per_c0 - 1) * band_stride_elements +
+                 written_elements_per_band) * itemsize > destination_size):
+                raise ProgramValidationError(
+                    "GM-to-L1 zN sub-tile bands exceed the destination buffer")
             written_regions = tuple(
                 replace(
                     destination,
                     shape=(written_elements_per_band,),
                     byte_offset=(base_elements + band * band_stride_elements) * itemsize,
-                )
-                for band in range(physical_cols // elements_per_c0)
-            )
+                ) for band in range(physical_cols // elements_per_c0))
             return {
                 "src": source,
                 "dst_regions": written_regions,
@@ -1318,21 +1336,17 @@ class _TirBridge:
             }
 
         if destination.byte_offset % BYTE_PER_C0:
-            raise UnsupportedSimOpError(
-                "functional copy_gm_to_l1 rebased zN copies require a "
-                "32-byte-aligned destination offset; fractal-row-aligned "
-                "offsets are no longer required"
-            )
+            raise UnsupportedSimOpError("functional copy_gm_to_l1 rebased zN copies require a "
+                                        "32-byte-aligned destination offset; fractal-row-aligned "
+                                        "offsets are no longer required")
         written_regions = tuple(
             replace(
                 destination,
                 shape=(min(elements_per_c0, valid_cols - column),),
-                byte_offset=destination.byte_offset
-                + physical_index("zN", row, column, (physical_rows, physical_cols), itemsize) * itemsize,
-            )
-            for row in range(valid_rows)
-            for column in range(0, valid_cols, elements_per_c0)
-        )
+                byte_offset=destination.byte_offset +
+                physical_index("zN", row, column, (physical_rows, physical_cols), itemsize) *
+                itemsize,
+            ) for row in range(valid_rows) for column in range(0, valid_cols, elements_per_c0))
         return {
             "src": source,
             "dst_regions": written_regions,
@@ -1962,41 +1976,63 @@ class _TirBridge:
     ) -> dict[str, Any]:
         # Final ABI: src, dst, dstStrideN, validM, validN, srcM, srcN,
         # enableRelu, unitFlag.
-        if len(arguments) != 9:
-            return {}
         marker = "copy_l0c_to_gm<"
         marker_start = operation_tag.find(marker)
         if marker_start < 0 or not operation_tag.endswith(">"):
             return {}
-        parameters = [parameter.strip() for parameter in operation_tag[marker_start + len(marker) : -1].split(",")]
+        parameters = [
+            parameter.strip()
+            for parameter in operation_tag[marker_start + len(marker):-1].split(",")
+        ]
         if len(parameters) != 6:
             raise UnsupportedSimOpError(f"malformed copy_l0c_to_gm template {operation_tag!r}")
         if parameters[2].lower() not in {"layout::rowmajor", "layout::row_major"}:
-            raise UnsupportedSimOpError(f"functional copy_l0c_to_gm requires RowMajor GM, got {parameters[2]!r}")
+            raise UnsupportedSimOpError(
+                f"functional copy_l0c_to_gm requires RowMajor GM, got {parameters[2]!r}")
         try:
             template_rows, template_cols = (int(parameters[index]) for index in (3, 4))
         except ValueError as error:
-            raise UnsupportedSimOpError("copy_l0c_to_gm requires static source template extents") from error
+            raise UnsupportedSimOpError(
+                "copy_l0c_to_gm requires static source template extents") from error
         relu_templates = {"true": True, "false": False, "1": True, "0": False}
         if parameters[5].lower() not in relu_templates:
             raise UnsupportedSimOpError("copy_l0c_to_gm requires a literal ReLU template flag")
         template_relu = relu_templates[parameters[5].lower()]
-        dimensions = tuple(self._runtime_int(argument, context.environment) for argument in arguments[2:7])
+        # WorkspaceReduction emits src,dst,stride,tailM,tailN; the C++ helper
+        # obtains physical M/N and ReLU from its template, with unitFlag=0.
+        # Keep the explicit final nine-argument simulator ABI unchanged.
+        if len(arguments) in (5, 6):
+            unit_flag = arguments[5] if len(arguments) == 6 else self.tir.IntImm("int32", 0)
+            valid_m = self.tir.IntImm("int32", template_rows) if self._const_int(
+                arguments[3], context.environment) == 0 else arguments[3]
+            valid_n = self.tir.IntImm("int32", template_cols) if self._const_int(
+                arguments[4], context.environment) == 0 else arguments[4]
+            arguments = (*arguments[:3], valid_m, valid_n, self.tir.IntImm("int32", template_rows),
+                         self.tir.IntImm("int32",
+                                         template_cols), self.tir.IntImm("bool",
+                                                                         template_relu), unit_flag)
+        if len(arguments) != 9:
+            return {}
+        dimensions = tuple(
+            self._runtime_int(argument, context.environment) for argument in arguments[2:7])
         if any(value is None for value in dimensions):
             return {}
         if not all(isinstance(value, int) for value in dimensions):
             raise UnsupportedSimOpError("functional copy_l0c_to_gm requires static dimensions")
         destination_cols, valid_rows, valid_cols, physical_rows, physical_cols = dimensions
         if min(destination_cols, physical_rows, physical_cols) <= 0:
-            raise ProgramValidationError("copy_l0c_to_gm physical extents and GM stride must be positive")
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical extents and GM stride must be positive")
         if valid_rows < 0 or valid_cols < 0:
             raise ProgramValidationError("copy_l0c_to_gm valid extents must not be negative")
         if valid_rows > physical_rows or valid_cols > physical_cols:
-            raise ProgramValidationError("copy_l0c_to_gm valid rectangle must fit its physical L0C tile")
+            raise ProgramValidationError(
+                "copy_l0c_to_gm valid rectangle must fit its physical L0C tile")
         if valid_cols > destination_cols:
             raise ProgramValidationError("copy_l0c_to_gm valid columns exceed the GM row stride")
         if (physical_rows, physical_cols) != (template_rows, template_cols):
-            raise ProgramValidationError("copy_l0c_to_gm physical extents disagree with its template")
+            raise ProgramValidationError(
+                "copy_l0c_to_gm physical extents disagree with its template")
         relu_argument = self._literal(self.analyzer.simplify(arguments[7]))
         if not isinstance(relu_argument, (bool, int)):
             raise UnsupportedSimOpError("copy_l0c_to_gm requires a literal enable_relu argument")
@@ -2037,7 +2073,8 @@ class _TirBridge:
             raise ProgramValidationError("copy_l0c_to_gm buffer dtypes disagree with its template")
         source_bytes = source_capacity_elements * dtype_size_bytes(source.dtype)
         if not isinstance(source.byte_offset, int) or source.byte_offset % source_bytes:
-            raise UnsupportedSimOpError("functional copy_l0c_to_gm requires a tile-base-aligned source")
+            raise UnsupportedSimOpError(
+                "functional copy_l0c_to_gm requires a tile-base-aligned source")
         source_size = _buffer_size_bytes(source_spec)
         if source_size is not None and source.byte_offset + source_bytes > source_size:
             raise ProgramValidationError("copy_l0c_to_gm physical source tile exceeds its buffer")
