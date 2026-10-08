@@ -154,3 +154,13 @@ including final physical UB capacity/disjointness checks. Compiler regression:
 or simulator setting was added. This candidate has no real precision/timing
 result yet and is not deployed over the live frozen32x64 performance campaign.
 No performance gain or90% acceptance is inferred from tile size or generation.
+
+### Iteration3 terminal performance result
+
+The frozen2c83b27d three-round process exited0. All84 original JSONs and336
+CSV files were verified and archived. Geomean v06/auto=0.104285: FAIL.
+Every case regresses; the largest noncausal case14 is1338.34us vs22930.36us.
+Full medians, round values and archive SHA256 are in
+`results/a2-score-three-round-performance.md`. The original msprof case14
+A/B wrapper is now used separately to identify pipe-level costs. No cause
+or larger-tile gain is inferred before those metrics arrive.

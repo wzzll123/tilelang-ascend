@@ -1,0 +1,1 @@
+{"case_index": 13, "elapsed_us": 702.25, "device_kernels_us": {"main_kernel": 702.25}, "warmup": 3, "repeat": 20, "prof_dir": "/tmp/perf_tilelang_500911_0sm80fww", "task_dir": "/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention"}

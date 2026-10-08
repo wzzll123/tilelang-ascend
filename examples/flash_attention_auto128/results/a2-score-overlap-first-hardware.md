@@ -40,8 +40,9 @@ for these fixed inputs, not all inputs or shapes.
 After terminal precision evidence and a fresh healthy/idle card6 check, the
 tracked `run_card6_score_perf.sh` started three-round same-case serial
 v06/auto128 comparison: warmup3, repeat20, original profiler and no boost.
-Its results remain pending; no performance acceptance, arbitrary-input
-stability or A3 hardware result is claimed. This is direct hardware validation,
+That process subsequently completed: all84 reports were verified and the
+geomean is0.104285, so performance FAILED (see `a2-score-three-round-performance.md`).
+No arbitrary-input stability or A3 hardware result is claimed. This is direct hardware validation,
 without simulator execution. Q/KV-tail generation tests do not substitute for
 additional real-device tail cases beyond this fixed fourteen-case set.
 
