@@ -486,6 +486,36 @@ export LD_LIBRARY_PATH="$TILELANG_LIBRARY_PATH:$TVM_LIBRARY_PATH:${LD_LIBRARY_PA
 
 ## Docker validation gates — not yet run
 
+### Developer-task placement and GEMM owner lifetime follow-up
+
+The new entry now assigns missing C/V scopes from extracted physical calls,
+without invoking legacy CombineCV. Mixed owners remain core-neutral; only their
+operations are scoped. Single-core owners keep a flat body with their scope
+outside the owner, so initialization and drain share that domain. Existing
+matching scopes are preserved; contradictory scopes and repeated node identities
+remain errors. Immediate tensor scalar operands fail closed: merely labeling the
+enclosing call PIPE_V does not model its scalar GetValue or hidden barrier.
+
+GEMM decomposition can allocate its freshly created, distinct L0A/L0B scratch at
+an unconditional common root outside loop owners. The registry is the actual
+created buffers, not a name-prefix heuristic. User allocations are not hoisted;
+conditional roots fail closed. Aggregate capacity and physical dependency checks
+still apply. Hoisted scratch reuse retains distance-one MMA-to-MTE1 WAR edges.
+Unconditional sequence expansion is flattened without crossing scopes or guards.
+
+A2/A3 tests execute generated GEMM/FIX loops for 1/2/5 epochs in full numeric and
+sync-only modes, check correct CPU output and flag balance, reject removed-wait
+mutants, and generate native source with exposed MMA tasks and real events.
+Expanded local regression: **795 passed, 1 deselected**, 66 subtests; the same
+pre-existing row-expand diagnostic exclusion remains. This is not NPU validation.
+
+An actual AST-loaded Developer FA128 example was lowered without importing its
+top-level Torch/NPU launch code. This exposed a bound nested-loop IV being treated
+as unallocated memory; that diagnosis is fixed and tested. General row loops and
+tensor-scalar operations are still not admitted. Whole-FA guards, tails,
+coordinated version selection, event reuse and the 14-case hardware acceptance
+remain open; these unit milestones do not satisfy final delivery.
+
 Task root:
 `/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention`.
 New kernel destination: `design/tile_level/ladder/fa_auto128.py` under that root.

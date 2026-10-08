@@ -172,6 +172,8 @@ def materialize_flat_function(function, extraction, platform):
         allocations.append((var, scope_names[scope], (byte_count + 31) // 32 * 32))
 
     def collect(node):
+        if isinstance(node, tir.For):
+            scalar_variables.append(node.loop_var)
         if isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent" and isinstance(
                 node.node, tir.IterVar):
             scalar_variables.append(node.node.var)

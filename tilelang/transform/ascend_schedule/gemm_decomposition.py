@@ -97,13 +97,17 @@ def decompose_gemm_v0(call, l0a, l0b):
     return tir.SeqStmt([tir.Evaluate(copy_a), tir.Evaluate(copy_b), tir.Evaluate(mma)])
 
 
-def decompose_function_gemms(function):
+def decompose_function_gemms(function, *, root_scratch=False):
     """Expose GEMM tasks and allocate logical scratch at each statement site.
 
     This transformation deliberately preserves enclosing loops, branches and
     Stage annotations. It does not schedule, emit synchronization, rotate slots,
     or grant permission to alias these allocations. Those are separate steps.
     Late Flatten2DBuffer/AscendMemoryPlanning discover the new 2D allocations.
+    With root_scratch, only buffers created in this invocation are allocated at
+    an unconditional common root outside all serial owners. This deliberately
+    retains distinct callsite identities and exposes their carried reuse edges.
+    It never hoists user allocations based on their names.
     """
     from tvm import tir
 
@@ -122,6 +126,42 @@ def decompose_function_gemms(function):
     if not gemms:
         return function
 
+    root = None
+    if root_scratch:
+        candidates = []
+
+        def find_root(node, unconditional=True):
+            if isinstance(node, tir.BlockRealize):
+                valid = (
+                    unconditional and isinstance(node.predicate, tir.IntImm) and
+                    bool(int(node.predicate)) and not node.iter_values and
+                    not node.block.iter_vars and node.block.init is None and
+                    not node.block.match_buffers)
+                contained = []
+                tir.stmt_functor.post_order_visit(
+                    node.block.body,
+                    lambda item: contained.append(item) if isinstance(item, tir.Call) and getattr(
+                        item.op, "name", None) == "tl.ascend_gemm_v0" else None)
+                if valid and len(contained) == len(gemms):
+                    candidates.append(node.block)
+                find_root(node.block.body, valid)
+            elif isinstance(node, (tir.AttrStmt, tir.Allocate)):
+                if isinstance(node, tir.Allocate):
+                    unconditional = (
+                        unconditional and isinstance(node.condition, tir.IntImm) and
+                        bool(int(node.condition)))
+                find_root(node.body, unconditional)
+            elif isinstance(node, tir.SeqStmt):
+                for child in node.seq:
+                    find_root(child, unconditional)
+            # Roots beneath a loop/branch do not establish a kernel lifetime.
+
+        find_root(function.body)
+        if not candidates:
+            raise ValueError("GEMM scratch requires an unconditional common root outside owners")
+        root = candidates[0]
+    scratch_buffers = []
+
     def fresh_name(prefix):
         index = 0
         while f"{prefix}_{index}" in names:
@@ -138,12 +178,42 @@ def decompose_function_gemms(function):
         a = tir.decl_buffer((m, k), "float16", name=fresh_name("auto_l0a"), scope="wmma.matrix_a")
         b = tir.decl_buffer((k, n), "float16", name=fresh_name("auto_l0b"), scope="wmma.matrix_b")
         body = decompose_gemm_v0(node.value, a, b)
+        if root is not None:
+            scratch_buffers.extend((a, b))
+            return body
         for scratch in (b, a):
             body = tir.Allocate(scratch.data, scratch.dtype, scratch.shape, tir.const(True, "bool"),
                                 body)
         return body
 
-    body = tir.stmt_functor.ir_transform(function.body, None, rewrite)
+    if root is not None:
+        # Replace the certified root pre-order; only its body is decomposed.
+        # The fresh buffer registry is populated exactly once, before attaching
+        # it to that root. No rebuilt-node name matching or arbitrary hoist.
+        def attach(node):
+            if node.same_as(root):
+
+                def expand(item):
+                    result = rewrite(item)
+                    if result is not None:
+                        return result
+                    if isinstance(item, tir.SeqStmt):
+                        children = []
+                        for child in item.seq:
+                            children.extend(
+                                child.seq if isinstance(child, tir.SeqStmt) else [child])
+                        return children[0] if len(children) == 1 else tir.SeqStmt(children)
+                    return None
+
+                rewritten = tir.stmt_functor.ir_transform(node.body, None, expand)
+                return tir.Block(node.iter_vars, node.reads, node.writes, node.name_hint, rewritten,
+                                 node.init, [*node.alloc_buffers, *scratch_buffers],
+                                 node.match_buffers, node.annotations, getattr(node, "span", None))
+            return None
+
+        body = tir.stmt_functor.ir_transform(function.body, attach, None)
+    else:
+        body = tir.stmt_functor.ir_transform(function.body, None, rewrite)
     remaining = []
     tir.stmt_functor.post_order_visit(
         body, lambda node: remaining.append(node) if isinstance(node, tir.Call) and getattr(

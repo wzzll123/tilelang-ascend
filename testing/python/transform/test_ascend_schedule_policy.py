@@ -86,18 +86,19 @@ class BootstrapTests(unittest.TestCase):
     def test_flag_on_extracts_then_errors_no_fallback(self):
         mod = self.module()
         with patch.object(entry, "extract_tasks") as extract, \
-                patch.object(entry, "decompose_function_gemms", side_effect=lambda node: node) as decompose, \
+                patch.object(entry, "decompose_function_gemms", side_effect=lambda node, **kwargs: node) as decompose, \
+                patch.object(entry, "normalize_core_scopes", side_effect=lambda node, extraction: node), \
                 patch.object(entry, "normalize_conditions", side_effect=lambda node: node) as normalize:
             with self.assertRaisesRegex(entry.AutoScheduleError, "materializ"):
                 entry.schedule_module(mod, "ascendc", {KEY: True})
             extract.assert_called_once_with(mod.functions["main"])
             normalize.assert_called_once_with(mod.functions["main"])
-            decompose.assert_called_once_with(mod.functions["main"])
+            decompose.assert_called_once_with(mod.functions["main"], root_scratch=True)
 
     def test_extraction_error_retains_multi_pipe_diagnostic(self):
         mod = self.module()
         with patch.object(entry, "extract_tasks", side_effect=ValueError("multi-pipe gemm_v0")), \
-                patch.object(entry, "decompose_function_gemms", side_effect=lambda node: node), \
+                patch.object(entry, "decompose_function_gemms", side_effect=lambda node, **kwargs: node), \
                 patch.object(entry, "normalize_conditions", side_effect=lambda node: node), \
                 self.assertRaisesRegex(ValueError, "multi-pipe gemm_v0"):
             entry.schedule_module(mod, "ascendc", {KEY: True})

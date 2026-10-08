@@ -10,6 +10,32 @@ import tvm
 from tvm import tir
 
 
+def test_nested_loop_index_is_bound_scalar_not_unallocated_memory():
+    from tilelang.transform.ascend_schedule.entry import schedule_module, AutoScheduleError
+    ub = tir.decl_buffer((8,), "float32", name="ub", scope="shared.ub")
+    output = tir.decl_buffer((8,), "float32", name="output", scope="global")
+    handle = tir.Var("output_handle", "handle")
+    epoch, row = tir.Var("epoch", "int32"), tir.Var("row", "int32")
+    inner = tir.For(row, 0, 2, tir.ForKind.SERIAL, tir.Evaluate(T.tile.fill(ub, row)))
+    owner = tir.For(epoch, 0, 2, tir.ForKind.SERIAL, inner)
+    body = tir.SeqStmt([
+        tir.Evaluate(T.tile.fill(ub, 0)), owner,
+        tir.Evaluate(
+            tir.call_extern("handle", "copy_ub_to_gm<float,8>", ub.access_ptr("r"),
+                            output.access_ptr("w"), 8))
+    ])
+    root = tir.Block([], [], [],
+                     "root",
+                     tir.AttrStmt(tir.IntImm("int32", 1), "resource_scope", 1, body),
+                     alloc_buffers=[ub])
+    function = tir.PrimFunc([handle], tir.BlockRealize([], True, root), buffer_map={
+        handle: output
+    }).with_attr("npu_platform", "A2")
+    with pytest.raises(AutoScheduleError, match="one shared serial owner"):
+        schedule_module(
+            tvm.IRModule({"main": function}), "ascendc", {"tl.ascend_auto_schedule": True})
+
+
 @pytest.mark.parametrize("iterations", [0, 1, 3])
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 def test_persistent_accumulator_survives_all_three_phases(iterations, platform):

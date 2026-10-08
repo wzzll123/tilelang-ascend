@@ -406,7 +406,7 @@ def assert_automatic_cv_phases(function, platform, ub, out):
 
             enclosed = candidate.with_body(
                 tir.stmt_functor.ir_transform(candidate.body, None, enclose_cut))
-            with pytest.raises(AutoScheduleError, match="core-neutral shared cut"):
+            with pytest.raises(AutoScheduleError, match="contradictory nested core scopes"):
                 schedule_module(
                     tvm.IRModule({"main": enclosed}), "ascendc", {"tl.ascend_auto_schedule": True})
 

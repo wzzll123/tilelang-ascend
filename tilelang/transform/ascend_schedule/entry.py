@@ -8,6 +8,7 @@ from .conditions import normalize_conditions
 from .gemm_decomposition import decompose_function_gemms
 from .workspace_tasks import prepare_cross_core_copies
 from .ub_versions import prepare_ub_versions
+from .core_scopes import normalize_core_scopes
 from .materializer import materialize_flat_function, MaterializationError
 
 
@@ -32,10 +33,17 @@ def schedule_module(mod, target_model, config):
     mod = prepare_cross_core_copies(mod)
     functions = {}
     for name, function in mod.functions.items():
-        function = normalize_conditions(decompose_function_gemms(function))
+        try:
+            function = normalize_conditions(decompose_function_gemms(function, root_scratch=True))
+        except ValueError as error:
+            raise AutoScheduleError("tl.ascend_auto_schedule GEMM preparation: " + str(error) +
+                                    "; no legacy synchronization fallback was applied.") from error
         extraction = extract_tasks(function)
         try:
             try:
+                scoped = normalize_core_scopes(function, extraction)
+                if scoped is not function:
+                    function, extraction = scoped, extract_tasks(scoped)
                 function, extraction = prepare_ub_versions(function, extraction,
                                                            str(function.attrs["npu_platform"]))
             except ValueError as error:

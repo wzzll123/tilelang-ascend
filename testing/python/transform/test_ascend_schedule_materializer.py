@@ -203,7 +203,8 @@ def test_automatic_flat_vector_entry_executes_without_manual_flags(platform):
 
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
-def test_automatic_gemm_and_fixpipe_epoch_has_correct_cpu_values(platform):
+@pytest.mark.parametrize("iterations", [None, 1, 2, 5])
+def test_automatic_gemm_and_fixpipe_epoch_has_correct_cpu_values(platform, iterations):
     import numpy as np
     from tilelang.simulator import (build_kernel_program, FunctionalSimulator, SimulatorConfig,
                                     BufferRegion, MemoryScope)
@@ -221,6 +222,10 @@ def test_automatic_gemm_and_fixpipe_epoch_has_correct_cpu_values(platform):
     body = tir.AttrStmt(
         tir.IntImm("int32", 0), "resource_scope", 0,
         tir.SeqStmt([tir.Evaluate(gemm), tir.Evaluate(fix)]))
+    if iterations is not None:
+        # No hand-written core scope or synchronization. Generated L0 scratch
+        # must dominate this owner and have real carried reuse fences.
+        body = tir.For(tir.Var("epoch", "int32"), 0, iterations, tir.ForKind.SERIAL, body.body)
     root = tir.Block([], [], [], "root", body, alloc_buffers=[a, b, c])
     function = tir.PrimFunc([handle], tir.BlockRealize([], True, root), buffer_map={
         handle: output
@@ -234,3 +239,41 @@ def test_automatic_gemm_and_fixpipe_epoch_has_correct_cpu_values(platform):
     sim.run()
     result = sim.read(BufferRegion("output", MemoryScope.GM, (16, 16), "float32"))
     np.testing.assert_array_equal(result, np.full((16, 16), 16, dtype="float32"))
+    if iterations is not None:
+        from tilelang.simulator import MemoryHazardError, SimulationDeadlockError
+
+        pure_sync = FunctionalSimulator(
+            build_kernel_program(scheduled, platform=platform),
+            SimulatorConfig(platform=platform, sync_only=True, flag_balance_check="error"))
+        for name in ("a", "b"):
+            pure_sync.write(
+                BufferRegion(name, MemoryScope.L1, (256,), "float16", core_id=0), np.ones(256))
+        pure_sync.run()
+
+        def remove_wait(node):
+            if isinstance(node, tir.Evaluate) and isinstance(node.value, tir.Call) and \
+                    node.value.op.name == "tl.ascend_wait_flag":
+                return tir.Evaluate(0)
+            return None
+
+        broken = scheduled.with_body(
+            tir.stmt_functor.ir_transform(scheduled.body, None, remove_wait))
+        sim = FunctionalSimulator(
+            build_kernel_program(broken, platform=platform),
+            SimulatorConfig(platform=platform, sync_only=True, flag_balance_check="error"))
+        for name in ("a", "b"):
+            sim.write(
+                BufferRegion(name, MemoryScope.L1, (256,), "float16", core_id=0), np.ones(256))
+        with pytest.raises((MemoryHazardError, SimulationDeadlockError)):
+            sim.run()
+
+        from tilelang.engine.phase import OptimizeForTarget
+        target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
+        mod = tir.transform.BindTarget(target)(
+            tvm.IRModule({"probe": scheduled.with_attr("global_symbol", "probe")}))
+        with tvm.transform.PassContext(config={"tl.ascend_auto_schedule": True}):
+            mod = OptimizeForTarget(mod, target, platform)
+        source = tvm.get_global_func("target.build.tilelang_ascend")(mod, target,
+                                                                     platform).get_source()
+        assert "gemm_v0<" not in source and "mma<half,float,16,16>" in source
+        assert "SetFlag<" in source and "WaitFlag<" in source

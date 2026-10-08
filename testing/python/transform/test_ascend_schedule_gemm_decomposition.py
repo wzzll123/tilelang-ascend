@@ -141,6 +141,56 @@ def test_no_gemm_preserves_function_identity():
     assert decompose_function_gemms(function).same_as(function)
 
 
+def test_root_scratch_hoist_is_explicit_distinct_and_has_carried_hazards():
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+    from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks
+    from tilelang.transform.ascend_schedule.dependency import analyze_dependencies
+
+    call, _, _ = example()
+    epoch = tir.Var("epoch", "int32")
+    owner = tir.For(epoch, 0, 2, tir.ForKind.SERIAL,
+                    tir.SeqStmt([tir.Evaluate(call), tir.Evaluate(call)]))
+    root = tir.Block([], [], [], "root", owner)
+    function = tir.PrimFunc([], tir.BlockRealize([], True, root))
+    result = decompose_function_gemms(function, root_scratch=True)
+    buffers = result.body.block.alloc_buffers
+    assert len(buffers) == 4
+    assert len({buffer.data.name for buffer in buffers}) == 4
+    assert [buffer.scope() for buffer in buffers] == ["wmma.matrix_a", "wmma.matrix_b"] * 2
+    allocations = []
+    tir.stmt_functor.post_order_visit(
+        result.body, lambda node: allocations.append(node)
+        if isinstance(node, tir.Allocate) else None)
+    assert not allocations
+    assert result.body.block.body.loop_var.same_as(epoch)
+    extraction = extract_tasks(result)
+    edges = analyze_dependencies(extraction.tasks, max_distance=1)
+    # Hoisting creates real reuse across epochs; the MMA read must finish before
+    # the next MTE1 load overwrites that same callsite's L0 scratch.
+    assert {(edge.source, edge.target, edge.kind, edge.distance) for edge in edges
+           } >= {(2, 0, "WAR", 1), (2, 1, "WAR", 1), (5, 3, "WAR", 1), (5, 4, "WAR", 1)}
+    assert decompose_function_gemms(result, root_scratch=True).same_as(result)
+
+
+def test_root_scratch_does_not_hoist_user_allocations_or_cross_conditional_roots():
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+
+    call, _, _ = example()
+    user = tir.decl_buffer((8,), "float16", name="auto_l0a_user", scope="wmma.matrix_a")
+    root = tir.Block([], [], [], "root",
+                     tir.Allocate(user.data, user.dtype, user.shape, tir.const(True, "bool"),
+                                  tir.Evaluate(call)))
+    result = decompose_function_gemms(
+        tir.PrimFunc([], tir.BlockRealize([], True, root)), root_scratch=True)
+    assert len(result.body.block.alloc_buffers) == 2
+    assert result.body.block.body.buffer_var.same_as(user.data)
+    predicate = tir.Var("predicate", "bool")
+    conditional = tir.PrimFunc([predicate],
+                               tir.IfThenElse(predicate, tir.BlockRealize([], True, root), None))
+    with pytest.raises(ValueError, match="unconditional common root"):
+        decompose_function_gemms(conditional, root_scratch=True)
+
+
 def test_enabled_entry_decomposes_gemm_but_still_rejects_missing_materializer():
     from tvm import IRModule
     from tilelang.transform.ascend_schedule.entry import schedule_module, AutoScheduleError
@@ -148,7 +198,7 @@ def test_enabled_entry_decomposes_gemm_but_still_rejects_missing_materializer():
     call, _, _ = example()
     function = tir.PrimFunc([], tir.Evaluate(call)).with_attr("npu_platform", "A2")
     mod = IRModule({"main": function})
-    with pytest.raises(AutoScheduleError, match="extraction succeeded"):
+    with pytest.raises(AutoScheduleError, match="unconditional common root"):
         schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})
     assert mod["main"].body.value.same_as(call)
 
