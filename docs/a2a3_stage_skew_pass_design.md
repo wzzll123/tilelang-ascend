@@ -137,3 +137,40 @@ protocols; prove all slot ready/release/seed/drain paths; check native source an
 actual-device FA precision/profiling. None of these obligations is discharged
 by simply increasing max_stage. Do not represent the standalone helper as
 completed automatic software pipelining.
+
+## Group-relative generated-workspace coverage
+
+`workspace_epoch.certify_workspace_epoch_write` returns a typed writer
+partition certificate, not an `Access.full_overwrite` hint or a versioning
+authorization. A Cube writes one complete group tile; the two Vector
+participants write complementary half-tile intervals. The version pitch is
+the entire generated GM allocation, while coverage is relative to one group.
+Conflating these two sizes would incorrectly authorize arbitrary group reads.
+
+The first admitted geometry is an unconditional generated compact GM view,
+one dominating `blockIdx.x`, two `threadIdx.x` participants, exact group/shard
+offsets, complete native DMA dimensions and a source allocation on the actual
+ancestor path. All resource scopes must agree, including nested scopes.
+Different buffer views sharing the same data variable are rejected. FIX is
+restricted to a complete 16-aligned compact L0C tile at source base zero;
+MTE3 requires a 32-byte-aligned UB base and contiguous local row pitch.
+Address intermediates and participant indices must fit their native integer
+types. The FIX boolean template argument is `enRelu`; both recognized values
+preserve coverage. It is not an atomic mode.
+
+Test-first writer coverage:26 tests pass, including actual native-lowered
+single/three-group C/V cases. New negatives reproduced seven validation gaps
+before the first fix, then two more row-pitch/address-overflow gaps before the
+second fix. A further narrowing source-pointer cast reproduced a third
+validation gap: TVM clips Cast bounds to the destination range, so the
+preconversion bounds must separately fit that range. Remaining negatives
+include partial DMA, conditional execution,
+unknown participants, source role/geometry/base and ordinary user GM input.
+This module is not yet used for production GM version admission: every reader
+still needs the same group partition proof and all endpoints need a common
+owner clock and lifetime protocol. No new numerical or hardware result is
+claimed for this isolated writer certificate.
+
+Nine-file regression including this certificate:151 tests pass locally, with
+17744 existing TVM/Python AST deprecation warnings. The local test wrapper now
+includes this suite by default; the actual library paths remain printed.

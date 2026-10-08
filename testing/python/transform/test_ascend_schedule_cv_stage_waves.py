@@ -22,7 +22,7 @@ from tilelang.transform.ascend_schedule.workspace_proof import certify_workspace
 from tilelang.transform.ascend_schedule.workspace_tasks import prepare_cross_core_copies
 
 
-def fixture(platform, trips):
+def fixture(platform, trips, groups=1):
     acc = tir.decl_buffer((16, 16), "float32", name="acc", scope="wmma.accumulator")
     ub = tir.decl_buffer((8, 16), "float16", name="ub", scope="shared.ub")
     out = tir.decl_buffer((8, 16), "float16", name="out", scope="shared.ub")
@@ -54,7 +54,7 @@ def fixture(platform, trips):
                                       "root",
                                       owner,
                                       alloc_buffers=[acc, ub, out, l1, l0]))
-    for tag, count in (("threadIdx.x", 2), ("blockIdx.x", 1)):
+    for tag, count in (("threadIdx.x", 2), ("blockIdx.x", groups)):
         axis = tir.IterVar(None, tir.Var(tag.replace(".", "_"), "int32"), tir.IterVar.ThreadIndex,
                            tag)
         body = tir.AttrStmt(axis, "thread_extent", count, body)

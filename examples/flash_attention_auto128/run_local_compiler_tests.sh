@@ -20,7 +20,8 @@ if test "$#" -eq 0; then
         testing/python/transform/test_ascend_schedule_l1_prefetch.py \
         testing/python/transform/test_ascend_schedule_materializer.py \
         testing/python/transform/test_ascend_schedule_buffer_versions.py
-    set -- "$@" testing/python/transform/test_ascend_schedule_cv_stage_waves.py
+    set -- "$@" testing/python/transform/test_ascend_schedule_cv_stage_waves.py \
+        testing/python/transform/test_ascend_schedule_workspace_epoch.py
 fi
 # Append (not prepend) the old isolated site directory: its setuptools58 is
 # incompatible with Python3.13 and must not shadow Conda's installed packages.
