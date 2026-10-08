@@ -50,8 +50,18 @@ have one real-device precision pass; each unmodified JSON is archived here as
 terminated with exit code 0, and all fourteen reports were independently read
 back and checked for `ok: true` and `device: npu`.
 
-Only cases0/42/10 currently have an explicit cached-source wave audit recorded
-above. Precision alone does not establish which scheduling path every other
-case used. Repeated numerical stability, explicit finiteness and new prefetch
+Follow-up CPU-only cache inspection matched each fixed case uniquely against
+its first three parameter shapes plus the causal query-row code. Full cache
+keys and both source/parameter SHA256 values are recorded in
+`prefetch-native-cache-audit.csv`. All fourteen sources contain a wave loop,
+16384-element K/V allocations and 8192-element slot pitches. This excludes
+sequential fallback in those cached sources. Parameter inspection used
+`pickletools.genops`, not `pickle.load`, so no serialized objects were executed.
+Cases13/15 have identical source hashes but different parameter shapes/hashes;
+source hashes alone cannot identify a case. Cache inspection by itself is not
+proof of historical loading; here it is paired with the explicit fixed cache
+in the actual validation environment above.
+
+Repeated numerical stability, explicit finiteness and new prefetch
 performance gates remain pending. This is not completion of the migration or
 the >=0.90 performance requirement.
