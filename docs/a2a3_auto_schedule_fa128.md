@@ -55,6 +55,12 @@ Implemented, with CPU tests:
   is not a loop/cross-core/software-pipeline materializer or full compiler path.
   Event IDs are never reused in this slice; a textually prior wait is not proof
   it executed before another asynchronous source set. Exhaustion is explicit.
+- FP16 single-tile GEMM decomposition into actual L1-to-L0A, L1-to-L0B and
+  MMA TIR tasks using explicit caller-owned scratch, without hidden flags.
+  Supported static aligned M/N/K <=128, kL0Size=128, FP32 C. Init and the
+  transpose-B actual-N behavior follow the original numerical helper. Operand
+  and scratch capacities are checked. Scratch allocation/placement/lifetimes
+  and automatic pass integration are still pending.
 
 Still required, in order:
 
@@ -155,6 +161,14 @@ the warnings are Python 3.12/older-TVM parser deprecations.
 Execution-domain follow-up: **274 local tests**, 66 subtests passed. Pure C and
 pure V scalar producers resolve correctly; explicitly scoped mixed-core scalar
 and local storage stays separate; ambiguous mixed-core controls are rejected.
+
+GEMM decomposition follow-up: **284 local tests**, 66 subtests passed. Ten new
+tests verify real intrinsic arguments, unsupported families/capacities, and
+the extracted MTE1/MTE1/M tasks feeding dependency analysis and event emission.
+This is not a numerical or NPU GEMM/FA acceptance result. A runtime symbolic
+`n_actual` is preserved for code generation, but the current simulator's direct
+L1-to-L0 copy dimension decoder still requires concrete dimensions; that gap
+must be addressed before dynamic-tail sync-only acceptance.
 
 Reproduce CPU validation inside `wzz_cann`:
 
