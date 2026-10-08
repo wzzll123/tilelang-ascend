@@ -1,0 +1,127 @@
+diff --git a/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py b/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py
+index ae0ec640..c2892076 100644
+--- a/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py
++++ b/skills/tilelang2ascend-tilelang-designer/scripts/verification_tilelang.py
+@@ -33,6 +33,7 @@ TileLang 功能验证脚本 —— 精度口径与 cannbench 官方评测对齐
+ """
+ 
+ import logging
++import math
+ import os
+ import sys
+ import traceback
+@@ -167,33 +168,54 @@ def _get_input_groups(module):
+     return groups
+ 
+ 
+-def _run_case(ref_model, cand_model, inputs, device, index):
++def _require_finite(value, path):
++    """Extra CPU output gate; does not replace the cannbench comparator."""
++    if isinstance(value, torch.Tensor):
++        if (torch.is_floating_point(value) or torch.is_complex(value)) and not torch.isfinite(value).all().item():
++            raise ValueError(f"{path}: candidate output contains NaN or infinity")
++    elif isinstance(value, (list, tuple)):
++        for index, item in enumerate(value):
++            _require_finite(item, f"{path}[{index}]")
++    elif isinstance(value, dict):
++        for key, item in value.items():
++            _require_finite(item, f"{path}[{key!r}]")
++    elif isinstance(value, float) and not math.isfinite(value):
++        raise ValueError(f"{path}: candidate output contains NaN or infinity")
++
++
++def _run_case(ref_model, cand_model, inputs, device, index, *, check_finite=False, repeat_checks=1):
+     """单 case 三线执行 + cannbench 口径比对。
+ 
+     Returns (ok, comparison_msg, input_summary)。
+     """
+     inputs = list(inputs)
++    if type(repeat_checks) is not int or repeat_checks < 1:
++        raise ValueError("repeat_checks must be a positive integer")
+ 
+     # golden（CPU fp64）+ native（CPU 原 dtype）—— cannbench fp64_cpu 策略
+     with torch.no_grad():
+         golden_out = _normalize_output(ref_model(*_to_f64_clone(inputs)))
+         native_out = _normalize_output(ref_model(*_clone_value(inputs)))
+ 
+-    # candidate（NPU，原 dtype）
+-    cand_inputs = _move_to_device(_clone_value(inputs), device)
+-    with torch.no_grad():
+-        cand_out = _normalize_output(cand_model(*cand_inputs))
+-    ai_out = _move_to_device(cand_out, "cpu")
+-
+     dtype_str = _case_dtype(inputs)
+-    if _contains_int8_tensor(golden_out) and _contains_int8_tensor(ai_out):
+-        # int8：cann 口径为精确匹配
+-        ok, msg = _compare_group_cannbench(ai_out, golden_out, native_out,
+-                                           dtype_str, f"case[{index}]")
+-    else:
++    summary = _summarize_value(inputs, f"inputs[{index}]")
++    for repetition in range(repeat_checks):
++        # Fresh inputs avoid mutation carry-over; every launch is compared,
++        # unlike profiler repeats that do not inspect numerical results.
++        cand_inputs = _move_to_device(_clone_value(inputs), device)
++        with torch.no_grad():
++            cand_out = _normalize_output(cand_model(*cand_inputs))
++        ai_out = _move_to_device(cand_out, "cpu")
++        if check_finite:
++            _require_finite(ai_out, f"case[{index}] repeat[{repetition + 1}]")
+         ok, msg = _compare_group_cannbench(ai_out, golden_out, native_out,
+                                            dtype_str, f"case[{index}]")
+-    summary = _summarize_value(inputs, f"inputs[{index}]")
++        if not ok:
++            if repeat_checks > 1:
++                msg += f" (repeat {repetition + 1}/{repeat_checks})"
++            return False, msg, summary
++    if repeat_checks > 1:
++        msg += f" (all {repeat_checks} repeated launches matched)"
+     return ok, msg, summary
+ 
+ 
+@@ -214,8 +236,9 @@ def _make_report(op):
+     }
+ 
+ 
+-def _run_verification(task_dir_arg: str, case_filter=None):
++def _run_verification(task_dir_arg: str, case_filter=None, *, check_finite=False, repeat_checks=1):
+     report = _make_report(Path(task_dir_arg).name)
++    report.update(check_finite=check_finite, repeat_checks=repeat_checks)
+ 
+     task_dir = Path(task_dir_arg)
+     if not task_dir.is_dir():
+@@ -258,7 +281,8 @@ def _run_verification(task_dir_arg: str, case_filter=None):
+         selected = case_filter if case_filter else range(len(input_groups))
+         for index in selected:
+             inputs = input_groups[index]
+-            ok, msg, summary = _run_case(ref_model, cand_model, inputs, device, index)
++            ok, msg, summary = _run_case(ref_model, cand_model, inputs, device, index,
++                                        check_finite=check_finite, repeat_checks=repeat_checks)
+             comparisons.append(f"case[{index}]: {msg}")
+             print(f"RESULT case[{index}] {'OK' if ok else 'FAIL'} {msg}", flush=True)
+             summaries.extend(summary)
+@@ -342,9 +366,15 @@ def main():
+     ap.add_argument("--case", type=int, action="append", default=None,
+                     help="case 序号（0 起，可多次；缺省全部）")
+     ap.add_argument("--json", dest="json_path", default=None)
++    ap.add_argument("--check-finite", action="store_true", help="reject non-finite candidate outputs")
++    ap.add_argument("--repeat-checks", type=int, default=1, help="compare each repeated launch")
+     ap.add_argument("--compile-only", action="store_true",
+                     help="只编译+首跑 candidate（触发 tilelang per-shape 编译），不做精度比对")
+     args = ap.parse_args()
++    if args.repeat_checks < 1:
++        ap.error("--repeat-checks must be positive")
++    if args.compile_only and (args.check_finite or args.repeat_checks != 1):
++        ap.error("finite/repeated precision checks cannot be combined with --compile-only")
+ 
+     if args.compile_only:
+         report = _compile_only(args.task_dir, case_filter=args.case)
+@@ -354,7 +384,8 @@ def main():
+             Path(args.json_path).write_text(_json.dumps(report, ensure_ascii=False))
+         raise SystemExit(0 if report["ok"] else 1)
+ 
+-    report = _run_verification(args.task_dir, case_filter=args.case)
++    report = _run_verification(args.task_dir, case_filter=args.case,
++                                check_finite=args.check_finite, repeat_checks=args.repeat_checks)
+     _print_report(report)
+     if args.json_path:
+         Path(args.json_path).write_text(_json.dumps(report, ensure_ascii=False))

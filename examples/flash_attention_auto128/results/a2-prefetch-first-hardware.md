@@ -41,6 +41,17 @@ Follow-up single precision runs also passed:
 Both original JSON reports are preserved alongside case0. Their real cached
 sources also contain the new wave: case42 has `epoch_wave < 4`; case10 has
 `epoch_wave < floordiv(floormod(cid,16),2)+2`. These are not sequential fallback
-passes. Three of fourteen fixed cases have passed one precision run. The other
-eleven, repeated numerical stability, explicit finiteness and performance gates
-are still pending.
+passes.
+
+The remaining cases `2,6,7,12,13,14,15,16,36,37,41` subsequently passed the same
+original verification script, serially on card6. All fourteen fixed cases now
+have one real-device precision pass; each unmodified JSON is archived here as
+`fa128-prefetch-1aeedc56-caseN-precision.json`. The serial fail-fast shell loop
+terminated with exit code 0, and all fourteen reports were independently read
+back and checked for `ok: true` and `device: npu`.
+
+Only cases0/42/10 currently have an explicit cached-source wave audit recorded
+above. Precision alone does not establish which scheduling path every other
+case used. Repeated numerical stability, explicit finiteness and new prefetch
+performance gates remain pending. This is not completion of the migration or
+the >=0.90 performance requirement.
