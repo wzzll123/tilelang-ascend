@@ -65,3 +65,16 @@ Integration must replace original-source same-pipe FIFO constraints with those
 of the reconstructed wave order, without dropping any true RAW/WAR/WAW edges;
 otherwise moving V before the current P workspace receive conflicts with an
 artificial old FIFO edge. Protocol minimization must be rechecked for that order.
+
+`materialize_l1_prefetch` now applies the selected counts to all candidates,
+refreshing the rebuilt owner after each rewrite. It then re-extracts physical
+storage identities and supplies ring access footprints, complete body
+dependencies and per-edge event slot counts. Both distance0 ready/release pairs
+and carried reuse pairs use the selected count; setting only carried counts
+would leave a one-slot same-iteration protocol and can deadlock stage0 against
+stage1 in the same wave. Persistent storage keeps its original distance1 edges.
+
+Tests exercise combined K/V rewrites for actual A2/A3 causal/noncausal FA input,
+and a scoped native DMA fixture feeding the real mode2 event emitter and stage
+wave reconstruction. This does not yet prove production phase-boundary emission
+or hardware execution. Those remain integration gates before enabling the path.

@@ -28,6 +28,16 @@ class PrefetchDiscovery:
     diagnostics: tuple
 
 
+@dataclass(frozen=True)
+class PrefetchMaterialization:
+    function: object
+    extraction: object
+    owner: object
+    stages: dict
+    dependencies: tuple
+    slot_counts: dict
+
+
 def discover_l1_prefetch(function, extraction):
     from tvm import tir
     from .l1_epoch import certify_l1_epoch_write, certify_l1_epoch_read
@@ -245,3 +255,92 @@ def solve_l1_prefetch(function, discovery, platform):
         capacities=allocation_budgets(platform),
         reuse_dependencies=reuse,
         resource_model=platform)
+
+
+def materialize_l1_prefetch(function, discovery, counts):
+    """Apply jointly validated counts and refresh all physical identities.
+
+    The caller must obtain counts from joint capacity validation. This step
+    checks their lifecycle requirement again, but does not create events or
+    issue reordered tasks. It supplies the exact ring dependencies and event
+    slot counts needed by the subsequent synchronization/wave reconstruction.
+    """
+    from tvm import tir
+    from .buffer_versions import materialize_iteration_versions
+    from .tir_adapter import extract_tasks
+    from .dependency import analyze_dependencies
+
+    expected = {f"prefetch_{index}" for index in range(len(discovery.candidates))}
+    if not expected or not expected <= counts.keys():
+        raise ValueError("joint materialization needs every certified prefetch selection")
+    original_ids = tuple(task.id for task in extract_tasks(function).tasks)
+    chosen = []
+    for index, candidate in enumerate(discovery.candidates):
+        count = counts[f"prefetch_{index}"]
+        if type(count) is not int or count != candidate.plan.count or count < 2:
+            raise ValueError("selected slot count violates the certified stage lifecycle")
+        # The previous allocation rewrite rebuilt the owner node. Never reuse
+        # its old object identity for the next candidate in the same owner.
+        fresh = extract_tasks(function)
+        contexts = [
+            fresh.loops[task.id] for task in fresh.tasks if any(
+                access.storage.var.same_as(candidate.buffer.data) for access in task.accesses)
+        ]
+        if not contexts or any(len(context) != 1 for context in contexts) or any(
+                not context[0].same_as(contexts[0][0]) for context in contexts):
+            raise ValueError("joint materialization lost the exclusive candidate owner")
+        owner = contexts[0][0]
+        plan = replace(candidate.plan, owners=(replace(candidate.plan.owners[0], loop=owner),))
+        function = materialize_iteration_versions(function, candidate.buffer, plan)
+        chosen.append((candidate, count))
+    fresh = extract_tasks(function)
+    if tuple(task.id for task in fresh.tasks) != original_ids:
+        raise ValueError("joint materialization changed task identity/order unexpectedly")
+    owners = [fresh.loops[task.id][0] for task in fresh.tasks if task.id in discovery.stages]
+    if not owners or any(not owner.same_as(owners[0]) for owner in owners):
+        raise ValueError("joint materialization lost the common owner")
+    owner = owners[0]
+    selected = dict(function.attrs.get("tl.ascend.selected_buffer_versions", {}).items())
+    for candidate, count in chosen:
+        selected[candidate.buffer.data] = tir.IntImm("int32", count)
+    function = function.with_attr("tl.ascend.selected_buffer_versions", selected)
+
+    def ring_access(access):
+        match = next(((candidate, count)
+                      for candidate, count in chosen
+                      if access.storage.var.same_as(candidate.buffer.data)), None)
+        if match is None:
+            return access
+        candidate, count = match
+        return replace(
+            access,
+            offset=0,
+            extent=candidate.size_bytes,
+            intervals=None,
+            iteration_stride=candidate.size_bytes,
+            ring_size=count,
+            owner=owner,
+            full_overwrite=access.mode == "W")
+
+    tasks = tuple(
+        replace(task, accesses=tuple(ring_access(access)
+                                     for access in task.accesses))
+        for task in fresh.tasks)
+    fresh = replace(fresh, tasks=tasks)
+    body = tuple(task for task in tasks if task.id in discovery.stages)
+    dependencies = tuple(analyze_dependencies(body, max_distance=max(count for _, count in chosen)))
+    slot_counts = {}
+    for edge in dependencies:
+        match = next(
+            ((candidate, count)
+             for candidate, count in chosen
+             if edge.storage is not None and edge.storage.var.same_as(candidate.buffer.data)), None)
+        if match is None:
+            continue
+        count = match[1]
+        key = edge.source, edge.target, edge.distance
+        if key in slot_counts and slot_counts[key] != count:
+            raise ValueError("one event pair has conflicting version clocks")
+        slot_counts[key] = count
+    return PrefetchMaterialization(function, fresh, owner, dict(discovery.stages), dependencies,
+                                   slot_counts)

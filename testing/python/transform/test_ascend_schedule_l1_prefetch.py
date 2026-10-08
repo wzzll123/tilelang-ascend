@@ -81,6 +81,80 @@ def test_joint_solver_selects_versions_with_persistent_storage_fixed():
     assert all(count == 1 for name, count in counts.items() if name.startswith("fixed_"))
 
 
+def test_joint_materialization_refreshes_owner_and_models_real_reuse_distance():
+    from tilelang.transform.ascend_schedule.l1_prefetch import (discover_l1_prefetch,
+                                                                materialize_l1_prefetch)
+    function, _, tiles = fixture()
+    discovery = discover_l1_prefetch(function, extract_tasks(function))
+    result = materialize_l1_prefetch(function, discovery, {"prefetch_0": 2, "prefetch_1": 2})
+    selected = [
+        buffer for buffer in result.function.body.block.alloc_buffers if any(
+            buffer.data.same_as(tile.data) for tile in tiles)
+    ]
+    assert len(selected) == 2
+    assert all(tuple(map(int, buffer.shape)) == (16384,) for buffer in selected)
+    candidate_edges = [
+        edge for edge in result.dependencies
+        if edge.storage is not None and any(edge.storage.var.same_as(tile.data) for tile in tiles)
+    ]
+    assert {edge.distance for edge in candidate_edges} == {0, 2}
+    assert all(count == 2 for count in result.slot_counts.values())
+    assert all(context[0].same_as(result.owner) for context in result.extraction.loops.values())
+    # L0B is shared by the two consumers and remains one physical version.
+    assert any(edge.distance == 1 for edge in result.dependencies if edge.kind == "WAW")
+
+
+def test_joint_materialization_cannot_accept_unproven_single_slot_selection():
+    from tilelang.transform.ascend_schedule.l1_prefetch import (discover_l1_prefetch,
+                                                                materialize_l1_prefetch)
+    function, _, _ = fixture()
+    discovery = discover_l1_prefetch(function, extract_tasks(function))
+    with pytest.raises(ValueError, match="lifecycle"):
+        materialize_l1_prefetch(function, discovery, {"prefetch_0": 1, "prefetch_1": 2})
+
+
+def test_joint_ring_dependencies_feed_actual_event_bundles_and_stage_waves():
+    from dataclasses import replace
+    from tilelang.transform.ascend_schedule.l1_prefetch import (discover_l1_prefetch,
+                                                                materialize_l1_prefetch)
+    from tilelang.transform.ascend_schedule.cross_sync import emit_mode2_loop_sync
+    from tilelang.transform.ascend_schedule.stage_skew import materialize_staged_owner
+    function, owner, _ = fixture()
+    scoped = tir.For(
+        owner.loop_var, owner.min, owner.extent, owner.kind,
+        tir.SeqStmt([
+            tir.AttrStmt(tir.IntImm("int32", 0), "resource_scope", 0, node)
+            for node in owner.body.seq
+        ]))
+    function = function.with_body(
+        tir.stmt_functor.ir_transform(function.body, None, lambda node: scoped
+                                      if node.same_as(owner) else None))
+    vid = tir.IterVar(None, tir.Var("vid", "int32"), tir.IterVar.ThreadIndex, "threadIdx.x")
+    function = function.with_body(tir.AttrStmt(vid, "thread_extent", 2, function.body))
+    discovery = discover_l1_prefetch(function, extract_tasks(function))
+    physical = materialize_l1_prefetch(function, discovery, {"prefetch_0": 2, "prefetch_1": 2})
+    body = replace(physical.extraction, loops={task.id: () for task in physical.extraction.tasks})
+    synchronized = emit_mode2_loop_sync(
+        physical.function,
+        physical.owner,
+        body,
+        physical.dependencies,
+        local_ids=tuple(range(8)),
+        cross_ids=tuple(range(8)),
+        slot_counts=physical.slot_counts)
+    owners = []
+    tir.stmt_functor.post_order_visit(
+        synchronized.body, lambda node: owners.append(node) if isinstance(node, tir.For) else None)
+    assert len(owners) == 1
+    staged = materialize_staged_owner(synchronized, owners[0], body.task_nodes, physical.stages,
+                                      physical.dependencies)
+    waves = []
+    tir.stmt_functor.post_order_visit(
+        staged.body, lambda node: waves.append(node) if isinstance(node, tir.For) else None)
+    assert len(waves) == 1 and int(waves[0].extent) == 3
+    assert all(isinstance(node, tir.IfThenElse) for node in waves[0].body.seq)
+
+
 def test_joint_capacity_not_two_independent_per_buffer_checks(monkeypatch):
     pytest.importorskip("z3")
     from tilelang.transform.ascend_schedule.l1_prefetch import discover_l1_prefetch, solve_l1_prefetch
@@ -133,3 +207,15 @@ def test_production_fa_discovers_kv_but_not_q_or_softmax_probability(platform, c
     assert any(message.startswith("q:") for message in discovery.diagnostics)
     assert any(
         message.startswith("p:") and "readonly" in message for message in discovery.diagnostics)
+    from tilelang.transform.ascend_schedule.l1_prefetch import materialize_l1_prefetch
+    physical = materialize_l1_prefetch(function, discovery, {"prefetch_0": 2, "prefetch_1": 2})
+    candidate_vars = [candidate.buffer.data for candidate in discovery.candidates]
+    edges = [
+        edge for edge in physical.dependencies if edge.storage is not None and any(
+            edge.storage.var.same_as(var) for var in candidate_vars)
+    ]
+    assert {edge.distance for edge in edges} == {0, 2}
+    assert any(edge.kind == "WAR" and edge.distance == 2 for edge in edges)
+    records = physical.function.attrs["tl.ascend.iteration_versions"]
+    assert len(records) == 2
+    assert all([int(record[0]), int(record[1])] == [2, 8192] for record in records.values())
