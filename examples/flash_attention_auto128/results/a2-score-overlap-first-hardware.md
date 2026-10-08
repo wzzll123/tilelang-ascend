@@ -34,6 +34,15 @@ the live execution must reach terminal evidence and reports must be read back.
 No performance result, arbitrary-input stability or A3 hardware result is
 claimed. This is direct hardware validation, without simulator execution.
 
+Read-back of the new cache's native `kernel.cu` (cache key
+`e046fc54eaf3bdac759e916177b90f0574d8b52873544ae68c679b61f2321c9a`)
+also confirms the pipeline actually reached generated code: four epoch waves
+for three data epochs, score GM offsets alternating two world-sized slots,
+mode2 FIX ready notifications and next-stage Vector waits. The generated UB
+allocations are `score: GetWithOffset<float>(1024,28800)` and
+`score_recv: GetWithOffset<float>(1024,32896)`: adjacent, disjoint 4096-byte
+regions. This source inspection is not a timing/overlap measurement.
+
 Reproduce inside Docker after checking healthy idle card6:
 
 ```bash
