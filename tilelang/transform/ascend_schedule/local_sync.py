@@ -214,6 +214,11 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
     positions = {t.id: i for i, t in enumerate(tasks)}
     pipes = {t.id: _pipe(t.pipe) for t in tasks}
     pairs = {}
+    minimum_distance = {}
+    for dependency in dependencies:
+        key = dependency.source, dependency.target
+        minimum_distance[key] = min(
+            minimum_distance.get(key, dependency.distance), dependency.distance)
     for d in dependencies:
         if d.kind not in ("RAW", "WAR", "WAW"):
             raise LocalSyncError("only RAW/WAR/WAW loop dependencies are supported")
@@ -221,6 +226,12 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
             raise LocalSyncError("dependency references missing loop task")
         if d.distance == 0 and positions[d.source] >= positions[d.target]:
             raise LocalSyncError("same-iteration dependency contradicts lexical order")
+        # The source pipe's FIFO orders later instances after this source.
+        # Its shortest emitted fence therefore also establishes every longer
+        # edge between the same task pair. A second ready/release protocol can
+        # invert lexical order and create a deadlock that is absent in the TIR.
+        if d.distance > minimum_distance[d.source, d.target]:
+            continue
         if pipes[d.source] != pipes[d.target]:
             pairs[d.source, d.target, d.distance] = None
 

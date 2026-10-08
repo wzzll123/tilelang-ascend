@@ -12,6 +12,51 @@ from tilelang.transform.ascend_schedule.entry import schedule_module
 
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("iterations", [0, 1, 2, 5])
+def test_automatic_single_loop_preserves_reuse_and_drains(platform, iterations):
+    from tilelang.simulator import build_kernel_program, FunctionalSimulator, SimulatorConfig
+
+    ub = tir.decl_buffer((8,), "float32", name="ub", scope="shared.ub")
+    output = tir.decl_buffer((8,), "float32", name="output", scope="global")
+    handle = tir.Var("output_handle", "handle")
+    index = tir.Var("iteration", "int32")
+    operations = tir.SeqStmt([
+        tir.Evaluate(T.tile.fill(ub, 1)),
+        tir.Evaluate(
+            tir.call_extern("handle", "copy_ub_to_gm<float,8>", ub.access_ptr("r"),
+                            output.access_ptr("w"), 8)),
+    ])
+    loop = tir.For(index, 3, iterations, tir.ForKind.SERIAL, operations)
+    body = tir.AttrStmt(tir.IntImm("int32", 1), "resource_scope", 1, loop)
+    root = tir.Block([], [], [], "root", body, alloc_buffers=[ub])
+    function = tir.PrimFunc([handle], tir.BlockRealize([], True, root), buffer_map={
+        handle: output
+    }).with_attr("npu_platform", platform)
+    scheduled = schedule_module(
+        tvm.IRModule({"main": function}), "ascendc", {"tl.ascend_auto_schedule": True})["main"]
+    report = json.loads(str(scheduled.attrs["tl.ascend.schedule_report"]))
+    assert report["materialization"] == "single local owner loop"
+    sim = FunctionalSimulator(
+        build_kernel_program(scheduled, platform=platform),
+        SimulatorConfig(platform=platform, sync_only=True, flag_balance_check="error"))
+    sim.run()
+    # A protocol with its final drain removed must not pass accounting, even
+    # when the owner executes zero iterations. This checks actual execution.
+    from tilelang.simulator import SimulationDeadlockError
+
+    def remove_drain(node):
+        if isinstance(node, tir.SeqStmt) and any(isinstance(child, tir.For) for child in node.seq):
+            return tir.SeqStmt(list(node.seq)[:-1])
+        return None
+
+    mutated = scheduled.with_body(tir.stmt_functor.ir_transform(scheduled.body, None, remove_drain))
+    with pytest.raises(SimulationDeadlockError, match="FLAG ACCOUNTING"):
+        FunctionalSimulator(
+            build_kernel_program(mutated, platform=platform),
+            SimulatorConfig(platform=platform, sync_only=True, flag_balance_check="error")).run()
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
 def test_automatic_flat_vector_entry_executes_without_manual_flags(platform):
     from tilelang.simulator import build_kernel_program, FunctionalSimulator, SimulatorConfig
 

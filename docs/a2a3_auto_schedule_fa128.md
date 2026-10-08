@@ -373,6 +373,23 @@ failure excluded. These are CPU/native-source results, not NPU FA acceptance.
 Whole-function loop/guard reconstruction, calibrated optimization and safe
 alias admission remain necessary for the original FA128 performance goal.
 
+Single-local-owner follow-up: the executable entry now accepts one unconditional
+serial loop containing all tasks, with one physical version and no nested
+control. Original allocation/core/thread wrappers remain intact. Same-iteration
+and distance-one RAW/WAR/WAW stay in the report; redundant longer fences between
+the same task pair are discharged by source-pipe FIFO plus the shortest emitted
+fence, rather than being emitted as a second handshake. Initial credits and
+final drain execute even for an empty owner.
+
+Test-first validation covered A2/A3 with loop minimum 3 and extents 0/1/2/5;
+all execute true sync-only with balance checking. Removing the final drain is
+rejected in every case. Expanded local regression: **759 passed, 1 deselected**,
+66 subtests (the existing row-expand diagnostic mismatch above). This is still
+a conservative single-version local loop, **not** complete FA software
+pipelining. Mixed C/V owner integration, guarded execution, scalar/control
+reconstruction and joint version materialization remain outstanding; no NPU
+correctness or performance acceptance is claimed.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

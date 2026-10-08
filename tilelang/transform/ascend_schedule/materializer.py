@@ -3,8 +3,9 @@
 """Executable flat-epoch bootstrap for the structured scheduling materializer."""
 
 import json
+from dataclasses import replace
 from .dependency import analyze_dependencies
-from .local_sync import emit_local_sync
+from .local_sync import emit_local_sync, emit_loop_sync, LocalSyncError
 from .cross_sync import emit_mode2_sync
 from .analysis_report import build_schedule_report
 from .solver import TaskCost, StorageCost
@@ -29,8 +30,29 @@ def materialize_flat_function(function, extraction, platform):
 
     tasks = tuple(extraction.tasks)
     if (not isinstance(function, tir.PrimFunc) or not tasks or extraction.scalar_bindings or
-            any(extraction.loops.values()) or any(task.guard not in (None, ()) for task in tasks)):
+            any(task.guard not in (None, ()) for task in tasks)):
         raise MaterializationError("structured loop/guard/scalar materializer is not integrated")
+    owner_loop = None
+    if any(extraction.loops.values()):
+        contexts = [extraction.loops[task.id] for task in tasks]
+        if (len({task.core for task in tasks}) != 1 or
+                any(len(context) != 1 for context in contexts) or
+                any(not context[0].same_as(contexts[0][0]) for context in contexts)):
+            raise MaterializationError("only a single unconditional local owner loop is integrated")
+        owner_loop = contexts[0][0]
+        if owner_loop.kind != tir.ForKind.SERIAL:
+            raise MaterializationError("owner loop must be serial")
+        nodes = [extraction.task_nodes[task.id] for task in tasks]
+        expected = nodes[0] if len(nodes) == 1 else tir.SeqStmt(nodes)
+        from tvm import ir
+        if not ir.structural_equal(owner_loop.body, expected):
+            raise MaterializationError("owner loop must contain only its extracted flat tasks")
+        loop_nodes = []
+        tir.stmt_functor.post_order_visit(
+            function.body, lambda node: loop_nodes.append(node)
+            if isinstance(node, tir.For) else None)
+        if len(loop_nodes) != 1:
+            raise MaterializationError("additional loops need structured lifetime reconstruction")
     if any(stage != 0 for stage in extraction.stages.values()):
         raise MaterializationError("nonzero Stage requires an owner-loop materializer")
     for annotation in extraction.annotations:
@@ -42,6 +64,8 @@ def materialize_flat_function(function, extraction, platform):
             "physical addresses need a validated asynchronous alias contract")
     allocations = []
     scalar_variables = [var for var in function.params if str(var.dtype) != "handle"]
+    if owner_loop is not None:
+        scalar_variables.append(owner_loop.loop_var)
     scope_names = {
         "shared.ub": "UB",
         "shared.l1": "L1",
@@ -99,7 +123,8 @@ def materialize_flat_function(function, extraction, platform):
             if scope not in permitted.get(task.core, set()):
                 raise MaterializationError(
                     "on-chip storage is inaccessible from its task core domain")
-    dependencies = list(analyze_dependencies(tasks, max_distance=0))
+    dependencies = list(
+        analyze_dependencies(tasks, max_distance=1 if owner_loop is not None else 0))
     # Preserve actual hardware FIFO in the feasibility model as well as emission.
     from .model import Dependency
     last = {}
@@ -125,10 +150,24 @@ def materialize_flat_function(function, extraction, platform):
         capacities=allocation_budgets(platform),
         resource_model=platform)
     report.update(
-        materialization="flat local/CV epoch",
+        materialization="single local owner loop"
+        if owner_loop is not None else "flat local/CV epoch",
         timing="unit-cost feasibility; not calibrated NPU timing",
         alias_policy="disjoint physical allocations until async alias contracts are integrated")
-    if len({task.core for task in tasks}) > 1:
+    if owner_loop is not None:
+        body_extraction = replace(extraction, loops={task.id: () for task in tasks})
+        try:
+            synchronized = emit_loop_sync(
+                body_extraction, owner_loop, dependencies, event_ids=tuple(range(8)))
+        except LocalSyncError as error:
+            raise MaterializationError(str(error)) from error
+
+        def rewrite_loop(node):
+            return synchronized if node.same_as(owner_loop) else None
+
+        result = function.with_body(
+            tir.stmt_functor.ir_transform(function.body, None, rewrite_loop))
+    elif len({task.core for task in tasks}) > 1:
         result = emit_mode2_sync(
             function,
             extraction,
