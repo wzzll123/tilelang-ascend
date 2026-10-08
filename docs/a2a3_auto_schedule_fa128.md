@@ -516,6 +516,40 @@ tensor-scalar operations are still not admitted. Whole-FA guards, tails,
 coordinated version selection, event reuse and the 14-case hardware acceptance
 remain open; these unit milestones do not satisfy final delivery.
 
+Docker CPU follow-up at **19329738492ec8e511f2f3e74d09289d1b598aa1**:
+the expanded suite (including `test_tir_bridge.py` with the documented exclusion)
+reported **795 passed, 1 deselected**, 348 warnings, in **43.39 seconds**.
+The independent worktree remained clean. It loaded the worktree Python package
+and `build-auto-schedule` native library with the explicit TVM/venv paths above;
+no NPU launch, global Python install change, main-checkout modification, or push.
+
+### Next real-FA gate: native VID broadcast/count rewriting
+
+Source inspection found a concrete mismatch in `src/transform/ascend_vid_reduction.cc`:
+UB allocations and access-pointer extents are halved, but `tl.ascend_broadcast`
+explicit shape operands are not. `BroadcastOpCodegen` consumes those operands.
+Replacing the example's row scalar loops with broadcasts is therefore not yet a
+safe workaround. Before admitting the automatic FA fixture, add native tests and
+fix the following together:
+
+- Axis-one `[M,N] <- [M]` / `[M,1]`: change both row counts to the actual mapped
+  shapes; first slice requires full zero-offset operands and static even M.
+- Axis-zero `[M,N] <- [N]` / `[1,N]`: only destination rows are distributed;
+  preserve the replicated column source before building reduced buffer mappings.
+- Preserve workspace byte arenas. Broadcast workspace is not row data: the
+  aligned FP32 axis-one heuristic in `allocate_tmp_buffer.cc` needs 256 bytes
+  independent of M, so blindly halving that arena is not justified.
+- Reject unsupported slices/contradictory storage roles; prove shape and pointer
+  span agreement, check generated native arrays and distinct row values on both
+  Vector lanes. Threads-one behavior must remain unchanged.
+
+Causal primitive counts need their own native tests: `createvecindex` is absent
+from the tile-size allowlist, and scalar-mode `select` places its count before
+dtype strings, not at the final argument. Do not use generic last-argument
+halving, introduce a host mask as a hidden fallback, or launch a candidate with
+these unverified shape/count rewrites. These are source-confirmed admission gaps,
+not an observed NPU failure or a completed native fix.
+
 Task root:
 `/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention`.
 New kernel destination: `design/tile_level/ladder/fa_auto128.py` under that root.
