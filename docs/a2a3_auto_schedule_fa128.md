@@ -18,12 +18,16 @@ A3 generation/regression results are not A3 hardware validation.
 ## Implementation status
 
 This is an **incomplete migration**, not a usable FA auto-scheduler release.
-`TL_ASCEND_AUTO_SCHEDULE` defaults off. When enabled, the entry validates target
-and configuration, extracts lowered tasks, then fails closed because TIR
-materialization and unified synchronization are not implemented. It must never
-quietly execute the old pipeline and present that result as automatic scheduling.
+`TL_ASCEND_AUTO_SCHEDULE` defaults off. The currently supported unconditional
+flat/serial three-phase subset has executable task decomposition and generated
+local/mode2 cross-core synchronization. Automatic FA128 passed all fourteen A2
+precision cases, but the first full hardware performance gate failed: geometric
+mean baseline/automatic ratio0.090009 against required0.90. Coordinated CV
+versions, actual software-pipeline reordering, general guards and asynchronous
+alias-planner integration remain incomplete. Unsupported structures fail closed;
+the old pipeline must not run silently under the new option.
 
-Implemented, with CPU tests:
+Historical first-milestone implementation inventory (later progress below):
 
 - `T.Stage` and `T.annotate_buffer_versions` metadata on the existing TVM/TIR.
 - Conservative lowered-operation extraction and physical storage interning.
@@ -62,7 +66,8 @@ Implemented, with CPU tests:
   and scratch capacities are checked. Scratch allocation/placement/lifetimes
   and automatic pass integration are still pending.
 
-Still required, in order:
+Original remaining-work sequence at the first milestone (historical, see later
+milestone results and the current status above):
 
 1. Decompose composite GEMM and cross-core copy into actual pipe tasks. Reject
    `gemm_v0/v1`, `copy_ub_to_l1`, and `copy_l0c_to_ub` for now: their hidden
@@ -840,3 +845,19 @@ TILELANG_CACHE_DIR=/tmp/fa128-v06-cache-e471-binary2d176 to avoid historical
 compiled-kernel cache contamination. It is not yet recorded as passed.
 The default/global cache was not deleted or switched. No performance result
 or baseline/candidate geomean is claimed at this checkpoint.
+
+### Actual-device performance follow-up
+
+The frozen reference subsequently passed all fourteen original precision cases;
+raw report: `examples/flash_attention_auto128/results/a2-card6-v06-reference-precision-14cases.json`.
+Three complete serial alternating performance rounds then finished with exit0,
+warmup3/repeat20, no-boost/no-sol, on physical card6. All 84 original per-case
+JSON reports and their matching kernel_details.csv files were retained.
+The geometric mean of baseline/automatic three-round-median ratios is
+**0.090009**, failing the required0.90. Full table, compiler identities,
+limitations and reproduction are in
+`examples/flash_attention_auto128/results/a2-card6-performance-baseline.md`.
+The automatic path is therefore still a correctness baseline, not a completed
+performant automatic software pipeline. Current work prioritizes actual-device
+verification; simulator regressions are not a prerequisite for the hardware
+optimization loop. Finite checks and repeated numerical stability remain open.
