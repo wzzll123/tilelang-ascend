@@ -408,6 +408,38 @@ jointly optimized multiversion FA pipeline. Guards, scalar controls, multiple
 epochs, online accumulated state and safe alias admission are not yet wired
 into a complete FA driver. No NPU FA result or speed ratio has been measured.
 
+Executable UB version-selection follow-up: the local owner driver now proves
+full overwrite from actual native `Fill` count/offset/dtype and full-mask
+`copy_ub_to_gm` source geometry. Pointer extent is not an overwrite proof.
+For one compact scratch UB allocation it feeds true dependencies, storage reuse
+constraints and A2/A3 capacity into Z3, then physically applies the selected
+version count. Other allocations and persistent state remain fixed. Bare
+integer-one hints opt out; supported explicit counts two and three are honored.
+Counter clocks, multiple scratch candidates and unproven helpers are not yet
+version-materialized (unsupported explicit hints fail closed).
+
+The physical rewriter handles dominating opaque root allocation blocks,
+preserves sibling allocations and records on-chip version certificates. Inner,
+conditional or unrelated sibling allocations and logical block views are
+rejected. Scalar index and owner-relative clock arithmetic must be proven not
+to overflow before slots can be treated as disjoint. Fresh task/owner identities
+are re-extracted after rewriting; synchronization uses the same owner-relative
+slot count. Unversioned same-pipe hazards remain FIFO dependencies even when
+their distance differs from the ring count. Alias annotations are validated
+before eligibility filtering, including unsupported scratch owners.
+
+A2/A3 tests cover automatic two-version selection, one-version opt-out and
+explicit two/three versions: native allocation/source generation, full numeric
+execution (five epochs starting at three, output seven), and sync-only balance.
+Misleading full pointer extent with partial fill and read-before-fill owners
+cannot be accepted for scratch rotation. These tests exposed and fixed
+simulator fill scalar binding: loop environment substitution precedes literal
+evaluation. Unit costs still mean feasibility, **not** calibrated performance.
+Expanded local regression: **773 passed, 1 deselected**, 66 subtests; the
+previously documented row-expand diagnostic mismatch remains the exclusion.
+Whole-FA guard/scalar reconstruction, coordinated C/V multiversion owners and
+NPU correctness/stability/performance acceptance remain incomplete.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

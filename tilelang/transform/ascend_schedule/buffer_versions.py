@@ -83,8 +83,22 @@ def materialize_iteration_versions(function, buffer, plan):
             raise ValueError("only generated scratch GM workspaces may be versioned")
         allocations = 1
     analyzer = arith.Analyzer()
+    owner_type = DataType(owner.loop_var.dtype)
+    if owner_type.lanes != 1 or not str(owner_type).startswith(("int", "uint")):
+        raise ValueError("owner clock requires a scalar integer index")
+    owner_low = -(1 << (owner_type.bits - 1)) if str(owner_type).startswith("int") else 0
+    owner_high = (1 << (owner_type.bits - 1)) - 1 if str(owner_type).startswith(
+        "int") else (1 << owner_type.bits) - 1
+    minimum_bound = analyzer.const_int_bound(owner.min)
+    extent_bound = analyzer.const_int_bound(owner.extent)
+    if (extent_bound.min_value < 0 or minimum_bound.min_value < owner_low or
+            minimum_bound.max_value + max(0, extent_bound.max_value - 1) > owner_high or
+            minimum_bound.max_value - minimum_bound.min_value + max(0, extent_bound.max_value - 1)
+            > owner_high):
+        raise ValueError("owner index or relative clock may overflow")
     analyzer.bind(owner.loop_var, ir.Range.from_min_extent(owner.min, owner.extent))
     calls = []
+    allocation_scopes = []
 
     def gm_copy_span(parent, pointer):
         from .workspace_proof import workspace_copy_span
@@ -99,16 +113,26 @@ def materialize_iteration_versions(function, buffer, plan):
 
     def before(node):
         nonlocal found_owner
+        if isinstance(node, tir.Allocate):
+            allocation_scopes.append(node.buffer_var.same_as(storage))
+        elif isinstance(node, tir.Block):
+            allocation_scopes.append(any(view.data.same_as(storage) for view in node.alloc_buffers))
+        if isinstance(node, tir.BlockRealize) and not analyzer.can_prove(node.predicate):
+            raise ValueError("predicated block allocation needs a version-aware lifecycle proof")
         if isinstance(node, tir.Call):
             calls.append(node)
         if isinstance(node, tir.For):
             matching = node.same_as(owner)
+            if matching and gm_handle is None and not any(allocation_scopes):
+                raise ValueError("version allocation must dominate the owner on its ancestor path")
             found_owner += int(matching)
             active.append(matching)
         return None
 
     def after(node):
         nonlocal allocations, accesses
+        if isinstance(node, (tir.Allocate, tir.Block)):
+            allocation_scopes.pop()
         parent_call = calls[-2] if isinstance(node, tir.Call) and len(calls) >= 2 else None
         if isinstance(node, tir.Call):
             calls.pop()
@@ -142,12 +166,22 @@ def materialize_iteration_versions(function, buffer, plan):
                 raise ValueError("access pointer is not proven to stay inside one version")
             slot = tir.floormod(owner.loop_var - owner.min, plan.count)
             offset_dtype = str(node.args[2].dtype)
+            index_type = DataType(offset_dtype)
+            if index_type.lanes != 1 or not offset_dtype.startswith(("int", "uint")):
+                raise ValueError("version offset requires a scalar integer index")
+            index_high = (1 << (index_type.bits - 1)) - 1 if offset_dtype.startswith(
+                "int") else (1 << index_type.bits) - 1
+            offset_bound = analyzer.const_int_bound(node.args[2])
+            if (plan.count - 1) * pitch + offset_bound.max_value > index_high:
+                raise ValueError("version slot offset arithmetic may overflow")
             offset = analyzer.simplify(node.args[2] + tir.Cast(offset_dtype, slot) *
                                        tir.IntImm(offset_dtype, pitch))
             accesses += 1
             return tir.Call(node.dtype, node.op, [*node.args[:2], offset, *node.args[3:]],
                             getattr(node, "span", None))
         if isinstance(node, tir.Allocate) and node.buffer_var.same_as(storage):
+            if any(active) or not analyzer.can_prove(node.condition):
+                raise ValueError("version allocation must unconditionally dominate its owner")
             if str(node.dtype) != str(buffer.dtype) or len(node.extents) != len(shape) or any(
                     not analyzer.can_prove_equal(a, b) for a, b in zip(node.extents, shape)):
                 raise ValueError("physical allocation does not match certified version pitch")
@@ -155,24 +189,49 @@ def materialize_iteration_versions(function, buffer, plan):
             return tir.Allocate(node.buffer_var, node.dtype, enlarged, node.condition, node.body,
                                 node.annotations, getattr(node, "span", None))
         if isinstance(node, tir.Block) and any(b.data.same_as(storage) for b in node.alloc_buffers):
-            raise ValueError("lower opaque allocation blocks before version materialization")
+            if any(active
+                  ) or node.reads or node.writes or node.match_buffers or node.init is not None:
+                raise ValueError(
+                    "logical block views or inner allocation need lifecycle reconstruction")
+            buffers = []
+            for view in node.alloc_buffers:
+                if not view.data.same_as(storage):
+                    buffers.append(view)
+                    continue
+                if (str(view.dtype) != str(buffer.dtype) or view.strides or
+                        not analyzer.can_prove_equal(view.elem_offset, 0) or
+                        len(view.shape) != len(shape) or
+                        any(not analyzer.can_prove_equal(a, b) for a, b in zip(view.shape, shape))):
+                    raise ValueError("physical allocation does not match certified version pitch")
+                allocations += 1
+                buffers.append(
+                    tir.decl_buffer(
+                        enlarged,
+                        view.dtype,
+                        name=view.name,
+                        data=storage,
+                        scope=scope,
+                        data_alignment=view.data_alignment,
+                        offset_factor=view.offset_factor))
+            return tir.Block(node.iter_vars, node.reads, node.writes, node.name_hint, node.body,
+                             node.init, buffers, node.match_buffers, node.annotations,
+                             getattr(node, "span", None))
         return None
 
     body = tir.stmt_functor.ir_transform(function.body, before, after)
     if found_owner != 1 or allocations != 1 or not accesses:
         raise ValueError(
             "version materialization needs one owner, one allocation and actual accesses")
-    if gm_handle is None:
-        return function.with_body(body)
     buffers = dict(function.buffer_map.items())
-    buffers[gm_handle] = tir.decl_buffer(
-        enlarged,
-        buffer.dtype,
-        name=buffer.name,
-        data=storage,
-        scope=scope,
-        data_alignment=buffer.data_alignment,
-        offset_factor=buffer.offset_factor)
+    if gm_handle is not None:
+        buffers[gm_handle] = tir.decl_buffer(
+            enlarged,
+            buffer.dtype,
+            name=buffer.name,
+            data=storage,
+            scope=scope,
+            data_alignment=buffer.data_alignment,
+            offset_factor=buffer.offset_factor)
     result = tir.PrimFunc(function.params, body, function.ret_type, buffers, function.attrs,
                           getattr(function, "span", None))
     from .workspace_proof import VERSION_ATTR

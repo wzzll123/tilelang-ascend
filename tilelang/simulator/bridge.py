@@ -4060,6 +4060,10 @@ class _TirBridge:
             return {}
         destination_arg, scalar_arg, count_arg = arguments[argument_offset:]
         count = self._runtime_int(count_arg, context.environment)
+        if context.environment:
+            scalar_arg = self.tir.stmt_functor.substitute(
+                scalar_arg, self._environment_replacements(context.environment)
+            )
         scalar = self._literal(self.analyzer.simplify(scalar_arg))
         if count is None:
             return {}

@@ -4,7 +4,7 @@
 
 import pytest
 import tilelang  # noqa: F401
-from tvm import tir, arith
+from tvm import tir, arith, ir
 from tilelang.transform.ascend_schedule.ownership import EpochPlan, OwnerEpochPlan
 from tilelang.transform.ascend_schedule.buffer_versions import materialize_iteration_versions
 
@@ -32,6 +32,68 @@ def test_expands_storage_and_offsets_every_access_by_owner_relative_epoch():
         offset = tir.stmt_functor.substitute(ptr.args[2], {loop.loop_var: tir.IntImm("int32", i)})
         assert int(arith.Analyzer().simplify(offset)) == 8 + ((i - 3) % 2) * 256
     assert int(ptr.args[3]) == 248  # Per-access extent is not allocation capacity.
+
+
+def test_pre_flatten_root_block_allocation_is_versioned_and_certified():
+    buffer, loop, function, plan = fixture()
+    sibling = tir.decl_buffer((8,), "float32", name="sibling", scope="shared.ub")
+    root = tir.Block([], [], [], "root", loop, alloc_buffers=[buffer, sibling])
+    function = function.with_body(tir.BlockRealize([], True, root))
+    result = materialize_iteration_versions(function, buffer, plan)
+    enlarged, preserved = result.body.block.alloc_buffers
+    assert [int(x) for x in enlarged.shape] == [32, 16]
+    assert enlarged.data.same_as(buffer.data)
+    assert preserved.same_as(sibling)
+    certificate = result.attrs["tl.ascend.iteration_versions"][buffer.data]
+    assert [int(certificate[0]), int(certificate[1])] == [2, 256]
+    assert certificate[2].same_as(loop.loop_var)
+
+
+@pytest.mark.parametrize("case", ["inside_owner", "conditional", "logical_view", "sibling"])
+def test_allocation_without_dominating_physical_lifetime_is_rejected(case):
+    buffer, loop, function, plan = fixture()
+    if case == "inside_owner":
+        loop = tir.For(
+            loop.loop_var, loop.min, loop.extent, loop.kind,
+            tir.Allocate(buffer.data, buffer.dtype, buffer.shape, tir.const(True, "bool"),
+                         loop.body))
+        function = function.with_body(loop)
+        plan = EpochPlan(buffer.data, True, 2, (OwnerEpochPlan(loop, "iteration", object()),))
+    elif case == "conditional":
+        enabled = tir.Var("enabled", "bool")
+        function = function.with_body(
+            tir.Allocate(buffer.data, buffer.dtype, buffer.shape, enabled, loop))
+    elif case == "sibling":
+        sibling = tir.BlockRealize([], True,
+                                   tir.Block([], [], [],
+                                             "sibling",
+                                             tir.Evaluate(0),
+                                             alloc_buffers=[buffer]))
+        function = function.with_body(tir.SeqStmt([sibling, loop]))
+    else:
+        view = tir.BufferRegion(buffer, [ir.Range(0, 16), ir.Range(0, 16)])
+        function = function.with_body(
+            tir.BlockRealize([], True,
+                             tir.Block([], [view], [], "root", loop, alloc_buffers=[buffer])))
+    with pytest.raises(ValueError):
+        materialize_iteration_versions(function, buffer, plan)
+
+
+def test_narrow_offset_cannot_wrap_ring_slots_into_the_same_address():
+    buffer = tir.decl_buffer((128,), "float16", name="scratch", scope="shared.ub")
+    pointer = buffer.access_ptr("w")
+    pointer = tir.Call(
+        pointer.dtype, pointer.op,
+        [*pointer.args[:2], tir.IntImm("uint8", 0), *pointer.args[3:]])
+    loop = tir.For(
+        tir.Var("epoch", "int32"), 0, 3, tir.ForKind.SERIAL,
+        tir.Evaluate(tir.call_extern("handle", "probe", pointer)))
+    function = tir.PrimFunc([],
+                            tir.Allocate(buffer.data, buffer.dtype, buffer.shape,
+                                         tir.const(True, "bool"), loop))
+    plan = EpochPlan(buffer.data, True, 3, (OwnerEpochPlan(loop, "iteration", object()),))
+    with pytest.raises(ValueError, match="offset arithmetic may overflow"):
+        materialize_iteration_versions(function, buffer, plan)
 
 
 @pytest.mark.parametrize("case", ["ineligible", "counter", "owner", "outside", "unaligned"])

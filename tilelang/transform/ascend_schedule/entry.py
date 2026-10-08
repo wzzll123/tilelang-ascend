@@ -7,6 +7,7 @@ from .tir_adapter import extract_tasks
 from .conditions import normalize_conditions
 from .gemm_decomposition import decompose_function_gemms
 from .workspace_tasks import prepare_cross_core_copies
+from .ub_versions import prepare_ub_versions
 from .materializer import materialize_flat_function, MaterializationError
 
 
@@ -34,6 +35,11 @@ def schedule_module(mod, target_model, config):
         function = normalize_conditions(decompose_function_gemms(function))
         extraction = extract_tasks(function)
         try:
+            try:
+                function, extraction = prepare_ub_versions(function, extraction,
+                                                           str(function.attrs["npu_platform"]))
+            except ValueError as error:
+                raise MaterializationError(str(error)) from error
             functions[name] = materialize_flat_function(function, extraction,
                                                         str(function.attrs["npu_platform"]))
         except MaterializationError as error:

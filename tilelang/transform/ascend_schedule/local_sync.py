@@ -201,7 +201,11 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
     if type(slot_count) is not int or slot_count < 1:
         raise LocalSyncError("slot_count must be a positive integer")
     dependencies = tuple(dependencies)
-    if any(type(d.distance) is not int or d.distance not in (0, slot_count) for d in dependencies):
+    task_pipes = {task.id: _pipe(task.pipe) for task in extraction.tasks}
+    if any(
+            type(d.distance) is not int or d.distance < 0 or
+        (d.distance not in (0, slot_count) and task_pipes.get(d.source) != task_pipes.get(d.target))
+            for d in dependencies):
         raise LocalSyncError("dependency distance must be zero or the certified slot count")
     # Reuse strict flat-domain/guard/node validation, without pretending carried
     # edges are distance-zero edges in its execution proof.

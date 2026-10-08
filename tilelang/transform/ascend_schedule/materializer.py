@@ -124,7 +124,17 @@ def materialize_flat_function(function, extraction, platform):
     for annotation in extraction.annotations:
         if hasattr(annotation, "keys") and any(
                 str(key).startswith("tl.buffer_version") for key in annotation.keys()):
-            raise MaterializationError("buffer version hints require owner materialization")
+            records = function.attrs.get("tl.ascend.iteration_versions", {})
+            selected = function.attrs.get("tl.ascend.selected_buffer_versions", {})
+            for var, count in annotation.get("tl.buffer_versions_map", {}).items():
+                if int(count) == 1 and var in selected and int(selected[var]) == 1:
+                    continue
+                if var not in records or int(records[var][0]) != int(count):
+                    raise MaterializationError("buffer version hints require owner materialization")
+            for var, mode in annotation.get("tl.buffer_version_mode", {}).items():
+                if (var not in records and
+                        var not in selected) or str(mode) not in ("auto", "iteration"):
+                    raise MaterializationError("buffer version hints require owner materialization")
     if function.attrs is not None and function.attrs.get("address_map", {}):
         raise MaterializationError(
             "physical addresses need a validated asynchronous alias contract")
@@ -189,8 +199,10 @@ def materialize_flat_function(function, extraction, platform):
             if scope not in permitted.get(task.core, set()):
                 raise MaterializationError(
                     "on-chip storage is inaccessible from its task core domain")
+    slot_count = max((access.ring_size or 1 for task in tasks for access in task.accesses),
+                     default=1)
     dependencies = list(
-        analyze_dependencies(tasks, max_distance=1 if owner_loop is not None else 0))
+        analyze_dependencies(tasks, max_distance=slot_count if owner_loop is not None else 0))
     # Preserve actual hardware FIFO in the feasibility model as well as emission.
     from .model import Dependency
     last = {}
@@ -235,7 +247,11 @@ def materialize_flat_function(function, extraction, platform):
                 return result.with_attr(MARKER, 1).with_attr("tl.ascend.schedule_report",
                                                              json.dumps(report, sort_keys=True))
             synchronized = emit_loop_sync(
-                body_extraction, owner_loop, dependencies, event_ids=tuple(range(8)))
+                body_extraction,
+                owner_loop,
+                dependencies,
+                event_ids=tuple(range(8)),
+                slot_count=slot_count)
         except LocalSyncError as error:
             raise MaterializationError(str(error)) from error
 
