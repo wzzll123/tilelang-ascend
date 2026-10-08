@@ -60,3 +60,36 @@ Compilerae4b1a35 and isolated cache /tmp/fa128-auto-causal-cache-ae4b1a35;
 Python/TVM/native/CANN/card identities unchanged from the frozen baseline.
 Raw case10 precision/performance JSON is in ../results, profiler CSV remains in
 /tmp/perf_tilelang_401509_5l6ycctf. Other causal cases and repeated profiling pending.
+
+### Completed causal follow-up
+
+Original verification subsequently passed all3 remaining causal cases36/37/41,
+including the unchanged CPU FP64/native precision comparison. Together with
+case10, all4 affected fixed causal cases pass one numerical run. Finite-output
+and repeated numerical stability gates remain separate and incomplete.
+The conditional profile job finished exit0 with3 rounds, warmup3/repeat20,
+no-boost/no-sol, same compiler/cache/card6. Raw3-case precision and12 profiler
+JSON files are retained under ../results/fa128-causal-ae4b1a35-*.
+
+| Case | Earlier auto median us | Pruned auto median us | Earlier/pruned | Duration reduction |
+|---:|---:|---:|---:|---:|
+| 10 | 381.47 | 231.39 | 1.6486 | 39.34% |
+| 36 | 11469.99 | 6021.96 | 1.9047 | 47.50% |
+| 37 | 5833.10 | 3195.14 | 1.8256 | 45.22% |
+| 41 | 11399.69 | 5863.30 | 1.9442 | 48.57% |
+
+Earlier measurements are the frozen prior three-round auto baseline, not newly
+alternated comparisons. Pruned round values respectively:
+10[231.26,231.39,231.70],36[6019.40,6021.96,6024.06],
+37[3195.14,3196.76,3194.54],41[5864.48,5861.18,5863.30].
+No speed claim for the10 noncausal cases or updated14-case acceptance score;
+current results still leave a large gap to v06 and are not task completion.
+
+## Compiler prerequisite for iteration2
+
+`bd9ae47d` adds an executable logical-epoch stage-wave reconstruction component.
+All8 focused tests pass, including actual mode2 emitter bundles and zero/short
+epochs, wrong single-slot reuse rejection, guard/flag coupling and overflow.
+It is not yet connected to production FA: joint storage eligibility/version
+selection, phased ring protocols and actual hardware checks remain required.
+The helper does not invent full overwrite proofs or silently enable old passes.
