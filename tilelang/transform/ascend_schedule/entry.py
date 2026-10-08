@@ -57,19 +57,30 @@ def schedule_module(mod, target_model, config):
                     for annotation in extraction.annotations)
                 if not hinted and len({task.core for task in extraction.tasks}) > 1:
                     from .l1_prefetch import discover_l1_prefetch, solve_l1_prefetch, materialize_l1_prefetch
+                    from .score_pipeline import prepare_score_pipeline
                     from .solver import ScheduleInfeasible
-                    discovery = discover_l1_prefetch(function, extraction)
-                    if discovery.candidates:
-                        try:
-                            prefetch_report = solve_l1_prefetch(function, discovery,
-                                                                str(function.attrs["npu_platform"]))
-                        except ScheduleInfeasible as error:
-                            function = function.with_attr("tl.ascend.prefetch_diagnostic",
-                                                          str(error))
-                        else:
-                            prefetch = materialize_l1_prefetch(
-                                function, discovery, prefetch_report["schedule"]["buffer_versions"])
-                            function, extraction = prefetch.function, prefetch.extraction
+                    score_failed = False
+                    try:
+                        prefetch, prefetch_report = prepare_score_pipeline(
+                            function, extraction, str(function.attrs["npu_platform"]))
+                    except ScheduleInfeasible as error:
+                        score_failed = True
+                        function = function.with_attr("tl.ascend.prefetch_diagnostic", str(error))
+                    if prefetch is None and not score_failed:
+                        discovery = discover_l1_prefetch(function, extraction)
+                        if discovery.candidates:
+                            try:
+                                prefetch_report = solve_l1_prefetch(
+                                    function, discovery, str(function.attrs["npu_platform"]))
+                            except ScheduleInfeasible as error:
+                                function = function.with_attr("tl.ascend.prefetch_diagnostic",
+                                                              str(error))
+                            else:
+                                prefetch = materialize_l1_prefetch(
+                                    function, discovery,
+                                    prefetch_report["schedule"]["buffer_versions"])
+                    if prefetch is not None:
+                        function, extraction = prefetch.function, prefetch.extraction
             except ValueError as error:
                 raise MaterializationError(str(error)) from error
             functions[name] = materialize_flat_function(

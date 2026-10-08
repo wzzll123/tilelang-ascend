@@ -284,3 +284,35 @@ automatic partition selection or achieved hardware performance.
 
 Twelve-file compiler/solver/report regression after workspace accounting:
 255 tests passed, with65232 existing TVM/Python AST deprecation warnings.
+
+## Production Cube-prefix overlap integration
+
+The previously read-only two-stage candidate is now installed in the
+unconstrained production entry via `score_pipeline.py`. Candidate discovery
+uses typed complete Cube-to-Vector GM coverage, not FA names or task IDs.
+The pure Cube prefix through the earliest complete workspace writer is stage0;
+the entire remaining epoch is stage1. Only that workspace is physically
+rotated. The full d0…2 dependency set, same-wave ordering, local allocation
+capacity and mode2 channel protocol are checked before admitting the wave.
+Online softmax carried state stays single-version. This is a checked
+two-stage candidate, not general optimal A5 schedule search.
+
+No eligible candidate retains the previous L1-prefetch path. An infeasible
+score candidate emits an explicit diagnostic and uses the new sequential
+materializer, not legacy auto-sync. Explicit stage/version constraints retain
+their separate validated path. Unit costs establish feasibility only.
+
+Compiler regression covers actual native A2/A3 FA inputs with Q/KV tails and
+causal guards, unmocked entry selection, zero/one-trip seed/drain and rejection
+of missing carried edges, wrong slots and reversed same-wave dependencies.
+The normal target pipeline is also checked with outer memory planning enabled:
+the automatic path overrides lexical reuse, and final `address_map` offsets
+agree with generated UB `GetWithOffset` allocations. Physical Vector-subblock
+sizes are used to prove score and score_recv byte intervals disjoint.
+
+This integration is Python-only. Docker deployment must use a committed
+compiler identity and a new isolated cache, recording the reused native
+library's original build identity and hash separately. The frozen1aeedc56
+hardware precision/performance results above do not validate this candidate.
+Numerical acceptance and performance remain real-device gates; simulator
+execution is not a prerequisite for this work.

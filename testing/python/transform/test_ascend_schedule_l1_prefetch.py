@@ -180,13 +180,17 @@ def test_unaccounted_physical_allocation_cannot_bypass_joint_capacity():
 
 
 @pytest.mark.parametrize("solver_failure", [False, True])
-def test_real_compiler_entry_selects_fa_prefetch_without_hand_hints(solver_failure, monkeypatch):
+def test_real_compiler_entry_retains_l1_prefetch_path(solver_failure, monkeypatch):
     pytest.importorskip("z3")
     import tvm
     from examples.flash_attention_auto128.fa_auto128 import (FlashAttentionConfig,
                                                              flash_attention_auto128_fwd,
                                                              pass_configs)
     from tilelang.engine.phase import LowerAndLegalize
+    from tilelang.transform.ascend_schedule import score_pipeline
+    # Isolate the still-supported L1 branch now that certified Cube-prefix
+    # overlap has priority. The score-pipeline suite checks the unmocked entry.
+    monkeypatch.setattr(score_pipeline, "prepare_score_pipeline", lambda *_: (None, None))
     if solver_failure:
         from tilelang.transform.ascend_schedule import l1_prefetch
         from tilelang.transform.ascend_schedule.solver import ScheduleInfeasible
