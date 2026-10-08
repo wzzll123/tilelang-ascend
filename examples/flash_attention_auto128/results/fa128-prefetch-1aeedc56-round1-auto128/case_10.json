@@ -1,0 +1,1 @@
+{"case_index": 10, "elapsed_us": 231.59, "device_kernels_us": {"main_kernel": 231.59}, "warmup": 3, "repeat": 20, "prof_dir": "/tmp/perf_tilelang_431049_51wxzw9h", "task_dir": "/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention"}

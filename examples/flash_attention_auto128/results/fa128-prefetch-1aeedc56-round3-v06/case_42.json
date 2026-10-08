@@ -1,0 +1,1 @@
+{"case_index": 42, "elapsed_us": 11.04, "device_kernels_us": {"main_kernel": 11.04}, "warmup": 3, "repeat": 20, "prof_dir": "/tmp/perf_tilelang_480396_x9x76q_n", "task_dir": "/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention"}

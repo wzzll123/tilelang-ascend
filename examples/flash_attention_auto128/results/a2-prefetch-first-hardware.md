@@ -69,6 +69,9 @@ reports were independently checked and archived as
 `fa128-prefetch-1aeedc56-caseN-stability20.json`. This is fixed-input stability
 over 280 launches, not proof for arbitrary inputs or future compiler changes.
 
-New prefetch performance gates remain pending. This is not completion of the
-migration or the >=0.90 performance requirement. The wider multistage compiler
+The three-round prefetch performance measurement has now completed: all84
+original reports and336 profiler CSV files are archived. The three-round
+median ratio geometric mean is0.107698, so the >=0.90 gate FAILS; see
+`a2-prefetch-three-round-performance.md`. This is not completion of the
+migration or the performance requirement. The wider multistage compiler
 work remains local and is not part of this frozen `1aeedc56` hardware build.
