@@ -323,6 +323,28 @@ milestone does not enable the full-function automatic entry or establish FA
 hardware correctness/performance. Counter/guard clocks, complete extraction
 proofs, scheduled reconstruction and safe alias contracts remain outstanding.
 
+Automatic workspace-envelope follow-up: materialization records a TIR-native
+storage pitch/count/iteration-owner certificate. The workspace proof adaptor
+checks parameter capacity, generated-scratch indices, loop clock bounds, dtype,
+the canonical slot offset and native row-major copy spans. Proven accesses get
+conservative whole-slot byte envelopes for carried-dependency analysis. Unknown
+helpers, changed pitches, wrong slot formulas and unsupported guards retain
+their original unknown footprints, with diagnostics. Full overwrite, actual
+synchronization and physical alias safety are deliberately separate proofs.
+
+The two-direction/double-Vector/double-buffer execution regression no longer
+manually supplies workspace Access footprints: certificates are derived from
+the transformed copy TIR. Normal and delayed-producer runs still pass across
+empty, short and wrapping loops. Three negative proof tests verify that missing
+slot selection, incorrect pitches and unknown helpers do not remove conflicts.
+Shared helper-span logic is used by both physical materialization and proof.
+
+Expanded local regression: **747 passed, 1 deselected**, 66 subtests. The known
+row-expand diagnostic mismatch remains separately documented. This covers
+generated row-major GM scratch copies, not every on-chip layout or dynamic
+counter/guard owner. The full automatic entry, FA kernel and NPU correctness /
+stability / performance acceptance are still outstanding.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

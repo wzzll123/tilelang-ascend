@@ -117,8 +117,6 @@ def assert_mode2_execution(function, extracted, dependencies, platform, source_n
         from tilelang.transform.ascend_schedule.buffer_versions import materialize_iteration_versions
         from tilelang.transform.ascend_schedule.ownership import EpochPlan, OwnerEpochPlan
         workspace = next(iter(candidate.buffer_map.values()))
-        pitch = int(np.prod([int(x) for x in workspace.shape])) * tvm.DataType(
-            workspace.dtype).bits // 8
         plan = EpochPlan(workspace.data, True, 2, (OwnerEpochPlan(owner, "iteration", object()),))
         versioned = materialize_iteration_versions(candidate, workspace, plan)
         loops = []
@@ -132,21 +130,9 @@ def assert_mode2_execution(function, extracted, dependencies, platform, source_n
         def is_workspace(storage, workspace=workspace):
             return hasattr(storage, "var") and storage.var.same_as(workspace.data)
 
-        # Conservative full-allocation regions for this one-core fixture cover
-        # both Vector shards; no inferred edge is silently turned into a fence.
-        ring_extraction.tasks = tuple(
-            replace(
-                task,
-                accesses=tuple(
-                    replace(
-                        access,
-                        offset=0,
-                        extent=pitch,
-                        intervals=None,
-                        iteration_stride=pitch,
-                        ring_size=2) if is_workspace(access.storage) else access
-                    for access in task.accesses))
-            for task in ring_extraction.tasks)
+        from tilelang.transform.ascend_schedule.workspace_proof import certify_workspace_versions
+        ring_extraction, diagnostics = certify_workspace_versions(versioned, ring_extraction)
+        assert not diagnostics
         ring_dependencies = analyze_dependencies(ring_extraction.tasks, max_distance=2)
         counts = {
             (d.source, d.target, d.distance): 2 if is_workspace(d.storage) else 1

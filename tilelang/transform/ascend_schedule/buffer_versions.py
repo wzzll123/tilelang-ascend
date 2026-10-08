@@ -87,38 +87,8 @@ def materialize_iteration_versions(function, buffer, plan):
     calls = []
 
     def gm_copy_span(parent, pointer):
-        # Native workspace ptr.extent advertises a whole core tile even for a
-        # half-tile Vector shard. Prove the helper's actual row-major span;
-        # never reinterpret that broad metadata as bytes the DMA must touch.
-        if parent is None or getattr(parent.op, "name", None) != "tir.call_extern":
-            return None
-        tag = parent.args[0].value if isinstance(parent.args[0], tir.StringImm) else ""
-        name = tag.split("<", 1)[0].removeprefix("tl::ascend::")
-        sides = {"copy_ub_to_gm": 2, "copy_gm_to_ub": 1, "copy_gm_to_l1": 1, "copy_l0c_to_gm": 2}
-        if name not in sides or len(
-                parent.args) < 6 or not pointer.same_as(parent.args[sides[name]]):
-            return None
-        try:
-            fields = tag.split("<", 1)[1].removesuffix(">").split(",")
-            if name == "copy_l0c_to_gm":
-                if fields[2].strip() != "layout::RowMajor":
-                    return None
-                rows, cols = int(fields[3]), int(fields[4])
-            elif name == "copy_gm_to_l1":
-                rows, cols = int(fields[1]), int(fields[2])
-            else:
-                cols, rows = int(fields[1]), int(fields[2])
-        except (ValueError, IndexError):
-            return None
-        dims = [analyzer.simplify(arg) for arg in parent.args[3:6]]
-        if not all(isinstance(arg, tir.IntImm) for arg in dims):
-            return None
-        stride, valid_m, valid_n = map(int, dims)
-        if name in ("copy_gm_to_l1", "copy_l0c_to_gm"):
-            valid_m, valid_n = valid_m or rows, valid_n or cols
-        if not (0 <= valid_m <= rows and 0 <= valid_n <= cols and valid_n <= stride):
-            return None
-        return 0 if valid_m == 0 or valid_n == 0 else (valid_m - 1) * stride + valid_n
+        from .workspace_proof import workspace_copy_span
+        return workspace_copy_span(parent, pointer, analyzer)
 
     def bind_thread(node):
         if (isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent" and
@@ -203,5 +173,13 @@ def materialize_iteration_versions(function, buffer, plan):
         scope=scope,
         data_alignment=buffer.data_alignment,
         offset_factor=buffer.offset_factor)
-    return tir.PrimFunc(function.params, body, function.ret_type, buffers, function.attrs,
-                        getattr(function, "span", None))
+    result = tir.PrimFunc(function.params, body, function.ret_type, buffers, function.attrs,
+                          getattr(function, "span", None))
+    from .workspace_proof import VERSION_ATTR
+    records = dict(function.attrs.get(VERSION_ATTR,
+                                      {}).items()) if function.attrs is not None else {}
+    records[storage] = [
+        tir.IntImm("int32", plan.count),
+        tir.IntImm("int64", pitch), owner.loop_var, owner.min
+    ]
+    return result.with_attr(VERSION_ATTR, records)
