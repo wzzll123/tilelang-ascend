@@ -266,7 +266,7 @@ def assert_automatic_cv_loop(function, platform, source_name):
 
             wrong_clock = candidate.with_body(
                 tir.stmt_functor.ir_transform(candidate.body, None, nonuniform_clock))
-            with pytest.raises(AutoScheduleError, match="uniform static clock"):
+            with pytest.raises(AutoScheduleError, match="uniform clock"):
                 schedule_module(
                     tvm.IRModule({"main": wrong_clock}), "ascendc",
                     {"tl.ascend_auto_schedule": True})

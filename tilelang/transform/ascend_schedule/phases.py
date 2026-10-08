@@ -165,9 +165,6 @@ def emit_three_phase_sync(function, extraction, *, local_ids=_DEFAULT_IDS, cross
             any(not context[0].same_as(contexts[0][0]) for context in contexts)):
         raise LocalSyncError("three-phase reconstruction requires one shared serial owner")
     owner = contexts[0][0]
-    if owner.kind != tir.ForKind.SERIAL or not isinstance(owner.min, tir.IntImm) or not isinstance(
-            owner.extent, tir.IntImm):
-        raise LocalSyncError("three-phase owner requires a uniform static serial clock")
     partition, phase = {0: [], 1: [], 2: []}, 0
     for task in extraction.tasks:
         if extraction.loops[task.id]:
@@ -206,6 +203,11 @@ def emit_three_phase_sync(function, extraction, *, local_ids=_DEFAULT_IDS, cross
         if len(participant_nodes) != 1:
             raise LocalSyncError("mixed phases require one unambiguous Vector participant group")
     _validate_tree(function, extraction, owner, mixed, participant_nodes)
+    from .uniform_clock import certify_uniform_clock
+    try:
+        certify_uniform_clock(function, owner)
+    except ValueError as error:
+        raise LocalSyncError(f"three-phase owner requires a uniform clock: {error}") from error
     registry = EventRegistry(local_ids=local_ids, cross_ids=cross_ids)
     # Whole-storage envelopes conservatively cover every possible ring/loop
     # offset. Boundary analysis is not restricted to iteration zero.

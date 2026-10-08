@@ -22,8 +22,11 @@ def _validate_cv_owner(function, loop, extraction):
     """Prove participant context and exact task ownership, not just presence."""
     from tvm import tir
 
-    if not isinstance(loop.min, tir.IntImm) or not isinstance(loop.extent, tir.IntImm):
-        raise MaterializationError("CV owner bounds require a uniform static clock")
+    from .uniform_clock import certify_uniform_clock
+    try:
+        certify_uniform_clock(function, loop)
+    except ValueError as error:
+        raise MaterializationError(f"CV owner bounds require a uniform clock: {error}") from error
     paths = []
 
     def find(node, path):

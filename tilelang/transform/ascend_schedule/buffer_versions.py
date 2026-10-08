@@ -17,7 +17,7 @@ def materialize_iteration_versions(function, buffer, plan):
     the owner are rejected, not silently versioned. Per-access extent remains
     unchanged. The allocation identity is preserved for alias/dependency maps.
     """
-    from tvm import DataType, arith, ir, tir
+    from tvm import DataType, ir, tir
     from .resources import allocation_budgets
 
     if not isinstance(function, tir.PrimFunc) or not isinstance(buffer, tir.Buffer):
@@ -82,20 +82,8 @@ def materialize_iteration_versions(function, buffer, plan):
         if position not in {int(i) for i in indices}:
             raise ValueError("only generated scratch GM workspaces may be versioned")
         allocations = 1
-    analyzer = arith.Analyzer()
-    owner_type = DataType(owner.loop_var.dtype)
-    if owner_type.lanes != 1 or not str(owner_type).startswith(("int", "uint")):
-        raise ValueError("owner clock requires a scalar integer index")
-    owner_low = -(1 << (owner_type.bits - 1)) if str(owner_type).startswith("int") else 0
-    owner_high = (1 << (owner_type.bits - 1)) - 1 if str(owner_type).startswith(
-        "int") else (1 << owner_type.bits) - 1
-    minimum_bound = analyzer.const_int_bound(owner.min)
-    extent_bound = analyzer.const_int_bound(owner.extent)
-    if (extent_bound.min_value < 0 or minimum_bound.min_value < owner_low or
-            minimum_bound.max_value + max(0, extent_bound.max_value - 1) > owner_high or
-            minimum_bound.max_value - minimum_bound.min_value + max(0, extent_bound.max_value - 1)
-            > owner_high):
-        raise ValueError("owner index or relative clock may overflow")
+    from .uniform_clock import certify_uniform_clock
+    analyzer = certify_uniform_clock(function, owner).analyzer
     analyzer.bind(owner.loop_var, ir.Range.from_min_extent(owner.min, owner.extent))
     calls = []
     allocation_scopes = []
