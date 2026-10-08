@@ -648,6 +648,11 @@ class FunctionalSimulator:
 
         reads = list(_metadata_regions(task.metadata, _READ_REGION_KEYS))
         writes = list(_metadata_regions(task.metadata, _WRITE_REGION_KEYS))
+        if self._empty_copy_rectangle(task):
+            # An empty DMA does not dereference its shifted GM pointer. A
+            # GM->UB padding fill remains a real full-tile write, however.
+            reads = []
+            writes = [region for region in writes if region is task.metadata.get("pad_dst")]
         if operation.startswith("atomic_add"):
             reads.extend(region for region in writes if region not in reads and region is not task.metadata.get("pad_dst"))
 
@@ -662,6 +667,13 @@ class FunctionalSimulator:
             view = self._resolve(region, task.core_id)
             initialized = True if region is pad_destination else sources_initialized
             view.allocation.mark_initialized(view, initialized)
+
+    def _empty_copy_rectangle(self, task: Task) -> bool:
+        details = task.metadata.get("copy")
+        if not isinstance(details, dict):
+            return False
+        return any(key in details and _resolve_int(details[key], self.bindings) == 0
+                   for key in ("valid_rows", "valid_cols"))
 
     def _copy(self, task: Task) -> None:
         source = _operand(task, "src")
@@ -683,6 +695,8 @@ class FunctionalSimulator:
                 np.full(pad_shape, pad_value, dtype=_numpy_dtype(pad_destination.dtype)),
                 task_core_id=task.core_id,
             )
+        if self._empty_copy_rectangle(task):
+            return
         source_regions = task.metadata.get("src_regions")
         if isinstance(source_regions, (tuple, list)):
             fragments = [self.read(region, task_core_id=task.core_id) for region in source_regions]

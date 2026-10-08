@@ -12,7 +12,8 @@ from fa128_auto_fixture import fa128_auto_fixture
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("q_len,kv_len", [(128, 128), (64, 128), (128, 256)])
+@pytest.mark.parametrize("q_len,kv_len", [(128, 128), (64, 128), (128, 256), (32, 65), (64, 130),
+                                          (1, 65), (16, 65), (17, 65), (33, 130)])
 def test_regular_fa128_has_values_sync_and_native_generation(platform, causal, q_len, kv_len):
     from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget
     from tilelang.simulator import (build_kernel_program, FunctionalSimulator, SimulatorConfig,

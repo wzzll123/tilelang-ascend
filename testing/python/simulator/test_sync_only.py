@@ -28,6 +28,37 @@ from tilelang.simulator.adapter import _resolve_config
 from tilelang.simulator.layout import pack_matrix, storage_elements
 
 
+@pytest.mark.parametrize("sync_only", [False, True])
+@pytest.mark.parametrize("gm_to_ub", [False, True])
+def test_empty_copy_does_not_resolve_shifted_gm_pointer(sync_only, gm_to_ub):
+    gm = BufferRegion("gm", MemoryScope.GM, (0, 128), "float32", byte_offset=8192)
+    ub = BufferRegion("ub", MemoryScope.UB, (0, 128), "float32")
+    padded = BufferRegion("ub", MemoryScope.UB, (16, 128), "float32")
+    metadata = {
+        "src": gm if gm_to_ub else ub,
+        "dst": ub if gm_to_ub else gm,
+        "copy": {"valid_rows": 0, "valid_cols": 128, "pad_value": -3.5},
+    }
+    if gm_to_ub:
+        metadata["pad_dst"] = padded
+    task = Task("empty", "copy", 0, Lane.VECTOR_0, Pipe.MTE2, 1, metadata=metadata)
+    program = KernelProgram("empty-copy", "A2", (CoreProgram(0, (task,)),), buffers=(
+        BufferSpec("gm", MemoryScope.GM, (1, 128), "float32"),
+        BufferSpec("ub", MemoryScope.UB, (16, 128), "float32"),
+    ))
+    simulator = FunctionalSimulator(program, SimulatorConfig(sync_only=sync_only))
+    valid_gm = BufferRegion("gm", MemoryScope.GM, (1, 128), "float32")
+    simulator.write(valid_gm, np.full((1, 128), 7, dtype="float32"))
+    simulator.run()
+    if not sync_only:
+        np.testing.assert_array_equal(simulator.read(valid_gm), np.full((1, 128), 7))
+    if gm_to_ub and sync_only:
+        view = simulator._resolve(padded, 0)
+        assert view.allocation.check_initialized(view)
+    if gm_to_ub and not sync_only:
+        np.testing.assert_array_equal(simulator.read(padded), np.full((16, 128), -3.5))
+
+
 def _flag_program() -> KernelProgram:
     tile = BufferRegion("tile", MemoryScope.UB, (32,), "float32")
     tasks = (

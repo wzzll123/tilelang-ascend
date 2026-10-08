@@ -674,3 +674,33 @@ the card or stop unrelated processes.
 No correctness, sync-only, stability, performance, or A3 platform acceptance
 result is currently claimed. Commit verified milestones independently; do not
 push automatically or mix other agents' main-checkout modifications.
+
+### Q/KV tail integration (CPU/native milestone, not hardware acceptance)
+
+The integration fixture uses ceiling-divided Q/KV tile counts and masks invalid
+KV columns before maximum reduction and after exponentiation. Existing
+bottom-right causal masks already exclude out-of-range KV columns for valid Q
+rows. GM-to-L1 copies remain single-version, base-zero destinations, so the
+native helper clears the entire template FRACTAL extent for partial tiles. This
+does not certify partial copies into nonzero ring slots.
+
+Q tails with at most sixteen valid rows leave Vector 1 with a zero-row output
+DMA. The simulator previously attempted to resolve that empty shifted GM view,
+causing a bounds error despite no memory being accessed. Full and sync-only
+execution now skip certified empty copy rectangles, after preserving any full
+GM-to-UB padding initialization. General memory bounds checks are unchanged.
+The native UB-to-GM helper returns before DMA when either valid dimension is
+zero; surrounding flags and both participants still execute normally.
+
+Test-first regressions reproduce both the empty-view error and the native
+helper issuing an empty DMA. A host C++ stub executes the actual helper text,
+observing no DMA for zero rows/columns and one DMA each for 1/15/16 rows.
+FA coverage includes `(Sq,Skv)` `(32,65)`, `(64,130)`, `(1,65)`, `(16,65)`,
+`(17,65)`, `(33,130)`, in addition to the previous aligned shapes, on A2/A3
+with causal/noncausal masks. Each checks generated native code, CPU FP64
+numerical reference, true sync-only execution with a 60-second timeout, and
+missing-cross-set/wait mutations. Expanded local regression: **871 passed,
+1 deselected**, 66 subtests, 104.27 seconds. The deselected preexisting bridge
+alignment test remains documented; no checker or precision threshold was
+relaxed. These results do not constitute the required fourteen-case hardware
+precision, stability or performance acceptance.

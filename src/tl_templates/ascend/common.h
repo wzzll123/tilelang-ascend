@@ -422,6 +422,11 @@ CATLASS_DEVICE void
 copy_ub_to_gm(GlobalTensor<T> dstTensor, LocalTensor<T> srcTensor,
               uint32_t realdstN = 1, uint32_t maskShapeM = srcM,
               uint32_t maskShapeN = srcN) {
+  // A tail may leave one Vector participant without valid rows. Keep the
+  // surrounding synchronization uniform, but do not issue an empty DMA.
+  if (maskShapeM == 0 || maskShapeN == 0) {
+    return;
+  }
   AscendC::DataCopyExtParams dataCopyParams(
       maskShapeM, maskShapeN * sizeof(T), (srcN - maskShapeN) * sizeof(T) / 32,
       (realdstN - maskShapeN) * sizeof(T), 0);

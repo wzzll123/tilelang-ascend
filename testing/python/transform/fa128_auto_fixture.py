@@ -3,7 +3,7 @@
 """Regular FA128 migration fixture; no launch, hidden helpers or hand sync.
 
 Based on examples/developer_mode/flash_attn_bshd_developer.py. This is a
-compiler integration fixture, not the final causal/tail-capable ladder entry.
+compiler integration fixture, not the final configurable ladder entry.
 """
 
 from tilelang import language as T
@@ -11,9 +11,8 @@ from tilelang import language as T
 
 def fa128_auto_fixture(causal=False, q_len=128, kv_len=128):
     block_m, block_n, dim = 32, 64, 128
-    if q_len <= 0 or kv_len <= 0 or q_len % block_m or kv_len % block_n:
-        raise ValueError(
-            "This integration fixture requires complete tiles; final tails remain open")
+    if q_len <= 0 or kv_len <= 0:
+        raise ValueError("Q and KV lengths must be positive")
     if causal and q_len > kv_len:
         raise ValueError("Existing golden does not define finite fully-masked causal rows")
     q_shape = (1, 1, q_len, dim)
@@ -22,7 +21,7 @@ def fa128_auto_fixture(causal=False, q_len=128, kv_len=128):
     @T.prim_func
     def main(Q: T.Tensor(q_shape, "float16"), K: T.Tensor(kv_shape, "float16"),
              V: T.Tensor(kv_shape, "float16"), Output: T.Tensor(q_shape, "float16")):
-        with T.Kernel(q_len // block_m, threads=2, is_npu=True) as cid:
+        with T.Kernel(T.ceildiv(q_len, block_m), threads=2, is_npu=True) as cid:
             q = T.alloc_shared((block_m, dim), "float16")
             k = T.alloc_shared((block_n, dim), "float16")
             v = T.alloc_shared((block_n, dim), "float16")
@@ -52,7 +51,7 @@ def fa128_auto_fixture(causal=False, q_len=128, kv_len=128):
             T.tile.fill(maximum, -1e30)
             T.tile.fill(denominator, 0)
             T.copy(Q[0, 0, cid * block_m:(cid + 1) * block_m, :], q)
-            for epoch in T.serial(kv_len // block_n):
+            for epoch in T.serial(T.ceildiv(kv_len, block_n)):
                 T.copy(K[0, 0, epoch * block_n:(epoch + 1) * block_n, :], k)
                 T.gemm_v0(q, k, score_c, transpose_B=True, init=True)
                 T.copy(score_c, score_recv)
@@ -63,6 +62,11 @@ def fa128_auto_fixture(causal=False, q_len=128, kv_len=128):
                     T.tile.broadcast(key_grid, key_columns, axis=0)
                     T.tile.compare(allowed, key_grid, query_grid, "LE")
                     T.tile.select(score, allowed, score, -1e30, "VSEL_TENSOR_SCALAR_MODE")
+                elif kv_len % block_n:
+                    T.tile.createvecindex(key_columns, T.cast(epoch * block_n, "float32"))
+                    T.tile.broadcast(key_grid, key_columns, axis=0)
+                    T.tile.compare(allowed, key_grid, T.float32(kv_len), "LT")
+                    T.tile.select(score, allowed, score, -1e30, "VSEL_TENSOR_SCALAR_MODE")
                 T.copy(maximum, correction)
                 T.reduce_max(score, maximum, dim=-1)
                 T.tile.max(maximum, maximum, correction)
@@ -71,7 +75,7 @@ def fa128_auto_fixture(causal=False, q_len=128, kv_len=128):
                 T.tile.broadcast(score_recv, maximum, axis=1)
                 T.tile.sub(score, score, score_recv)
                 T.tile.exp(score, score)
-                if causal:
+                if causal or kv_len % block_n:
                     T.tile.select(score, allowed, score, 0.0, "VSEL_TENSOR_SCALAR_MODE")
                 T.reduce_sum(score, tile_sum, dim=-1)
                 T.tile.mul(denominator, denominator, correction)
