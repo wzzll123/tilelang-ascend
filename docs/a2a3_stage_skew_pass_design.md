@@ -100,8 +100,34 @@ versions also passes:113 tests, with old TVM/Python AST deprecation warnings.
 local Python/TVM/native paths and appends the isolated solver package path
 without shadowing Conda's setuptools; it prints the actual library bindings.
 Existing actual-mode2 bundle coverage is retained.
-New multi-stage cases are TIR reconstruction tests, not native A2/A3 or hardware
-acceptance of a new FA schedule.
+The initial multi-stage cases are TIR reconstruction tests, not hardware
+acceptance of a new FA schedule. Follow-up source-generation tests in
+`test_ascend_schedule_cv_stage_waves.py` use the actual workspace lowering:
+FIX→Vector MTE2→Vector operation→Vector MTE3→Cube MTE2→Cube MTE1,
+with stages0/1/2 and two three-version generated GM parameters. Both A2 and A3
+generate native sources for T0/1/2/5. Version plans are explicitly supplied
+for this fixture; this does not certify production automatic discovery,
+collective complete-write eligibility or numerical FA correctness. The L0C
+source has an external initialization precondition; no such kernel was launched.
+The fixture supplies16 cross IDs for its12-channel three-slot protocol; it is
+not production-default event-capacity admission. Supplying the production
+eight-ID pool is tested to fail with event-capacity exhaustion. Native checks
+also verify logical stage1/2 pointer shifts and guards, modulo3 slot selection
+for longer owners, and legal constant-slot folding for a one-trip owner.
+
+These native tests exposed a bundle-boundary bug: SeqStmt construction flattens
+adjacent task/event sequences inside a shared C/V scope. The owner emitter now
+wraps each operation and its waits/sets in `tl.ascend.task_bundle` metadata.
+Stage reconstruction preserves that exact boundary, not an inferred adjacency.
+The attribute generates no hardware work. Removing the marker reproduces the
+fail-closed orphan-synchronization error; removing a carried physical WAR edge
+is separately rejected by complete dependency validation.
+
+Eight-file regression after this bundle fix:125 tests passed, including native
+workspace lowering and existing production prefetch/phase paths. The old TVM
+parser emits17744 Python AST deprecation warnings. No new simulator feature or
+real-device numerical result is claimed for this native-only fixture; the
+ongoing hardware profiler uses the frozen `1aeedc56` checkout, not this change.
 
 Before using wider stages in production: certify each intermediate buffer's
 complete writes/read envelopes including tails; select stages and counts jointly

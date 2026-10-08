@@ -232,7 +232,13 @@ def emit_mode2_loop_sync(function,
             return None
         seen.add(task_id)
         sequence = [*before[task_id], node, *after[task_id]]
-        return sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
+        # SeqStmt construction can flatten adjacent task/event sequences when
+        # several operations share one C/V scope. Preserve the exact bundle
+        # boundary so stage reconstruction never guesses which orphan wait or
+        # set belongs to an operation. This metadata emits no hardware work.
+        from .stage_skew import TASK_BUNDLE_ATTR
+        bundle = sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
+        return tir.AttrStmt(tir.StringImm(str(task_id)), TASK_BUNDLE_ATTR, 0, bundle)
 
     body = tir.stmt_functor.ir_transform(loop.body, None, task_rewrite)
     if seen != set(by_id):

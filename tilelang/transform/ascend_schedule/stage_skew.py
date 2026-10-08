@@ -7,6 +7,8 @@ versions from its caller. It neither invents storage eligibility nor removes
 events. The main scheduling driver must supply that proof before using it.
 """
 
+TASK_BUNDLE_ATTR = "tl.ascend.task_bundle"
+
 
 def materialize_staged_owner(function, owner, task_nodes, stages, dependencies):
     """Move whole task/event bundles to their logical epoch in a staged wave.
@@ -51,7 +53,7 @@ def materialize_staged_owner(function, owner, task_nodes, stages, dependencies):
             return found
         if isinstance(node, tir.SeqStmt):
             return [key for child in node.seq for key in identities(child)]
-        if isinstance(node, tir.AttrStmt) and node.attr_key == "resource_scope":
+        if isinstance(node, tir.AttrStmt) and node.attr_key in ("resource_scope", TASK_BUNDLE_ATTR):
             return identities(node.body)
         raise ValueError("stage bundle requires flat unconditional scoped operations")
 
