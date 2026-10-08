@@ -9,7 +9,7 @@ events. The main scheduling driver must supply that proof before using it.
 
 
 def materialize_staged_owner(function, owner, task_nodes, stages, dependencies):
-    """Move whole task/event bundles to their logical epoch in a two-stage wave.
+    """Move whole task/event bundles to their logical epoch in a staged wave.
 
     Task(e) with stage s runs in wave e+s. An edge a(e)->b(e+d) therefore
     requires s[a] <= s[b]+d; equality additionally requires actual wave order.
@@ -21,14 +21,15 @@ def materialize_staged_owner(function, owner, task_nodes, stages, dependencies):
 
     certificate = certify_uniform_clock(function, owner)
     if not task_nodes or set(stages) != set(task_nodes) or any(
-            type(stage) is not int or stage not in (0, 1) for stage in stages.values()):
-        raise ValueError("stage reconstruction requires complete two-stage task assignments")
-    if set(stages.values()) != {0, 1}:
-        raise ValueError("stage reconstruction requires both prefetch and compute stages")
+            type(stage) is not int or stage < 0 for stage in stages.values()):
+        raise ValueError("stage reconstruction requires complete nonnegative integer assignments")
+    max_stage = max(stages.values())
+    if min(stages.values()) != 0 or max_stage == 0:
+        raise ValueError("stage reconstruction requires stage zero and a later stage")
     dtype = DataType(owner.loop_var.dtype)
     if not str(dtype).startswith("int") or dtype.lanes != 1:
         raise ValueError("stage wave requires a signed scalar integer owner")
-    if certificate.extent_max + 1 > (1 << (dtype.bits - 1)) - 1:
+    if certificate.extent_max + max_stage > (1 << (dtype.bits - 1)) - 1:
         raise ValueError("stage wave extent may overflow")
     markers = list(task_nodes.items())
     if any(
@@ -102,7 +103,7 @@ def materialize_staged_owner(function, owner, task_nodes, stages, dependencies):
     replacement = tir.For(
         wave,
         0,
-        owner.extent + 1,
+        owner.extent + max_stage,
         tir.ForKind.SERIAL,
         tir.SeqStmt(body),
         annotations=owner.annotations,

@@ -8,19 +8,19 @@ from tvm import tir, arith
 from tilelang.transform.ascend_schedule.model import Dependency
 
 
-def fixture(trips):
+def fixture(trips, slots=2):
     epoch = tir.Var("epoch", "int32")
     nodes = {
-        i: tir.Evaluate(tir.call_extern("handle", f"op_{i}", epoch, epoch % 2)) for i in range(4)
+        i: tir.Evaluate(tir.call_extern("handle", f"op_{i}", epoch, epoch % slots)) for i in range(4)
     }
     groups = []
     for node in nodes.values():
         wait = tir.Evaluate(
             tir.call_intrin("handle", tir.op.Op.get("tl.ascend_wait_flag"), "MTE2", "MTE1",
-                            epoch % 2))
+                            epoch % slots))
         ready = tir.Evaluate(
             tir.call_intrin("handle", tir.op.Op.get("tl.ascend_set_flag"), "MTE2", "MTE1",
-                            epoch % 2))
+                            epoch % slots))
         groups.append(
             tir.AttrStmt(
                 tir.IntImm("int32", 0), "resource_scope", 0, tir.SeqStmt([wait, node, ready])))
@@ -33,6 +33,129 @@ def fixture(trips):
         Dependency(3, 2, "WAR", 2)
     ]
     return function, owner, nodes, dependencies
+
+
+@pytest.mark.parametrize("trips", [0, 1, 2, 5])
+@pytest.mark.parametrize("stages,slots", [({
+    0: 0,
+    1: 1,
+    2: 2,
+    3: 2
+}, 3), ({
+    0: 0,
+    1: 2,
+    2: 3,
+    3: 3
+}, 4)])
+def test_multistage_epochs_and_flag_slots_cover_each_logical_task_once(trips, stages, slots):
+    from tilelang.transform.ascend_schedule.stage_skew import materialize_staged_owner
+    function, owner, nodes, _ = fixture(trips, slots)
+    dependencies = [
+        Dependency(0, 1, "RAW"),
+        Dependency(1, 2, "RAW"),
+        Dependency(2, 3, "RAW"),
+        Dependency(3, 0, "WAR", slots)
+    ]
+    result = materialize_staged_owner(function, owner, nodes, stages, dependencies)
+    wave = result.body
+    assert int(wave.extent) == trips + max(stages.values())
+    events = []
+    analyzer = arith.Analyzer()
+    for w in range(int(wave.extent)):
+        bindings = {wave.loop_var: tir.IntImm("int32", w)}
+        for guard in wave.body.seq:
+            if not int(analyzer.simplify(tir.stmt_functor.substitute(guard.condition, bindings))):
+                continue
+            calls = []
+            tir.stmt_functor.post_order_visit(
+                guard.then_case, lambda n: calls.append(n.value)
+                if isinstance(n, tir.Evaluate) else None)
+            operation = calls[1]
+            epoch = int(analyzer.simplify(tir.stmt_functor.substitute(operation.args[1], bindings)))
+            op_slot = int(
+                analyzer.simplify(tir.stmt_functor.substitute(operation.args[2], bindings)))
+            assert op_slot == epoch % slots
+            for flag in (calls[0], calls[2]):
+                assert int(analyzer.simplify(tir.stmt_functor.substitute(flag.args[2],
+                                                                         bindings))) == op_slot
+            events.append((str(operation.args[0].value), epoch))
+    assert sorted(events) == sorted((f"op_{i}", e) for e in range(trips) for i in range(4))
+    if trips > max(stages.values()):
+        assert events.index(("op_0", 1)) < events.index(("op_3", 0))
+
+
+def test_multistage_reuse_at_equal_wave_is_rejected_in_actual_bundle_order():
+    from tilelang.transform.ascend_schedule.stage_skew import materialize_staged_owner
+    function, owner, nodes, _ = fixture(5)
+    with pytest.raises(ValueError, match="dependence"):
+        materialize_staged_owner(function, owner, nodes, {
+            0: 0,
+            1: 1,
+            2: 2,
+            3: 2
+        }, [Dependency(3, 0, "WAR", 2)])
+
+
+def test_multistage_wave_extent_checks_maximum_stage_not_only_one():
+    from tilelang.transform.ascend_schedule.stage_skew import materialize_staged_owner
+    function, owner, nodes, _ = fixture(2147483646, 3)
+    with pytest.raises(ValueError, match="overflow"):
+        materialize_staged_owner(function, owner, nodes, {0: 0, 1: 1, 2: 2, 3: 2}, [])
+
+
+@pytest.mark.parametrize("bad_stages", [{
+    0: -1,
+    1: 1,
+    2: 2,
+    3: 2
+}, {
+    0: False,
+    1: 1,
+    2: 2,
+    3: 2
+}, {
+    0: 1,
+    1: 2,
+    2: 3,
+    3: 3
+}, {
+    0: 0,
+    1: 0,
+    2: 0,
+    3: 0
+}])
+def test_multistage_assignments_remain_fail_closed(bad_stages):
+    from tilelang.transform.ascend_schedule.stage_skew import materialize_staged_owner
+    function, owner, nodes, _ = fixture(5, 4)
+    with pytest.raises(ValueError, match="stage"):
+        materialize_staged_owner(function, owner, nodes, bad_stages, [])
+
+
+def test_multistage_preserves_group_dependent_clock():
+    from tilelang.transform.ascend_schedule.stage_skew import materialize_staged_owner
+    cid = tir.IterVar(None, tir.Var("cid", "int32"), tir.IterVar.ThreadIndex, "blockIdx.x")
+    trips = tir.floormod(cid.var, 4)
+    function, owner, nodes, _ = fixture(trips, 3)
+    function = function.with_body(tir.AttrStmt(cid, "thread_extent", 8, owner))
+    result = materialize_staged_owner(function, owner, nodes, {
+        0: 0,
+        1: 1,
+        2: 2,
+        3: 2
+    }, [Dependency(3, 0, "WAR", 3)])
+    wave = result.body.body
+    analyzer = arith.Analyzer()
+    for group in range(8):
+        group_binding = {cid.var: tir.IntImm("int32", group)}
+        extent = int(analyzer.simplify(tir.stmt_functor.substitute(wave.extent, group_binding)))
+        assert extent == group % 4 + 2
+        counts = [0] * 4
+        for w in range(extent):
+            for index, guard in enumerate(wave.body.seq):
+                bindings = {**group_binding, wave.loop_var: tir.IntImm("int32", w)}
+                counts[index] += int(
+                    analyzer.simplify(tir.stmt_functor.substitute(guard.condition, bindings)))
+        assert counts == [group % 4] * 4
 
 
 @pytest.mark.parametrize("trips", [0, 1, 2, 3])
@@ -56,7 +179,8 @@ def test_skew_moves_next_load_before_current_compute_and_flags_follow_epoch(trip
                 continue
             calls = []
             tir.stmt_functor.post_order_visit(
-                guard.then_case, lambda n, calls=calls: calls.append(n.value)
+                guard.then_case,
+                lambda n, calls=calls: calls.append(n.value)
                 if isinstance(n, tir.Evaluate) else None)
             operation = calls[1]
             logical_epoch = int(arith.Analyzer().simplify(
