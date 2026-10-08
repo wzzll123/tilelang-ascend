@@ -205,3 +205,38 @@ alone does not authorize a physical version rewrite or claim hardware speedup.
 The nine-file compiler regression after reader/all-endpoint integration passes
 195 tests, with65232 existing TVM/Python AST deprecation warnings. No simulator
 path was added or used in these native-input tests.
+
+## Typed workspace lifecycle planning
+
+`workspace_planning.discover_workspace_epochs` now maps the complete partition
+certificate to exactly one extracted writer and all readers, preserving task
+and Access metadata. It checks roles, native helper core/pipe assignments,
+shared GM storage domain, exclusive owner and participant-uniform clock.
+Candidates sharing the owner share one clock certificate. Both the current
+function and extraction are checked for explicit Stage/version constraints;
+these remain on the existing validated hint path, not unconstrained discovery.
+Already address-planned input requires the asynchronous alias contract.
+
+`plan_workspace_epochs` is a separate typed partition planner. It does not
+route collective writes through L1's full-world `Access.full_overwrite` proof.
+Reader stage cannot precede writer stage. For ascending stage-wave execution,
+the slot count exceeds the writer-to-last-reader stage span, with minimum2.
+The returned iteration EpochPlan undergoes the existing physical rewriter's
+pointer-span/index/all-use preflight; the temporary rewritten IR is discarded.
+The original world version pitch and group coverage byte count remain separate.
+
+Nineteen test-first discovery/planning cases cover stage spans1/2/4, invalid
+stages/counts, escaped parameters, incorrect execution metadata, private GM,
+explicit constraints, stale-extraction constraints and physical-address input.
+The16 real FA native-input cases additionally discover all three candidates,
+share their owner clock, and preflight two-slot physical materialization for
+each workspace independently. That per-workspace test is not a globally
+executable FA stage assignment. Ten-file regression passes214 tests.
+
+The planner has not yet been installed in the production entry. Joint local
+capacity, host-GM workspace allocation accounting, complete dependencies and
+event-channel feasibility must select one common schedule before actual rings,
+mode2 protocols and waves are emitted. GM bytes cannot be charged against L1
+or UB hardware capacity. No new hardware performance result is attributed to
+these local changes; the frozen prefetch build's three-round performance gate
+has failed at0.107698, with all84 original reports archived separately.

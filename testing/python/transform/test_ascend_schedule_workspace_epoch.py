@@ -560,3 +560,22 @@ def test_native_fa_scheduler_input_has_certified_group_workspaces(platform, sq, 
         assert len(proof.readers) == 1
         assert proof.owner.same_as(proofs[0].owner)
         certify_uniform_clock(function, proof.owner)
+    from tilelang.transform.ascend_schedule.workspace_planning import (discover_workspace_epochs,
+                                                                       plan_workspace_epochs)
+    discovery = discover_workspace_epochs(function, extraction)
+    assert not discovery.diagnostics and len(discovery.candidates) == 3
+    assert all(
+        candidate.clock is discovery.candidates[0].clock for candidate in discovery.candidates)
+    for candidate in discovery.candidates:
+        stages = {task.id: 0 for task in extraction.tasks}
+        for task_id in candidate.reader_ids:
+            stages[task_id] = 1
+        # Per-workspace lifecycle/preflight only, not a globally executable
+        # FA assignment or a claim that its other dependencies allow this map.
+        plan = plan_workspace_epochs(candidate, stages)
+        assert plan.eligible and plan.count == 2
+        assert candidate.size_bytes == candidate.group_bytes * candidate.certificate.writer.group_count
+        assert not any(access.full_overwrite
+                       for task in discovery.tasks
+                       for access in task.accesses
+                       if access.storage is candidate.storage)
