@@ -316,3 +316,20 @@ library's original build identity and hash separately. The frozen1aeedc56
 hardware precision/performance results above do not validate this candidate.
 Numerical acceptance and performance remain real-device gates; simulator
 execution is not a prerequisite for this work.
+
+## Larger-tile admission, separate from the frozen hardware campaign
+
+The example configuration now accepts `block_m` and `block_n`, preserving
+32x64 defaults and the existing JIT/task interface. M must be an integer
+multiple of32 (two Vector participants with16-row Cube geometry); N an integer
+multiple of16. These are algorithm tiling values, not event IDs, slots,
+addresses or hand scheduling. No new compiler or simulator switch is added.
+
+Test-first native-input checks admit64x128 with Q/KV length130, causal and
+noncausal on both A2/A3. The production automatic entry still selects the
+certified two-stage workspace wave. Final generated UB allocation intervals
+are checked disjoint and bounded by the platform's real capacity; unknown
+allocation dtypes cannot silently escape the assertion. Invalid geometries
+are rejected before lowering. Larger tiles have no real numerical or timing
+validation yet; native generation is not hardware acceptance. The Docker
+2c83b27d campaign remains frozen32x64 until all three rounds finish.

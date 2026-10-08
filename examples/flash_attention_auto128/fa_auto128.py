@@ -28,6 +28,8 @@ class FlashAttentionConfig:
     dim: int
     dtype: str = "float16"
     causal: bool = False
+    block_m: int = 32
+    block_n: int = 64
 
 
 @tilelang.jit(out_idx=[3], pass_configs=pass_configs, target="ascendc")
@@ -39,7 +41,11 @@ def flash_attention_auto128_fwd(cfg: FlashAttentionConfig):
         raise ValueError("batch, heads and sequence lengths must be positive")
     if cfg.causal and sq > skv:
         raise ValueError("causal requires q_seq_len <= kv_seq_len")
-    bm, bn, dim = 32, 64, 128
+    bm, bn, dim = cfg.block_m, cfg.block_n, 128
+    if type(bm) is not int or bm <= 0 or bm % 32:
+        raise ValueError("block_m must be a positive integer multiple of 32")
+    if type(bn) is not int or bn <= 0 or bn % 16:
+        raise ValueError("block_n must be a positive integer multiple of 16")
     q_tiles = (sq + bm - 1) // bm
     causal = cfg.causal
 

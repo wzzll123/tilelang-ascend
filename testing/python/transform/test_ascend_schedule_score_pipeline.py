@@ -9,7 +9,7 @@ import tilelang
 from tvm import tir
 
 
-def prepared(platform, causal, kv, sq=128):
+def prepared(platform, causal, kv, sq=128, block_m=32, block_n=64):
     from examples.flash_attention_auto128.fa_auto128 import (FlashAttentionConfig,
                                                              flash_attention_auto128_fwd,
                                                              pass_configs)
@@ -20,7 +20,8 @@ def prepared(platform, causal, kv, sq=128):
     from tilelang.transform.ascend_schedule.workspace_tasks import prepare_cross_core_copies
     from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks
     function = flash_attention_auto128_fwd.__wrapped__(
-        FlashAttentionConfig(1, 1, sq, kv, 128, causal=causal)).with_attr("npu_platform", platform)
+        FlashAttentionConfig(1, 1, sq, kv, 128, causal=causal, block_m=block_m,
+                             block_n=block_n)).with_attr("npu_platform", platform)
     target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
     with patch("tilelang.transform.ascend_schedule.entry.schedule_module", lambda mod, *_: mod), \
             tvm.transform.PassContext(config=pass_configs):
