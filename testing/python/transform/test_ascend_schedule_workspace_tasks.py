@@ -114,6 +114,54 @@ def assert_mode2_execution(function, extracted, dependencies, platform, source_n
             local_ids=(0, 1, 2, 3))
         simulator(synchronized).run()
         simulator(synchronized, delayed_producer=True).run()
+        from tilelang.transform.ascend_schedule.buffer_versions import materialize_iteration_versions
+        from tilelang.transform.ascend_schedule.ownership import EpochPlan, OwnerEpochPlan
+        workspace = next(iter(candidate.buffer_map.values()))
+        pitch = int(np.prod([int(x) for x in workspace.shape])) * tvm.DataType(
+            workspace.dtype).bits // 8
+        plan = EpochPlan(workspace.data, True, 2, (OwnerEpochPlan(owner, "iteration", object()),))
+        versioned = materialize_iteration_versions(candidate, workspace, plan)
+        loops = []
+        tir.stmt_functor.post_order_visit(
+            versioned.body,
+            lambda node, loops=loops: loops.append(node) if isinstance(node, tir.For) else None)
+        assert len(loops) == 1
+        ring_owner = loops[0]
+        ring_extraction = extract_tasks(ring_owner.body)
+
+        def is_workspace(storage, workspace=workspace):
+            return hasattr(storage, "var") and storage.var.same_as(workspace.data)
+
+        # Conservative full-allocation regions for this one-core fixture cover
+        # both Vector shards; no inferred edge is silently turned into a fence.
+        ring_extraction.tasks = tuple(
+            replace(
+                task,
+                accesses=tuple(
+                    replace(
+                        access,
+                        offset=0,
+                        extent=pitch,
+                        intervals=None,
+                        iteration_stride=pitch,
+                        ring_size=2) if is_workspace(access.storage) else access
+                    for access in task.accesses))
+            for task in ring_extraction.tasks)
+        ring_dependencies = analyze_dependencies(ring_extraction.tasks, max_distance=2)
+        counts = {
+            (d.source, d.target, d.distance): 2 if is_workspace(d.storage) else 1
+            for d in ring_dependencies
+        }
+        ring_synced = emit_mode2_loop_sync(
+            versioned,
+            ring_owner,
+            ring_extraction,
+            ring_dependencies,
+            cross_ids=tuple(range(8)),
+            local_ids=(0, 1, 2, 3),
+            slot_counts=counts)
+        simulator(ring_synced).run()
+        simulator(ring_synced, delayed_producer=True).run()
         missing_set = synchronized.with_body(
             tir.stmt_functor.ir_transform(synchronized.body, None, remove_set))
         with pytest.raises(SimulationDeadlockError):

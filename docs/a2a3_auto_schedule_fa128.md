@@ -298,6 +298,31 @@ The expanded suites remain **742 passed, 1 deselected**, 66 subtests; the one
 deselected row-expand diagnostic test is the verified pre-existing failure
 described above. No NPU FA hardware/performance result is claimed.
 
+GM workspace/per-edge version follow-up: generated scratch GM parameters can
+now expand their buffer_map capacity without changing parameter order,
+auto_gm_indices or storage identity. Ordinary GM inputs are rejected. Physical
+slot offsets use the original pointer integer width. Thread-axis bounds and
+native copy helper spans prove Vector shard accesses when native access_ptr
+extent advertises a whole-core tile; unknown helpers still fail closed.
+
+The mode-2 owner emitter accepts independently certified slot counts per edge,
+initializes/drains every ready/release slot, and uses the same owner-relative
+iteration modulo as GM addresses. This permits a double-buffered GM exchange
+alongside single-version local storage. Both directions execute on A2/A3 CPU
+simulator configurations, with two Vector lanes, 0/1/2/5 epochs and normal or
+delayed producers. The test supplies conservative full-workspace footprints
+for its one-core fixture to analyze distance-two reuse: automatically deriving
+these layout-aware certificates from general lowered TIR is still pending.
+No arbitrary carried edge is changed into a timing assumption. Longer carried
+duplicates are discharged through actual repeated source-pipe FIFO plus an
+emitted shorter-distance fence; unsupported reuse distances are rejected.
+
+Expanded regression: **744 passed, 1 deselected**, 66 subtests. The deselected
+test remains the verified pre-existing row-expand diagnostic mismatch. This
+milestone does not enable the full-function automatic entry or establish FA
+hardware correctness/performance. Counter/guard clocks, complete extraction
+proofs, scheduled reconstruction and safe alias contracts remain outstanding.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

@@ -95,3 +95,36 @@ def test_raw_handle_escape_is_not_left_unversioned():
     plan = EpochPlan(buffer.data, True, 2, (OwnerEpochPlan(loop, "iteration", object()),))
     with pytest.raises(ValueError, match="raw buffer handles"):
         materialize_iteration_versions(function, buffer, plan)
+
+
+def test_generated_gm_workspace_versions_keep_parameter_index_and_identity():
+    workspace = tir.decl_buffer((16,), "float32", name="workspace", scope="global")
+    handle = tir.Var("workspace_handle", "handle")
+    i = tir.Var("epoch", "int32")
+    loop = tir.For(i, 3, 5, tir.ForKind.SERIAL,
+                   tir.Evaluate(tir.call_extern("handle", "probe", workspace.access_ptr("w"))))
+    function = tir.PrimFunc([handle], loop, buffer_map={
+        handle: workspace
+    }).with_attr("auto_gm_indices", [0])
+    plan = EpochPlan(workspace.data, True, 2, (OwnerEpochPlan(loop, "iteration", object()),))
+    result = materialize_iteration_versions(function, workspace, plan)
+    assert result.params[0].same_as(handle)
+    assert result.buffer_map[handle].data.same_as(workspace.data)
+    assert [int(x) for x in result.buffer_map[handle].shape] == [32]
+    assert int(result.attrs["auto_gm_indices"][0]) == 0
+    offset = result.body.body.value.args[1].args[2]
+    for epoch in range(3, 8):
+        bound = tir.stmt_functor.substitute(offset, {i: tir.IntImm("int32", epoch)})
+        assert int(arith.Analyzer().simplify(bound)) == ((epoch - 3) % 2) * 16
+
+
+def test_plain_gm_inputs_are_not_implicitly_versioned():
+    workspace = tir.decl_buffer((16,), "float32", name="input", scope="global")
+    handle = tir.Var("input_handle", "handle")
+    loop = tir.For(
+        tir.Var("epoch", "int32"), 0, 2, tir.ForKind.SERIAL,
+        tir.Evaluate(tir.call_extern("handle", "probe", workspace.access_ptr("r"))))
+    function = tir.PrimFunc([handle], loop, buffer_map={handle: workspace})
+    plan = EpochPlan(workspace.data, True, 2, (OwnerEpochPlan(loop, "iteration", object()),))
+    with pytest.raises(ValueError, match="generated scratch GM"):
+        materialize_iteration_versions(function, workspace, plan)

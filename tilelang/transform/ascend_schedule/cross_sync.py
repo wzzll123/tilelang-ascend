@@ -103,22 +103,37 @@ def emit_mode2_sync(function, extraction, dependencies, *, cross_ids, local_ids)
     return function.with_body(body)
 
 
-def emit_mode2_loop_sync(function, loop, extraction, dependencies, *, cross_ids, local_ids):
-    """Materialize one-slot ready/release protocols in a shared CV owner loop.
+def emit_mode2_loop_sync(function,
+                         loop,
+                         extraction,
+                         dependencies,
+                         *,
+                         cross_ids,
+                         local_ids,
+                         slot_counts=None):
+    """Materialize per-edge slot protocols in a shared regular CV owner loop.
 
-    Every cross-pipe edge owns two channels. Distance-one edges seed ready;
+    Every cross-pipe edge owns ready/release channels for each certified slot.
+    Carried reuse edges seed ready;
     same-iteration edges seed release. Drain consumes exactly the remaining
     initial credit, including when the loop executes zero times. The extraction
-    describes the loop body; conditional/counter owners and multiversion cross
-    channels are not yet supported by this reconstruction.
+    describes the loop body; conditional/counter owners are not yet supported.
+    slot_counts maps (source,target,distance) to the certified owner version
+    count. It must come from physical-region/owner proof, not guessed timing.
     """
     from tvm import tir
 
     if not isinstance(loop, tir.For) or loop.kind != tir.ForKind.SERIAL:
         raise LocalSyncError("mode-2 owner must be a serial loop")
     dependencies = tuple(dependencies)
-    if any(type(d.distance) is not int or d.distance not in (0, 1) for d in dependencies):
-        raise LocalSyncError("mode-2 owner currently supports dependency distance zero or one")
+    slot_counts = {} if slot_counts is None else dict(slot_counts)
+    dependency_keys = {(d.source, d.target, d.distance) for d in dependencies}
+    if any(key not in dependency_keys for key in slot_counts) or any(
+            type(count) is not int or count < 1 for count in slot_counts.values()):
+        raise LocalSyncError(
+            "slot counts require known dependency keys and positive integer counts")
+    if any(type(d.distance) is not int or d.distance < 0 for d in dependencies):
+        raise LocalSyncError("mode-2 dependency distances must be nonnegative integers")
     # Validate core/participant/node ownership using the existing flat emitter.
     emit_mode2_sync(
         function,
@@ -129,7 +144,10 @@ def emit_mode2_loop_sync(function, loop, extraction, dependencies, *, cross_ids,
     positions = {task.id: i for i, task in enumerate(extraction.tasks)}
     before, after = {i: [] for i in by_id}, {i: [] for i in by_id}
     pairs = {}
-    same_epoch_pairs = {(d.source, d.target) for d in dependencies if d.distance == 0}
+    minimum_distance = {}
+    for d in dependencies:
+        pair = d.source, d.target
+        minimum_distance[pair] = min(minimum_distance.get(pair, d.distance), d.distance)
     for d in dependencies:
         if d.kind not in ("RAW", "WAR", "WAW") or d.source not in by_id or d.target not in by_id:
             raise LocalSyncError("mode-2 owner requires analyzed RAW/WAR/WAW dependencies")
@@ -138,11 +156,17 @@ def emit_mode2_loop_sync(function, loop, extraction, dependencies, *, cross_ids,
         # Actual pipe FIFO orders source(i) before source(i+1). A real emitted
         # source(i+1)->target(i+1) fence therefore already proves this carried
         # edge. Adding another credit protocol would impose a false cycle.
-        if d.distance == 1 and (d.source, d.target) in same_epoch_pairs:
+        if d.distance > minimum_distance[d.source, d.target]:
             continue
+        count = slot_counts.get((d.source, d.target, d.distance), 1)
+        if d.distance not in (0, count):
+            raise LocalSyncError("carried mode-2 distance must equal its certified slot count")
         a, b = by_id[d.source], by_id[d.target]
         if a.core != b.core or _pipe(a.pipe) != _pipe(b.pipe):
-            pairs[d.source, d.target, d.distance] = None
+            key = d.source, d.target, d.distance
+            if key in pairs and pairs[key] != count:
+                raise LocalSyncError("conflicting slot counts for one dependency channel")
+            pairs[key] = count
     used_cross, local_pools = set(), {}
 
     def channel(a, b):
@@ -171,16 +195,24 @@ def emit_mode2_loop_sync(function, loop, extraction, dependencies, *, cross_ids,
         return node
 
     initialize, drain = [], []
-    for source, target, distance in pairs:
-        ready = channel(by_id[source], by_id[target])
-        release = channel(by_id[target], by_id[source])
-        before[source].append(flag("wait", release))
-        after[source].append(flag("set", ready))
-        before[target].append(flag("wait", ready))
-        after[target].append(flag("set", release))
+
+    def selected(keys, count):
+        slot = tir.floormod(loop.loop_var - loop.min, count)
+        event = tir.IntImm("int32", keys[-1][-1])
+        for i in reversed(range(count - 1)):
+            event = tir.Select(slot == i, tir.IntImm("int32", keys[i][-1]), event)
+        return (*keys[0][:-1], event)
+
+    for (source, target, distance), count in pairs.items():
+        ready = tuple(channel(by_id[source], by_id[target]) for _ in range(count))
+        release = tuple(channel(by_id[target], by_id[source]) for _ in range(count))
+        before[source].append(flag("wait", selected(release, count)))
+        after[source].append(flag("set", selected(ready, count)))
+        before[target].append(flag("wait", selected(ready, count)))
+        after[target].append(flag("set", selected(release, count)))
         initial = ready if distance else release
-        initialize.append(flag("set", initial, scoped=True))
-        drain.append(flag("wait", initial, scoped=True))
+        initialize.extend(flag("set", key, scoped=True) for key in initial)
+        drain.extend(flag("wait", key, scoped=True) for key in initial)
     seen = set()
 
     def task_rewrite(node):
