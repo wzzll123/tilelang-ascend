@@ -77,19 +77,25 @@ class BootstrapTests(unittest.TestCase):
 
     def test_flag_off_returns_input_without_extracting(self):
         mod = self.module()
-        with patch.object(entry, "extract_tasks", side_effect=AssertionError("unexpected")):
+        with patch.object(entry, "extract_tasks", side_effect=AssertionError("unexpected")), \
+                patch.object(entry, "normalize_conditions",
+                             side_effect=AssertionError("unexpected normalization")):
             self.assertIs(entry.schedule_module(mod, "ascendc", {}), mod)
+            self.assertIs(entry.schedule_module(mod, "ascendc", {KEY: False}), mod)
 
     def test_flag_on_extracts_then_errors_no_fallback(self):
         mod = self.module()
-        with patch.object(entry, "extract_tasks") as extract:
+        with patch.object(entry, "extract_tasks") as extract, \
+                patch.object(entry, "normalize_conditions", side_effect=lambda node: node) as normalize:
             with self.assertRaisesRegex(entry.AutoScheduleError, "materializ"):
                 entry.schedule_module(mod, "ascendc", {KEY: True})
             extract.assert_called_once_with(mod.functions["main"])
+            normalize.assert_called_once_with(mod.functions["main"])
 
     def test_extraction_error_retains_multi_pipe_diagnostic(self):
         mod = self.module()
         with patch.object(entry, "extract_tasks", side_effect=ValueError("multi-pipe gemm_v0")), \
+                patch.object(entry, "normalize_conditions", side_effect=lambda node: node), \
                 self.assertRaisesRegex(ValueError, "multi-pipe gemm_v0"):
             entry.schedule_module(mod, "ascendc", {KEY: True})
 
@@ -141,6 +147,16 @@ class NativePolicyTests(unittest.TestCase):
                 KEY: T.IntImm("bool", 1),
                 "tl.ascend_auto_sync": T.IntImm("bool", 0)
             })
+
+    def test_enabled_if_primfunc_reaches_materializer_after_normalization(self):
+        T = self.tvm.tir
+        state = T.decl_buffer((1,), "int32", name="state")
+        body = T.IfThenElse(state[0] > 0, T.BufferStore(state, T.IntImm("int32", 0), [0]), None)
+        mod = self.tvm.IRModule({"main": T.PrimFunc([], body).with_attr("npu_platform", "A2")})
+        source = self.tvm.ir.save_json(mod)
+        with self.assertRaisesRegex(entry.AutoScheduleError, "materializer"):
+            entry.schedule_module(mod, "ascendc", {KEY: True})
+        self.assertEqual(self.tvm.ir.save_json(mod), source)
 
     def test_phase_stops_immediately_after_lower_tile_op(self):
         from tilelang.engine import phase

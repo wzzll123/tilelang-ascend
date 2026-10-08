@@ -37,6 +37,12 @@ class SourceContracts(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(adapter.ExtractionError):
                 adapter.operation_config(name)
 
+    def test_cross_core_gm_hop_composites_require_decomposition(self):
+        for name in ("copy_ub_to_l1", "copy_l0c_to_ub"):
+            with self.subTest(name=name), \
+                    self.assertRaisesRegex(adapter.ExtractionError, "cross-core.*decompose"):
+                adapter.operation_config(name)
+
     def test_storage_interning_uses_same_as_not_wrapper_identity(self):
 
         class Var:
@@ -97,7 +103,9 @@ class RealTIRContracts(unittest.TestCase):
         body = T.LetStmt(
             scalar, buffer[0],
             T.IfThenElse(scalar > 0, T.BufferStore(buffer, T.IntImm("int32", 0), [0]), None))
-        result = adapter.extract_tasks(body)
+        from importlib import import_module
+        normalize = import_module(PACKAGE + ".conditions").normalize_conditions
+        result = adapter.extract_tasks(normalize(body))
         self.assertEqual(len(result.scalar_bindings), 2)
         self.assertEqual(len(result.tasks), 3)
         self.assertTrue(result.tasks[-1].guard)
@@ -144,6 +152,78 @@ class RealTIRContracts(unittest.TestCase):
         self.assertEqual((result.tasks[0].pipe, result.tasks[0].core), ("PIPE_V", "V"))
         self.assertEqual([access.mode for access in result.tasks[0].accesses], ["W", "R", "R"])
 
+    def test_copy_logical_extent_does_not_hide_second_physical_row(self):
+        from importlib import import_module
+        dependencies = import_module(PACKAGE + ".dependency")
+        T = self.tir
+        gm = T.decl_buffer((2, 16), "float16", name="gm")
+        ub = T.decl_buffer((2, 16), "float16", name="ub", scope="shared")
+        scalar = T.decl_buffer((1,), "float16", name="scalar", scope="local")
+        # src/op/ascend.cc CopyNode::Lower supplies product(region extents)=8,
+        # although a 2x4 region in 16-column storage touches elements 16..19.
+        copy = T.Evaluate(
+            T.call_extern("handle", "tl::ascend::copy_gm_to_ub<half,16,2>",
+                          self.pointer(gm.data, 0, 8, 1), self.pointer(ub.data, 0, 8, 2), 16, 2, 4,
+                          T.FloatImm("float16", 0), 2, 16))
+        later_read = T.BufferStore(scalar, ub[1, 0], [0])
+        result = adapter.extract_tasks(T.SeqStmt([copy, later_read]))
+        copy_write = [access for access in result.tasks[0].accesses if access.writes][0]
+        self.assertIsNone(copy_write.offset)
+        self.assertIsNone(copy_write.extent)
+        self.assertEqual(copy_write.mode, "W")
+        precise_read = result.tasks[1].accesses[0]
+        self.assertEqual((precise_read.offset, precise_read.extent), (32, 2))
+        hazards = dependencies.analyze_dependencies(result.tasks, max_distance=0)
+        self.assertTrue((0, 1,
+                         "RAW") in [(edge.source, edge.target, edge.kind) for edge in hazards])
+        reversed_result = adapter.extract_tasks(T.SeqStmt([later_read, copy]))
+        hazards = dependencies.analyze_dependencies(reversed_result.tasks, max_distance=0)
+        self.assertTrue((0, 1,
+                         "WAR") in [(edge.source, edge.target, edge.kind) for edge in hazards])
+
+    def test_builtin_mma_tail_logical_counts_preserve_hazards(self):
+        from importlib import import_module
+        import tilelang  # noqa: F401 - Registers tl.ascend_mma in the native library.
+        dependencies = import_module(PACKAGE + ".dependency")
+        T = self.tir
+        a = T.decl_buffer((256,), "float16", name="a", scope="shared.l0a")
+        b = T.decl_buffer((256,), "float16", name="b", scope="shared.l0b")
+        c = T.decl_buffer((256,), "float32", name="c", scope="shared.l0c")
+        # MmaCodegen reads template/ptr args 0..3 and runtime init/K args 4..5.
+        # Logical 16x5 counts cannot prove padded/fractal physical read spans.
+        for k_actual in (1, 5, 15):
+            mma = T.Evaluate(
+                T.call_intrin("handle", T.op.Op.get("tl.ascend_mma"), "mma<half,float,16,16>",
+                              self.pointer(a.data, 0, 80, 1), self.pointer(b.data, 0, 80, 1),
+                              T.tvm_access_ptr(T.type_annotation("float32"), c.data, 0, 256, 3),
+                              T.IntImm("bool", 0), k_actual))
+            prior_write = T.BufferStore(a, T.FloatImm("float16", 1), [80])
+            result = adapter.extract_tasks(T.SeqStmt([prior_write, mma]))
+            matrix = result.tasks[1]
+            self.assertEqual((matrix.pipe, matrix.core), ("PIPE_M", "C"))
+            self.assertEqual([access.mode for access in matrix.accesses], ["R", "R", "RW"])
+            self.assertTrue(all(access.footprint() is None for access in matrix.accesses))
+            self.assertIs(matrix.accesses[0].storage, result.tasks[0].accesses[0].storage)
+            hazards = dependencies.analyze_dependencies(result.tasks, max_distance=0)
+            self.assertTrue((0, 1,
+                             "RAW") in [(edge.source, edge.target, edge.kind) for edge in hazards])
+            # A following write must also retain WAR on the matrix's reads.
+            result = adapter.extract_tasks(T.SeqStmt([mma, prior_write]))
+            hazards = dependencies.analyze_dependencies(result.tasks, max_distance=0)
+            self.assertTrue((0, 1,
+                             "WAR") in [(edge.source, edge.target, edge.kind) for edge in hazards])
+
+    def test_vector_pipe_ub_copy_is_also_conservative(self):
+        T = self.tir
+        source, destination = T.Var("src", "handle"), T.Var("dst", "handle")
+        copy = T.Evaluate(
+            T.call_extern("handle", "copy_ub_to_ub", self.pointer(source),
+                          self.pointer(destination, mask=3)))
+        result = adapter.extract_tasks(copy)
+        self.assertEqual(result.tasks[0].pipe, "PIPE_V")
+        self.assertEqual([access.mode for access in result.tasks[0].accesses], ["R", "RW"])
+        self.assertTrue(all(access.footprint() is None for access in result.tasks[0].accesses))
+
     def test_real_template_intrinsic_argument_index(self):
         import tilelang.language as L
         T = self.tir
@@ -154,6 +234,34 @@ class RealTIRContracts(unittest.TestCase):
         result = adapter.extract_tasks(T.PrimFunc([dst.data], T.Evaluate(call)))
         self.assertEqual(len(result.tasks[0].accesses), 1)
         self.assertEqual(result.tasks[0].accesses[0].mode, "W")
+
+    def test_actual_extern_gm_hop_composites_rejected(self):
+        T = self.tir
+        source, destination, workspace = (
+            T.Var(name, "handle") for name in ("source", "destination", "workspace"))
+        names = ("tl::ascend::copy_ub_to_l1<half,16,2>",
+                 "tl::ascend::copy_l0c_to_ub<float,half,layout::RowMajor,16,16,0>")
+        for name in names:
+            call = T.Evaluate(
+                T.call_extern("handle", name, self.pointer(source),
+                              self.pointer(destination, mask=2), 16, 2, 2, 16,
+                              self.pointer(workspace, mask=3)))
+            with self.subTest(name=name), \
+                    self.assertRaisesRegex(adapter.ExtractionError, "cross-core.*decompose"):
+                adapter.extract_tasks(call)
+
+    def test_lower_level_gm_hop_components_remain_supported(self):
+        T = self.tir
+        source, destination = T.Var("source", "handle"), T.Var("destination", "handle")
+        for name, pipe, core in (("copy_gm_to_l1", "PIPE_MTE2", "C"), ("copy_ub_to_gm", "PIPE_MTE3",
+                                                                       "V")):
+            call = T.Evaluate(
+                T.call_extern("handle", name, self.pointer(source),
+                              self.pointer(destination, mask=2)))
+            result = adapter.extract_tasks(call)
+            self.assertEqual((result.tasks[0].pipe, result.tasks[0].core), (pipe, core))
+            self.assertEqual([access.mode for access in result.tasks[0].accesses], ["R", "W"])
+            self.assertTrue(all(access.footprint() is None for access in result.tasks[0].accesses))
 
     def test_builtin_multipipe_gemm_diagnostic(self):
         import tilelang  # noqa: F401 - Registers builtin Ops in the native library.

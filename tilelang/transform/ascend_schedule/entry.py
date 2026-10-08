@@ -4,6 +4,7 @@
 
 from .policy import resolve_options, schedule_enabled
 from .tir_adapter import extract_tasks
+from .conditions import normalize_conditions
 
 
 class AutoScheduleError(NotImplementedError):
@@ -11,7 +12,7 @@ class AutoScheduleError(NotImplementedError):
 
 
 def schedule_module(mod, target_model, config):
-    """Extract enabled modules, then stop before any legacy scheduling/sync.
+    """Normalize and extract enabled modules, then stop before legacy sync.
 
     This bootstrap intentionally cannot return a scheduled module: ring
     materialization and unified synchronization are not implemented. Disabling
@@ -25,7 +26,7 @@ def schedule_module(mod, target_model, config):
         attrs = getattr(function, "attrs", None)
         platform = str(attrs.get("npu_platform", "")) if attrs is not None else ""
         resolve_options(config, target_model, platform)
-        extract_tasks(function)
+        extract_tasks(normalize_conditions(function))
     raise AutoScheduleError(
         "tl.ascend_auto_schedule extraction succeeded, but the scheduling materializer "
         "and unified synchronization emitter are not implemented. Disable "

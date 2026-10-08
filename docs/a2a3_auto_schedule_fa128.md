@@ -26,8 +26,12 @@ quietly execute the old pipeline and present that result as automatic scheduling
 Implemented, with CPU tests:
 
 - `T.Stage` and `T.annotate_buffer_versions` metadata on the existing TVM/TIR.
-- Conservative lowered-operation extraction, physical storage interning,
-  byte regions, scalar bindings and condition snapshot descriptions.
+- Conservative lowered-operation extraction and physical storage interning.
+  Literal contiguous scalar/vector byte ranges are exact. Copy and MMA pointer
+  counts do not prove physical ranges for strided/fractal/padded operations;
+  those footprints stay unknown until helper/layout semantics are established.
+- Actual TIR `LetStmt` condition snapshots at the original position, including
+  inside loops; extraction refers to the real bindings without duplicate work.
 - Same-iteration and carried RAW/WAR/WAW analysis, including uncertain regions.
 - Full-overwrite owner eligibility and iteration/counter clock descriptions;
   initial reads, read-modify-write and partial initialization cannot rotate.
@@ -40,13 +44,22 @@ Implemented, with CPU tests:
 - Conservative A2/A3 compiler allocation budgets, checked against the existing
   C++ planner's reservations, not copied from A5.
 - Native PassContext key registration and verified runtime fingerprint utility.
+- Bounded affine old-TVM byte-region/Z3 proof adapter with intermediate integer
+  overflow checks. Unsupported nodes or solver unknown retain conflicts. It is
+  not yet connected to automatic dependence pruning.
+- Flat single-core local event TIR emitter, independently tested through the
+  simulator on A2/A3. Removing a generated wait exposes a memory hazard. This
+  is not a loop/cross-core/software-pipeline materializer or full compiler path.
+  Event IDs are never reused in this slice; a textually prior wait is not proof
+  it executed before another asynchronous source set. Exhaustion is explicit.
 
 Still required, in order:
 
 1. Decompose composite GEMM and cross-core copy into actual pipe tasks. Reject
-   `gemm_v0/v1` for now: their hidden MTE1/M work cannot be modeled as atomic M.
-2. Lower scalar condition snapshots to executable TIR, preserve scalar updates,
-   and add region-expression/Z3 proof adaptation for the supported TIR subset.
+   `gemm_v0/v1`, `copy_ub_to_l1`, and `copy_l0c_to_ub` for now: their hidden
+   MTE1/M or cross-core GM-hop work cannot be modeled as a single atomic pipe.
+2. Connect the verified condition snapshots and region proofs to the supported
+   task/control-flow reconstruction and helper-specific physical byte regions.
 3. Connect owner/full-footprint proof, per-core cost/storage model and solver to
    real loops; materialize versions, slot selection, prologue/body/epilogue.
 4. Generate local events and A2/A3 mode-2 cross-core ready/release protocols,
@@ -110,6 +123,23 @@ simulator/platform regressions, **222 passed**, 50 subtests, zero skips.
 This used the independent rebuilt native library and the existing older TVM.
 Warnings are older TVM parser deprecations under Python 3.13, not failing tests.
 Native compilation succeeded; hardware compilation/execution is not included.
+
+Docker first-milestone validation also passed all 222 selected tests using its
+independent native build, toolkit 9.0.0, Python 3.12.13 and the same clean TVM commit.
+Loaded native SHA256: `0778c7e71891d09820fbb75517e8e414bceedfcb1597bfc7b095bd453ed51ee1`.
+Loaded TVM SHA256: `2df7999bbed69490640f5bc50166a5a650ac543bdea22514878e86ae31ccd36e`.
+Docker isolated solver environment:
+`/tmp/a2a3-auto-schedule-fa128-venv.JsRZee` (Z3 4.15.4).
+Local Z3 is 5.1.0; both passed the first-milestone constraint suite. The exact
+local version has no binary wheel in the Docker ARM index and its source build
+failed, so Docker uses an available wheel, not a global installation change.
+
+Second local milestone: condition reconstruction, byte proofs, local-event
+emission and conservative transfer/MMA extraction passed **270 tests**, 66
+subtests, zero skips, with the same native library. Both A2/A3 local event
+mutation checks execute sync-only, not just compile, and reject deleted waits.
+This does not establish full FA scheduling, cross-core protocols or hardware
+correctness. YAPF 0.40.2, Ruff 0.6.5, codespell 2.3.0 and diff checks passed.
 
 ## Docker validation gates — not yet run
 

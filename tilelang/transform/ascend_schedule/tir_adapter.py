@@ -10,12 +10,13 @@ are bytes, with symbolic offsets/extents deliberately left unknown.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 from typing import Any
 
 from .model import Access, Task
+from .conditions import CONDITION_SNAPSHOT
 
 
 class ExtractionError(ValueError):
@@ -53,6 +54,11 @@ def load_operation_configs(path: Path | None = None) -> dict:
 
 def operation_config(name: str, configs: dict | None = None) -> OperationConfig:
     normalized = normalize_operation(name)
+    # CopyNode::Lower marks these helpers virtual_channel and passes workspace:
+    # A2/A3 execute a GM hop across cores/pipes, not an atomic L1/UB transfer.
+    if normalized in ("copy_ub_to_l1", "copy_l0c_to_ub"):
+        raise ExtractionError(f"{name} is a multi-pipe cross-core GM-hop composite; "
+                              "decompose it into physical copy tasks before scheduling")
     if normalized in ("gemm_v0", "gemm_v1", "tl.ascend_gemm_v0", "tl.ascend_gemm_v1"):
         raise ExtractionError(
             f"{name} is a multi-pipe function; decompose it into copy/mma tasks before scheduling")
@@ -148,6 +154,7 @@ class _Extractor:
         self.tasks, self.bindings, self.annotations = [], [], []
         self.nodes, self.stages, self.loops = {}, {}, {}
         self.stage, self.core, self.guard, self.loop_stack = 0, None, (), ()
+        self.snapshot_vars = ()
 
     def integer(self, expr):
         return int(expr.value) if isinstance(expr, self.tir.IntImm) else None
@@ -209,6 +216,11 @@ class _Extractor:
         return Access(storage, mode, offset, size, alias=buffer)
 
     def pointer_access(self, pointer, configured_mode):
+        """Decode an access pointer; callers must prove operation contiguity.
+
+        CopyNode::Lower uses product(region extents), not a physical span,
+        for copy access pointers. operation() discards those tentative ranges.
+        """
         if (not isinstance(pointer, self.tir.Call) or pointer.op.name != "tir.tvm_access_ptr" or
                 len(pointer.args) != 5):
             raise ExtractionError("Configured buffer argument is not a lowered tvm_access_ptr")
@@ -230,8 +242,8 @@ class _Extractor:
 
     def bind(self, node, expression, var=None, kind="let"):
         if var is None:
-            # A synthetic condition variable represents a single evaluation at entry.
-            var = self.tir.Var(f"ascend_guard_{len(self.bindings)}", "bool")
+            raise ExtractionError("A predicate needs an actual scalar binding before extraction; "
+                                  "normalize_conditions handles runtime IfThenElse conditions")
         storage = self.pool.intern(var)
         task_id = self.add_task(node, "PIPE_S", self.core or "C",
                                 self.expression_reads(expression) + [Access(storage, "W")])
@@ -268,7 +280,20 @@ class _Extractor:
         for index, argument in enumerate(arguments):
             accesses.extend(
                 self.expression_reads(argument, include_pointers=index not in configured_indices))
-        core = self.operation_core(normalize_operation(name), config.pipe)
+        # Copies may stride across rows or convert fractal layouts. Their
+        # pointer extent is a logical element count (src/op/ascend.cc), so no
+        # contiguous physical span follows from it. This includes PIPE_V UB
+        # copies, MTE im2col, and FIX transfers. PIPE_M matrix instructions can
+        # similarly read padded/fractal tiles or hardware-rounded K tails.
+        # Until helper stride/layout analysis proves actual intervals, retain
+        # whole-storage conflicts for transfers and matrix accesses.
+        normalized_name = normalize_operation(name)
+        if "copy" in normalized_name.lower() or config.pipe in ("PIPE_MTE1", "PIPE_MTE2",
+                                                                "PIPE_MTE3", "PIPE_FIX", "PIPE_M"):
+            accesses = [
+                replace(access, offset=None, extent=None, intervals=None) for access in accesses
+            ]
+        core = self.operation_core(normalized_name, config.pipe)
         self.add_task(node, config.pipe, core, accesses)
 
     def operation_core(self, name, pipe):
@@ -297,7 +322,11 @@ class _Extractor:
             self.walk(node.body)
             self.loop_stack = previous
         elif isinstance(node, T.IfThenElse):
-            snapshot = self.bind(node, node.condition, kind="guard")
+            if (not isinstance(node.condition, T.Var) or
+                    not any(var.same_as(node.condition) for var in self.snapshot_vars)):
+                raise ExtractionError("Runtime IfThenElse needs an actual snapshot LetStmt; "
+                                      "call normalize_conditions before extraction")
+            snapshot = self.pool.intern(node.condition)
             previous = self.guard
             self.guard += ((snapshot, True),)
             self.walk(node.then_case)
@@ -306,10 +335,20 @@ class _Extractor:
                 self.walk(node.else_case)
             self.guard = previous
         elif isinstance(node, T.LetStmt):
-            self.bind(node, node.value, node.var)
+            kind = "guard" if any(var.same_as(node.var) for var in self.snapshot_vars) else "let"
+            self.bind(node, node.value, node.var, kind)
             self.walk(node.body)
         elif isinstance(node, T.AttrStmt):
             stage, core = self.stage, self.core
+            snapshots = self.snapshot_vars
+            if node.attr_key == CONDITION_SNAPSHOT:
+                if (not isinstance(node.node, T.Var) or str(node.node.dtype) != "bool" or
+                        not isinstance(node.body, T.LetStmt) or
+                        not node.body.var.same_as(node.node) or
+                        not isinstance(node.body.body, T.IfThenElse) or
+                        not node.body.body.condition.same_as(node.node)):
+                    raise ExtractionError("Malformed tl.ascend_condition_snapshot wrapper")
+                self.snapshot_vars += (node.node,)
             if node.attr_key == "tl.ascend_stage":
                 value = self.integer(node.node)
                 if value is None or value < 0:
@@ -323,6 +362,7 @@ class _Extractor:
             self.annotations.append(node)
             self.walk(node.body)
             self.stage, self.core = stage, core
+            self.snapshot_vars = snapshots
         elif isinstance(node, T.BlockRealize):
             previous = self.guard
             for variable, value in zip(node.block.iter_vars, node.iter_values):

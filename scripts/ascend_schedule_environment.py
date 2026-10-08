@@ -59,6 +59,18 @@ def cann_identity():
     }
 
 
+def solver_identity():
+    try:
+        import z3
+    except (ImportError, OSError) as error:
+        return {"available": False, "reason": str(error)}
+    return {
+        "available": True,
+        "version": z3.get_version_string(),
+        "python": str(Path(z3.__file__).resolve())
+    }
+
+
 def collect(args):
     import tilelang
     import tvm
@@ -97,6 +109,7 @@ def collect(args):
         },
         "bisheng": command(["bisheng", "--version"]),
         "cann": cann_identity(),  # codespell:ignore cann
+        "z3": solver_identity(),
         "run": {
             "platform": args.platform,
             "card": args.card,

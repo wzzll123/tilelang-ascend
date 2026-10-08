@@ -5,6 +5,8 @@
 import hashlib
 import importlib.util
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,3 +62,20 @@ def test_cann_version_from_selected_installation(tmp_path, monkeypatch):
 def test_unavailable_cann_not_zero_version(monkeypatch):
     monkeypatch.delenv("ASCEND_HOME_PATH", raising=False)
     assert not environment.cann_identity()["available"]
+
+
+def test_solver_fingerprint_records_selected_package(tmp_path, monkeypatch):
+    source = tmp_path / "z3" / "__init__.py"
+    monkeypatch.setitem(
+        sys.modules, "z3",
+        SimpleNamespace(__file__=str(source), get_version_string=lambda: "fixture-version"))
+    assert environment.solver_identity() == {
+        "available": True,
+        "version": "fixture-version",
+        "python": str(source)
+    }
+
+
+def test_missing_solver_fingerprint_is_explicit(monkeypatch):
+    monkeypatch.setitem(sys.modules, "z3", None)
+    assert not environment.solver_identity()["available"]
