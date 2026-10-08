@@ -175,6 +175,103 @@ def assert_mode2_execution(function,
             simulator(missing_drain).run()
 
 
+def assert_automatic_cv_loop(function, platform, source_name):
+    import numpy as np
+    from dataclasses import replace
+    from tilelang.simulator import (build_kernel_program, FunctionalSimulator, SimulatorConfig,
+                                    SimulationDeadlockError)
+    from tilelang.transform.ascend_schedule.entry import AutoScheduleError
+
+    for extent in (0, 1, 2, 5):
+        epoch = tir.Var("auto_epoch", "int32")
+
+        def wrap(node, epoch=epoch, extent=extent):
+            if isinstance(node, tir.Block) and node.name_hint == "root":
+                return tir.Block(node.iter_vars, node.reads, node.writes, node.name_hint,
+                                 tir.For(epoch, 3, extent, tir.ForKind.SERIAL,
+                                         node.body), node.init, node.alloc_buffers,
+                                 node.match_buffers, node.annotations)
+            return None
+
+        candidate = function.with_body(tir.stmt_functor.ir_transform(function.body, None, wrap))
+        automatic = schedule_module(
+            tvm.IRModule({"main": candidate}), "ascendc", {"tl.ascend_auto_schedule": True})["main"]
+
+        def run(candidate):
+            sim = FunctionalSimulator(
+                build_kernel_program(candidate, platform=platform),
+                SimulatorConfig(platform=platform, sync_only=True, flag_balance_check="error"))
+            for task in sim.program.tasks:
+                region = task.metadata.get("src")
+                if region is not None and region.buffer == source_name:
+                    owner = sim.memory.vector1_owner(
+                        task.core_id) if task.lane.value == "vector1" else task.core_id
+                    sim.write(
+                        replace(region, core_id=owner), np.ones(region.shape), task_core_id=owner)
+            sim.run()
+
+        run(automatic)
+        if extent == 2:
+            from tilelang.engine.phase import OptimizeForTarget
+            target = function.attrs["target"]
+            native = tvm.IRModule({"probe": automatic.with_attr("global_symbol", "probe")})
+            with tvm.transform.PassContext(config={"tl.ascend_auto_schedule": True}):
+                native = OptimizeForTarget(native, target, platform)
+            source = tvm.get_global_func("target.build.tilelang_ascend")(native, target,
+                                                                         platform).get_source()
+            assert "CrossCoreSetFlag<0x2," in source
+            assert "CrossCoreWaitFlag(" in source
+
+        def remove_drain(node):
+            if isinstance(node, tir.SeqStmt) and any(
+                    isinstance(child, tir.For) for child in node.seq):
+                return tir.SeqStmt(list(node.seq)[:-1])
+            return None
+
+        mutated = automatic.with_body(
+            tir.stmt_functor.ir_transform(automatic.body, None, remove_drain))
+        with pytest.raises(SimulationDeadlockError, match="FLAG ACCOUNTING"):
+            run(mutated)
+
+        if extent == 1:
+            axes = []
+            tir.stmt_functor.post_order_visit(
+                candidate.body,
+                lambda node, axes=axes: axes.append(node.node)
+                if isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent" and node.node
+                .thread_tag == "threadIdx.x" else None)
+            axis = axes[0]
+
+            def relocate_participants(node, axis=axis):
+                if isinstance(node, tir.AttrStmt
+                             ) and node.attr_key == "thread_extent" and node.node.same_as(axis):
+                    return node.body
+                if isinstance(node, tir.For):
+                    return tir.For(node.loop_var, node.min, node.extent, node.kind,
+                                   tir.AttrStmt(axis, "thread_extent", 2, node.body))
+                return None
+
+            wrong_scope = candidate.with_body(
+                tir.stmt_functor.ir_transform(candidate.body, None, relocate_participants))
+            with pytest.raises(AutoScheduleError, match="participant scope must dominate"):
+                schedule_module(
+                    tvm.IRModule({"main": wrong_scope}), "ascendc",
+                    {"tl.ascend_auto_schedule": True})
+
+            def nonuniform_clock(node, axis=axis):
+                if isinstance(node, tir.For):
+                    return tir.For(node.loop_var, node.min, tir.Select(axis.var == 0, 1, 2),
+                                   node.kind, node.body)
+                return None
+
+            wrong_clock = candidate.with_body(
+                tir.stmt_functor.ir_transform(candidate.body, None, nonuniform_clock))
+            with pytest.raises(AutoScheduleError, match="uniform static clock"):
+                schedule_module(
+                    tvm.IRModule({"main": wrong_clock}), "ascendc",
+                    {"tl.ascend_auto_schedule": True})
+
+
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 def test_ub_to_l1_is_two_real_pipes_with_a_shared_gm_dependency(platform):
     ub = tir.decl_buffer((8, 16), "float16", name="ub", scope="shared.ub")
@@ -213,6 +310,7 @@ def test_ub_to_l1_is_two_real_pipes_with_a_shared_gm_dependency(platform):
     automatic = schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})["main"]
     assert int(automatic.attrs["tl.ascend.schedule_materialized"]) == 1
     assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "ub", automatic)
+    assert_automatic_cv_loop(prepared["main"], platform, "ub")
 
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
@@ -252,3 +350,4 @@ def test_l0c_to_ub_exposes_fix_write_and_vector_mte2_read(platform):
     automatic = schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})["main"]
     assert int(automatic.attrs["tl.ascend.schedule_materialized"]) == 1
     assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "acc", automatic)
+    assert_automatic_cv_loop(prepared["main"], platform, "acc")

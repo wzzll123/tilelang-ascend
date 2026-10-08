@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 from .dependency import analyze_dependencies
 from .local_sync import emit_local_sync, emit_loop_sync, LocalSyncError
-from .cross_sync import emit_mode2_sync
+from .cross_sync import emit_mode2_sync, emit_mode2_loop_sync
 from .analysis_report import build_schedule_report
 from .solver import TaskCost, StorageCost
 from .resources import allocation_budgets
@@ -16,6 +16,71 @@ MARKER = "tl.ascend.schedule_materialized"
 
 class MaterializationError(ValueError):
     """The requested structure has no complete executable materialization yet."""
+
+
+def _validate_cv_owner(function, loop, extraction):
+    """Prove participant context and exact task ownership, not just presence."""
+    from tvm import tir
+
+    if not isinstance(loop.min, tir.IntImm) or not isinstance(loop.extent, tir.IntImm):
+        raise MaterializationError("CV owner bounds require a uniform static clock")
+    paths = []
+
+    def find(node, path):
+        if node.same_as(loop):
+            paths.append(path)
+            return
+        children = []
+        if isinstance(node, (tir.AttrStmt, tir.Allocate, tir.Block)):
+            children = [node.body]
+        elif isinstance(node, tir.BlockRealize):
+            if not isinstance(node.predicate, tir.IntImm) or not int(node.predicate):
+                raise MaterializationError("predicated allocation scopes need guard reconstruction")
+            children = [node.block]
+        elif isinstance(node, tir.SeqStmt):
+            children = list(node.seq)
+        for child in children:
+            find(child, (*path, node))
+
+    find(function.body, ())
+    if len(paths) != 1:
+        raise MaterializationError("CV owner has no unique allocation/thread scope path")
+    ancestors = paths[0]
+    if any(
+            isinstance(node, tir.AttrStmt) and node.attr_key == "resource_scope"
+            for node in ancestors):
+        raise MaterializationError("shared CV owner cannot be enclosed by a single-core scope")
+    if not any(
+            isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent" and
+            isinstance(node.node, tir.IterVar) and node.node.thread_tag in
+        ("threadIdx.x",
+         "blockIdx.y") and isinstance(node.value, tir.IntImm) and int(node.value) == 2
+            for node in ancestors):
+        raise MaterializationError("two-Vector participant scope must dominate the CV owner")
+    seen = []
+    by_id = {task.id: task for task in extraction.tasks}
+
+    def validate(node, core=None):
+        if isinstance(node, tir.SeqStmt):
+            for child in node.seq:
+                validate(child, core)
+        elif (isinstance(node, tir.AttrStmt) and node.attr_key == "resource_scope" and
+              isinstance(node.value, tir.IntImm) and int(node.value) in (0, 1)):
+            validate(node.body, "C" if int(node.value) == 0 else "V")
+        elif isinstance(node, tir.Evaluate):
+            task_id = next(
+                (i for i, original in extraction.task_nodes.items() if node.same_as(original)),
+                None)
+            if task_id is None or core != by_id[task_id].core or task_id in seen:
+                raise MaterializationError(
+                    "CV owner task must occur once in its matching core scope")
+            seen.append(task_id)
+        else:
+            raise MaterializationError("CV owner body requires flat scoped tasks")
+
+    validate(loop.body)
+    if seen != [task.id for task in extraction.tasks]:
+        raise MaterializationError("CV owner does not cover its complete lexical task stream")
 
 
 def materialize_flat_function(function, extraction, platform):
@@ -35,17 +100,18 @@ def materialize_flat_function(function, extraction, platform):
     owner_loop = None
     if any(extraction.loops.values()):
         contexts = [extraction.loops[task.id] for task in tasks]
-        if (len({task.core for task in tasks}) != 1 or
-                any(len(context) != 1 for context in contexts) or
+        if (any(len(context) != 1 for context in contexts) or
                 any(not context[0].same_as(contexts[0][0]) for context in contexts)):
-            raise MaterializationError("only a single unconditional local owner loop is integrated")
+            raise MaterializationError("only a single unconditional owner loop is integrated")
         owner_loop = contexts[0][0]
         if owner_loop.kind != tir.ForKind.SERIAL:
             raise MaterializationError("owner loop must be serial")
         nodes = [extraction.task_nodes[task.id] for task in tasks]
         expected = nodes[0] if len(nodes) == 1 else tir.SeqStmt(nodes)
         from tvm import ir
-        if not ir.structural_equal(owner_loop.body, expected):
+        if len({task.core for task in tasks}) > 1:
+            _validate_cv_owner(function, owner_loop, extraction)
+        elif not ir.structural_equal(owner_loop.body, expected):
             raise MaterializationError("owner loop must contain only its extracted flat tasks")
         loop_nodes = []
         tir.stmt_functor.post_order_visit(
@@ -150,13 +216,24 @@ def materialize_flat_function(function, extraction, platform):
         capacities=allocation_budgets(platform),
         resource_model=platform)
     report.update(
-        materialization="single local owner loop"
+        materialization=("single CV owner loop"
+                         if len({task.core for task in tasks}) > 1 else "single local owner loop")
         if owner_loop is not None else "flat local/CV epoch",
         timing="unit-cost feasibility; not calibrated NPU timing",
         alias_policy="disjoint physical allocations until async alias contracts are integrated")
     if owner_loop is not None:
         body_extraction = replace(extraction, loops={task.id: () for task in tasks})
         try:
+            if len({task.core for task in tasks}) > 1:
+                result = emit_mode2_loop_sync(
+                    function,
+                    owner_loop,
+                    body_extraction,
+                    dependencies,
+                    cross_ids=tuple(range(8)),
+                    local_ids=tuple(range(8)))
+                return result.with_attr(MARKER, 1).with_attr("tl.ascend.schedule_report",
+                                                             json.dumps(report, sort_keys=True))
             synchronized = emit_loop_sync(
                 body_extraction, owner_loop, dependencies, event_ids=tuple(range(8)))
         except LocalSyncError as error:

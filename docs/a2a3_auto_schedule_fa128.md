@@ -390,6 +390,24 @@ pipelining. Mixed C/V owner integration, guarded execution, scalar/control
 reconstruction and joint version materialization remain outstanding; no NPU
 correctness or performance acceptance is claimed.
 
+Shared-CV-owner follow-up: automatic entry also reconstructs a sole static
+serial C/V owner with one physical version. Both UB-to-L1 and L0C-to-UB numeric
+workspace paths execute for extents 0/1/2/5 on A2/A3, with mode-2 ready/release
+and final drain. The extent-two variants pass native target optimization and
+generate actual mode-2 calls. The owner validator proves that a two-Vector
+participant context dominates initialization, the loop and drain; detecting
+that context somewhere in the function is not sufficient. Body tasks must
+occur exactly once in matching explicit C/V scopes, with no hidden control or
+allocation. Nonuniform bounds and wrongly nested participant scopes fail
+closed; removed drain is rejected during execution. The expanded suite remains
+**759 passed, 1 deselected**, now including these additional loop checks in
+the existing four workspace tests.
+
+This is still sequentially reconstructed single-version execution, not a
+jointly optimized multiversion FA pipeline. Guards, scalar controls, multiple
+epochs, online accumulated state and safe alias admission are not yet wired
+into a complete FA driver. No NPU FA result or speed ratio has been measured.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash
