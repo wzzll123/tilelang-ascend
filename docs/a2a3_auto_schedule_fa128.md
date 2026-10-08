@@ -199,6 +199,34 @@ materialization can establish their protocol. Full FA hardware gates remain
 unrun; neither this conservative handshake nor its performance is accepted as
 the final FA schedule.
 
+Iteration-version materialization follow-up: **312 local tests**, 66 subtests
+passed. Certified single iteration owners can now expand compact physical
+Allocate storage and shift every lowered access_ptr by the owner-relative
+epoch modulo version count, without changing the per-access extent. Nine tests
+cover nonzero loop minima, ownership/eligibility rejection, outside-owner
+accesses, raw-handle escape, and native A2/A3 allocation/source generation of
+dynamic slots. Capacity and access bounds are checked; fractal tiles require
+aligned dimensions and whole-version pitches are 32-byte aligned. Counter
+owners, mixed-dtype aliases, logical BufferLoad/Store and Block allocation
+views still require additional materialization work and currently fail closed.
+This is not yet wired as a complete executable automatic-schedule path: slot
+release events must be derived from the same certified owner clock before
+versioned kernels can be accepted for execution. No hardware or performance
+acceptance claim follows from source-generation tests.
+
+Version-clock/event integration follow-up: **322 local tests**, 66 subtests
+passed. The local loop emitter now assigns ready/release channels per slot and
+selects them with the same `(iteration - loop_min) % count` clock as physical
+addresses. Every slot is initialized and drained, including unused slots in
+empty/short loops. Ten tests actually execute the materialized double-buffer
+TIR with generated synchronization on A2/A3 simulator configurations for
+0/1/2/3/5 iterations and a nonzero loop minimum. A carried reuse edge must have
+distance equal to the selected slot count; other distances are not discarded.
+The current emitter requires a uniform slot count within its flat local slice;
+mixed owner clocks, guarded tasks, cross-core protocols and whole-function
+automatic materialization are still outstanding. This result is CPU sync-only,
+not NPU FA correctness or performance acceptance.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

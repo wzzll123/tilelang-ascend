@@ -182,12 +182,13 @@ def emit_local_sync(extraction, dependencies, *, event_ids, order=None):
          "event IDs supplied by caller; no ID reuse within destination pools"))
 
 
-def emit_loop_sync(extraction, loop, dependencies, *, event_ids):
+def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1):
     """Emit bounded-credit local protocols around one unconditional serial loop.
 
     The extraction describes the flat loop *body*, not the surrounding For.
     Distance-zero edges transfer ready then release in the same iteration;
-    distance-one edges transfer ready into the next iteration. Each edge owns
+    carried edges transfer ready to the next reuse of the same physical slot.
+    Each edge owns
     two destination channels so an asynchronous producer cannot overwrite a
     ready notification before its consumer takes it. Initial credits and final
     drain are paired even for an empty loop. This is not slot rotation or the
@@ -197,9 +198,11 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids):
 
     if not isinstance(loop, tir.For) or loop.kind != tir.ForKind.SERIAL:
         raise LocalSyncError("loop synchronization requires a serial For")
+    if type(slot_count) is not int or slot_count < 1:
+        raise LocalSyncError("slot_count must be a positive integer")
     dependencies = tuple(dependencies)
-    if any(type(d.distance) is not int or d.distance not in (0, 1) for d in dependencies):
-        raise LocalSyncError("loop synchronization supports only dependency distance 0 or 1")
+    if any(type(d.distance) is not int or d.distance not in (0, slot_count) for d in dependencies):
+        raise LocalSyncError("dependency distance must be zero or the certified slot count")
     # Reuse strict flat-domain/guard/node validation, without pretending carried
     # edges are distance-zero edges in its execution proof.
     emit_local_sync(extraction, [d for d in dependencies if d.distance == 0], event_ids=event_ids)
@@ -236,19 +239,27 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids):
         return tir.Evaluate(
             tir.call_intrin("handle", tir.op.Op.get("tl.ascend_" + kind + "_flag"), *key))
 
+    slot = tir.floormod(loop.loop_var - loop.min, slot_count)
+
+    def selected(keys):
+        event = tir.IntImm("int32", keys[-1][2])
+        for index in reversed(range(len(keys) - 1)):
+            event = tir.Select(slot == index, tir.IntImm("int32", keys[index][2]), event)
+        return keys[0][0], keys[0][1], event
+
     before = {t.id: [] for t in tasks}
     after = {t.id: [] for t in tasks}
     initialize, drain = [], []
     for source, target, distance in pairs:
-        ready = channel(pipes[source], pipes[target])
-        release = channel(pipes[target], pipes[source])
-        before[source].append(flag("wait", release))
-        after[source].append(flag("set", ready))
-        before[target].append(flag("wait", ready))
-        after[target].append(flag("set", release))
-        initial = ready if distance == 1 else release
-        initialize.append(flag("set", initial))
-        drain.append(flag("wait", initial))
+        ready = tuple(channel(pipes[source], pipes[target]) for _ in range(slot_count))
+        release = tuple(channel(pipes[target], pipes[source]) for _ in range(slot_count))
+        before[source].append(flag("wait", selected(release)))
+        after[source].append(flag("set", selected(ready)))
+        before[target].append(flag("wait", selected(ready)))
+        after[target].append(flag("set", selected(release)))
+        initial = ready if distance else release
+        initialize.extend(flag("set", key) for key in initial)
+        drain.extend(flag("wait", key) for key in initial)
     statements = []
     for task in tasks:
         statements.extend(before[task.id])

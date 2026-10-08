@@ -108,3 +108,36 @@ def test_deleted_drain_fails_runtime_flag_accounting(extent):
         FunctionalSimulator(
             build_kernel_program(function, platform="A2"),
             SimulatorConfig(sync_only=True, flag_balance_check="error")).run()
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("extent", [0, 1, 2, 3, 5])
+def test_double_buffer_slot_credits_match_materialized_addresses(platform, extent):
+    from tilelang.simulator import build_kernel_program, FunctionalSimulator, SimulatorConfig
+    from tilelang.transform.ascend_schedule.buffer_versions import materialize_iteration_versions
+    from tilelang.transform.ascend_schedule.ownership import EpochPlan, OwnerEpochPlan
+
+    extraction, loop, ub, output = fixture(extent)
+    loop = tir.For(loop.loop_var, 3, extent, loop.kind, loop.body)
+    function = tir.PrimFunc([output.data],
+                            tir.Allocate(ub.data, ub.dtype, ub.shape, tir.const(True, "bool"),
+                                         loop),
+                            buffer_map={output.data: output})
+    plan = EpochPlan(ub.data, True, 2, (OwnerEpochPlan(loop, "iteration", object()),))
+    function = materialize_iteration_versions(function, ub, plan)
+    versioned_loop = function.body.body
+    extraction.task_nodes = dict(enumerate(versioned_loop.body.seq))
+    synced = emit_loop_sync(
+        extraction,
+        versioned_loop,
+        [Dependency(0, 1, "RAW"), Dependency(1, 0, "WAR", 2)],
+        event_ids=(0, 1, 2, 3),
+        slot_count=2)
+    allocation = tir.Allocate(ub.data, ub.dtype, function.body.extents, tir.const(True, "bool"),
+                              synced)
+    function = function.with_body(
+        tir.AttrStmt(tir.IntImm("int32", 1), "resource_scope", 1, allocation))
+    program = build_kernel_program(function, platform=platform)
+    FunctionalSimulator(
+        program, SimulatorConfig(platform=platform, sync_only=True,
+                                 flag_balance_check="error")).run()
