@@ -26,13 +26,24 @@ finite-output check. Its original JSON is archived alongside this document.
 The original comparator uses CPU FP64 golden plus original-dtype native;
 the JSON's legacy atol/rtol metadata does not describe this CANN comparison.
 
-The serial fourteen-case twenty-launch run then started with the tracked
-`run_card6_score_precision.sh` environment wrapper. At this checkpoint,
-cases0,42 and10 passed all20 comparisons with finite outputs. Case10 retained
-the `True` causal input. Remaining cases are **not yet recorded as passed**;
-the live execution must reach terminal evidence and reports must be read back.
-No performance result, arbitrary-input stability or A3 hardware result is
-claimed. This is direct hardware validation, without simulator execution.
+The serial fourteen-case twenty-launch run completed with exit0 using the
+tracked `run_card6_score_precision.sh` environment wrapper. All fixed IDs
+`0,2,6,7,10,12,13,14,15,16,36,37,41,42` passed all20 comparisons with finite
+outputs: 280 launches. Causal input flags remained intact. The original
+fourteen JSON reports are archived alongside this document, with filenames
+`fa128-score-2c83b27d-caseN-stability20.json`. Independent local read-back
+verified the exact case count, case identity, NPU device, FP16 input, finite
+gate, repeat count and twenty-launch comparison messages. SHA256 of every
+downloaded file matched its server export. This establishes repeated stability
+for these fixed inputs, not all inputs or shapes.
+
+After terminal precision evidence and a fresh healthy/idle card6 check, the
+tracked `run_card6_score_perf.sh` started three-round same-case serial
+v06/auto128 comparison: warmup3, repeat20, original profiler and no boost.
+Its results remain pending; no performance acceptance, arbitrary-input
+stability or A3 hardware result is claimed. This is direct hardware validation,
+without simulator execution. Q/KV-tail generation tests do not substitute for
+additional real-device tail cases beyond this fixed fourteen-case set.
 
 Read-back of the new cache's native `kernel.cu` (cache key
 `e046fc54eaf3bdac759e916177b90f0574d8b52873544ae68c679b61f2321c9a`)
