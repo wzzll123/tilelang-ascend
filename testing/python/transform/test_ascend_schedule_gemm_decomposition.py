@@ -92,3 +92,100 @@ def test_decomposition_is_visible_to_dependency_and_sync_pipeline():
     assert len(emitted.assignments) == 2
     assert all(event.source_pipe == "MTE1" and event.destination_pipe == "M"
                for event in emitted.assignments)
+
+
+def test_function_decomposition_preserves_loop_stage_guard_and_attributes():
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+
+    call, _, _ = example()
+    i = tir.Var("i", "int32")
+    predicate = tir.Var("predicate", "bool")
+    body = tir.For(
+        i, 0, 2, tir.ForKind.SERIAL,
+        tir.AttrStmt(i, "tl.stage", 1, tir.IfThenElse(predicate, tir.Evaluate(call), None)))
+    function = tir.PrimFunc([predicate], body).with_attr("global_symbol", "test")
+    result = decompose_function_gemms(function)
+    assert result.attrs["global_symbol"] == "test"
+    assert result.body.loop_var.same_as(i)
+    assert result.body.body.attr_key == "tl.stage"
+    branch = result.body.body.body
+    assert branch.condition.same_as(predicate)
+    alloc_a = branch.then_case
+    alloc_b = alloc_a.body
+    assert isinstance(alloc_a, tir.Allocate) and isinstance(alloc_b, tir.Allocate)
+    assert [int(x) for x in alloc_a.extents] == [128, 128]
+    assert [int(x) for x in alloc_b.extents] == [128, 128]
+    assert alloc_a.buffer_var.type_annotation.storage_scope == "wmma.matrix_a"
+    assert alloc_b.buffer_var.type_annotation.storage_scope == "wmma.matrix_b"
+    assert len(alloc_b.body.seq) == 3
+    assert decompose_function_gemms(result).same_as(result)
+
+
+def test_each_callsite_has_distinct_scratch_and_avoids_existing_names():
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+
+    call, _, _ = example()
+    occupied = tir.Var("auto_l0a_0", "int32")
+    function = tir.PrimFunc([occupied], tir.SeqStmt([tir.Evaluate(call), tir.Evaluate(call)]))
+    result = decompose_function_gemms(function)
+    first, second = result.body.seq
+    assert first.buffer_var.name != occupied.name
+    assert not first.buffer_var.same_as(second.buffer_var)
+    assert not first.body.buffer_var.same_as(second.body.buffer_var)
+
+
+def test_no_gemm_preserves_function_identity():
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+
+    function = tir.PrimFunc([], tir.Evaluate(0))
+    assert decompose_function_gemms(function).same_as(function)
+
+
+def test_enabled_entry_decomposes_gemm_but_still_rejects_missing_materializer():
+    from tvm import IRModule
+    from tilelang.transform.ascend_schedule.entry import schedule_module, AutoScheduleError
+
+    call, _, _ = example()
+    function = tir.PrimFunc([], tir.Evaluate(call)).with_attr("npu_platform", "A2")
+    mod = IRModule({"main": function})
+    with pytest.raises(AutoScheduleError, match="extraction succeeded"):
+        schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})
+    assert mod["main"].body.value.same_as(call)
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_new_scratch_is_discovered_by_existing_native_planner_and_codegen(platform):
+    import tvm
+    from tilelang.transform.ascend_schedule.gemm_decomposition import decompose_function_gemms
+
+    a = tir.decl_buffer((16, 16), "float16", name="a", scope="shared.l1")
+    b = tir.decl_buffer((16, 16), "float16", name="b", scope="shared.l1")
+    c = tir.decl_buffer((16, 16), "float32", name="c", scope="wmma.accumulator")
+    call = tir.call_intrin("handle", tvm.ir.Op.get("tl.ascend_gemm_v0"),
+                           "gemm_v0<half,float,16,16,16,false,false,128>", a.access_ptr("r"),
+                           b.access_ptr("r"), c.access_ptr("w"), True, 16)
+    body = tir.AttrStmt(tir.IntImm("int32", 0), "resource_scope", 0, tir.Evaluate(call))
+    block = tir.Block([], [], [], "root", body, alloc_buffers=[a, b, c])
+    function = tir.PrimFunc([], tir.BlockRealize([], True, block)).with_attr(
+        "global_symbol", "probe").with_attr("npu_platform", platform)
+    mod = tvm.IRModule({"probe": function})
+    target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
+    with tvm.transform.PassContext(config={"tl.ascend_memory_planning": True}):
+        mod = tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.BufferShapeCollector()(mod)
+        mod = tilelang.transform.LowerTileOp()(mod)
+        # Insert after the initial shape collection, exactly at the new entry.
+        mod = tvm.IRModule({"probe": decompose_function_gemms(mod["probe"])})
+        mod = tilelang.transform.AscendLowerOpaqueBlock()(mod)
+        mod = tilelang.transform.Flatten2DBuffer()(mod)
+        mod = tilelang.transform.FlattenBuffer()(mod)
+        mod = tilelang.transform.AscendMemoryPlanning()(mod)
+        source = tvm.get_global_func("target.build.tilelang_ascend")(mod, target,
+                                                                     platform).get_source()
+    assert "auto_l0a_0 = ascend_l0a.GetWithOffset<half>(256," in source
+    assert "auto_l0b_0 = ascend_l0b.GetWithOffset<half>(256," in source
+    assert "copy_l1_to_l0a<half,16,16,false>(auto_l0a_0[0], a[0], 16, 16)" in source
+    assert "copy_l1_to_l0b<half,16,16,false>(auto_l0b_0[0], b[0], 16, 16)" in source
+    assert "mma<half,float,16,16>(auto_l0a_0[0],auto_l0b_0[0],c[0]" in source
+    assert "gemm_v0<" not in source
+    # Source-only: this intentionally unsynchronized probe is never launched.

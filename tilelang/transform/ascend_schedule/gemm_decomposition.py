@@ -10,15 +10,9 @@ are the caller's responsibility; this helper never claims to emit a pipeline.
 import re
 
 
-def decompose_gemm_v0(call, l0a, l0b):
-    """Return MTE1(A), MTE1(B), M tasks using caller-owned L0 buffers.
-
-    First supported family is FP16 input/FP32 accumulation with static aligned
-    M/N/K <=128 and one K tile. Runtime n_actual is retained only on transpose-B,
-    exactly as in the original helper. Unsupported forms fail rather than leave
-    an opaque multi-pipe function in the task graph.
-    """
-    from tvm import arith, tir
+def _gemm_geometry(call):
+    """Validate the supported template before creating any scratch allocations."""
+    from tvm import tir
 
     if not isinstance(call, tir.Call) or call.op.name != "tl.ascend_gemm_v0" or len(call.args) != 6:
         raise ValueError("expected the six-argument gemm_v0 intrinsic")
@@ -34,6 +28,20 @@ def decompose_gemm_v0(call, l0a, l0b):
     tile_k = int(match.group(6))
     if any(dim < 16 or dim > 128 or dim % 16 for dim in (m, n, k)) or tile_k != 128:
         raise ValueError("GEMM decomposition supports aligned M/N/K<=128 with kL0Size=128")
+    return m, n, k, transpose_a, transpose_b
+
+
+def decompose_gemm_v0(call, l0a, l0b):
+    """Return MTE1(A), MTE1(B), M tasks using caller-owned L0 buffers.
+
+    First supported family is FP16 input/FP32 accumulation with static aligned
+    M/N/K <=128 and one K tile. Runtime n_actual is retained only on transpose-B,
+    exactly as in the original helper. Unsupported forms fail rather than leave
+    an opaque multi-pipe function in the task graph.
+    """
+    from tvm import arith, tir
+
+    m, n, k, transpose_a, transpose_b = _gemm_geometry(call)
 
     def pointer(ptr, dtype, scope, required_mask):
         if (not isinstance(ptr, tir.Call) or ptr.op.name != "tir.tvm_access_ptr" or
@@ -87,3 +95,59 @@ def decompose_gemm_v0(call, l0a, l0b):
                           l0a.access_ptr("r"), l0b.access_ptr("r"), call.args[3], call.args[4], k,
                           actual_n, 0)
     return tir.SeqStmt([tir.Evaluate(copy_a), tir.Evaluate(copy_b), tir.Evaluate(mma)])
+
+
+def decompose_function_gemms(function):
+    """Expose GEMM tasks and allocate logical scratch at each statement site.
+
+    This transformation deliberately preserves enclosing loops, branches and
+    Stage annotations. It does not schedule, emit synchronization, rotate slots,
+    or grant permission to alias these allocations. Those are separate steps.
+    Late Flatten2DBuffer/AscendMemoryPlanning discover the new 2D allocations.
+    """
+    from tvm import tir
+
+    if not isinstance(function, tir.PrimFunc):
+        raise TypeError("GEMM decomposition requires a PrimFunc")
+    names = {param.name for param in function.params}
+    gemms = []
+
+    def collect(node):
+        if isinstance(node, tir.Var):
+            names.add(node.name)
+        if isinstance(node, tir.Call) and getattr(node.op, "name", None) == "tl.ascend_gemm_v0":
+            gemms.append(node)
+
+    tir.stmt_functor.post_order_visit(function.body, collect)
+    if not gemms:
+        return function
+
+    def fresh_name(prefix):
+        index = 0
+        while f"{prefix}_{index}" in names:
+            index += 1
+        name = f"{prefix}_{index}"
+        names.add(name)
+        return name
+
+    def rewrite(node):
+        if (not isinstance(node, tir.Evaluate) or not isinstance(node.value, tir.Call) or
+                getattr(node.value.op, "name", None) != "tl.ascend_gemm_v0"):
+            return None
+        m, n, k, _, _ = _gemm_geometry(node.value)
+        a = tir.decl_buffer((m, k), "float16", name=fresh_name("auto_l0a"), scope="wmma.matrix_a")
+        b = tir.decl_buffer((k, n), "float16", name=fresh_name("auto_l0b"), scope="wmma.matrix_b")
+        body = decompose_gemm_v0(node.value, a, b)
+        for scratch in (b, a):
+            body = tir.Allocate(scratch.data, scratch.dtype, scratch.shape, tir.const(True, "bool"),
+                                body)
+        return body
+
+    body = tir.stmt_functor.ir_transform(function.body, None, rewrite)
+    remaining = []
+    tir.stmt_functor.post_order_visit(
+        body, lambda node: remaining.append(node) if isinstance(node, tir.Call) and getattr(
+            node.op, "name", None) == "tl.ascend_gemm_v0" else None)
+    if remaining:
+        raise ValueError("GEMM decomposition requires standalone Evaluate statements")
+    return function.with_body(body)

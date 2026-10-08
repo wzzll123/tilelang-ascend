@@ -170,6 +170,17 @@ This is not a numerical or NPU GEMM/FA acceptance result. A runtime symbolic
 L1-to-L0 copy dimension decoder still requires concrete dimensions; that gap
 must be addressed before dynamic-tail sync-only acceptance.
 
+Function-level GEMM follow-up: **290 local tests**, 66 subtests passed. The
+enabled entry now decomposes supported GEMMs before condition normalization
+and task extraction. Each callsite receives distinct compact 2D L0A/L0B
+allocations without physical addresses; loops, branches, Stage annotations and
+function attributes are preserved. Six additional tests cover function
+rewriting, idempotence, name collisions, enabled-entry fail-closed behavior,
+and native A2/A3 memory-planning/source generation after LowerTileOp. The late
+buffer flattening discovers scratch absent from the initial shape collection.
+Source-only probes are intentionally not launched: loop-carried scratch reuse,
+slot materialization and unified synchronization still need implementation.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash
