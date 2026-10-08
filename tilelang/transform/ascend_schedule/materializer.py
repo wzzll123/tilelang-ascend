@@ -86,7 +86,12 @@ def _validate_cv_owner(function, loop, extraction):
         raise MaterializationError("CV owner does not cover its complete lexical task stream")
 
 
-def materialize_flat_function(function, extraction, platform):
+def materialize_flat_function(function,
+                              extraction,
+                              platform,
+                              *,
+                              prefetch=None,
+                              prefetch_report=None):
     """Emit an unconditional single epoch with disjoint allocation contracts.
 
     Unit costs test feasibility only: they are not calibrated NPU timings.
@@ -209,6 +214,31 @@ def materialize_flat_function(function, extraction, platform):
             if scope not in permitted.get(task.core, set()):
                 raise MaterializationError(
                     "on-chip storage is inaccessible from its task core domain")
+    if prefetch is not None:
+        if not phased or prefetch_report is None:
+            raise MaterializationError("prefetch requires validated phased scheduling")
+        for scope, capacity in allocation_budgets(platform).items():
+            if sum(size for _, allocation_scope, size in allocations
+                   if allocation_scope == scope) > capacity:
+                raise MaterializationError(f"expanded prefetch allocation exceeds {scope} capacity")
+        from .phases import emit_three_phase_sync
+        try:
+            result = emit_three_phase_sync(function, extraction, prefetch=prefetch)
+        except ValueError as error:
+            raise MaterializationError(str(error)) from error
+        report = dict(prefetch_report)
+        report.update(
+            materialization="prefix/prefetch-wave/suffix phases",
+            timing="unit-cost feasibility; not calibrated NPU timing",
+            alias_policy="disjoint physical allocations",
+            expanded_allocations=[{
+                "scope": scope,
+                "size_bytes": size
+            } for _, scope, size in allocations])
+        return result.with_attr(MARKER,
+                                1).with_attr("tl.ascend.prefetch_materialized",
+                                             1).with_attr("tl.ascend.schedule_report",
+                                                          json.dumps(report, sort_keys=True))
     slot_count = max((access.ring_size or 1 for task in tasks for access in task.accesses),
                      default=1)
     dependencies = list(

@@ -179,6 +179,38 @@ def test_unaccounted_physical_allocation_cannot_bypass_joint_capacity():
         discover_l1_prefetch(function, extract_tasks(function))
 
 
+@pytest.mark.parametrize("solver_failure", [False, True])
+def test_real_compiler_entry_selects_fa_prefetch_without_hand_hints(solver_failure, monkeypatch):
+    pytest.importorskip("z3")
+    import tvm
+    from examples.flash_attention_auto128.fa_auto128 import (FlashAttentionConfig,
+                                                             flash_attention_auto128_fwd,
+                                                             pass_configs)
+    from tilelang.engine.phase import LowerAndLegalize
+    if solver_failure:
+        from tilelang.transform.ascend_schedule import l1_prefetch
+        from tilelang.transform.ascend_schedule.solver import ScheduleInfeasible
+
+        def fail_solve(*_):
+            raise ScheduleInfeasible("test solver failure")
+
+        monkeypatch.setattr(l1_prefetch, "solve_l1_prefetch", fail_solve)
+    function = flash_attention_auto128_fwd.__wrapped__(FlashAttentionConfig(
+        1, 1, 128, 192, 128)).with_attr("npu_platform", "A2")
+    target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
+    with tvm.transform.PassContext(config=pass_configs):
+        lowered = LowerAndLegalize(tvm.IRModule({"main": function}), target)["main"]
+    assert int(lowered.attrs.get("tl.ascend.prefetch_materialized",
+                                 0)) == int(not solver_failure), str(
+                                     lowered.attrs.get("tl.ascend.prefetch_diagnostic",
+                                                       "no optimization diagnostic"))
+    if solver_failure:
+        assert "test solver failure" in str(lowered.attrs["tl.ascend.prefetch_diagnostic"])
+        assert not lowered.attrs.get("tl.ascend.iteration_versions", {})
+    else:
+        assert len(lowered.attrs["tl.ascend.iteration_versions"]) == 2
+
+
 @pytest.mark.parametrize("platform", ["A2", "A3"])
 @pytest.mark.parametrize("causal", [False, True])
 def test_production_fa_discovers_kv_but_not_q_or_softmax_probability(platform, causal, monkeypatch):

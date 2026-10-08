@@ -50,9 +50,11 @@ def discover_l1_prefetch(function, extraction):
         function.body, lambda node: buffers.extend(node.alloc_buffers)
         if isinstance(node, tir.Block) else physical_allocations.append(node)
         if isinstance(node, tir.Allocate) else None)
+    buffers = [buffer for buffer in buffers if buffer.scope() == "shared.l1"]
+    if not buffers:
+        return PrefetchDiscovery((), (), {}, ())
     if physical_allocations:
         raise ValueError("joint prefetch capacity needs complete Block allocation accounting")
-    buffers = [buffer for buffer in buffers if buffer.scope() == "shared.l1"]
     diagnostics, candidates = [], []
     if extraction.scalar_bindings:
         return PrefetchDiscovery((), (), {}, ("prefetch owner contains scalar bindings",))
@@ -201,6 +203,17 @@ def solve_l1_prefetch(function, discovery, platform):
                                 names[id(dependency.storage)]))
         else:
             fixed.append(dependency)
+    # The executable wave preserves lexical order within each stage/pipe,
+    # not the original K→P-receive→V source FIFO across different stages.
+    # These are feasibility FIFO constraints; actual memory edges remain
+    # intact and physical FIFO implements these extra relations at execution.
+    from .model import Dependency
+    last = {}
+    for task in discovery.tasks:
+        key = discovery.stages[task.id], task.core, task.pipe
+        if key in last:
+            fixed.append(Dependency(last[key], task.id, "RAW"))
+        last[key] = task.id
     buffers, physical_allocations = [], []
     tir.stmt_functor.post_order_visit(
         function.body, lambda node: buffers.extend(node.alloc_buffers)

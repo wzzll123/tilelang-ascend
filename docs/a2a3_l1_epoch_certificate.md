@@ -81,8 +81,22 @@ exact materialization, verifies complete ring dependencies/slot counts, emits
 boundary notifications and seed/drain outside the wave, and reconstructs whole
 task/event bundles. Actual FA tests reach OptimizeForTarget and native AscendC
 source generation on A2/A3. Omitting distance0 slot counts is a fail-closed
-mutation test. The production entry still does not select this path, and no
-multiversion hardware execution is claimed yet.
+mutation test. The production entry now attempts this path automatically;
+multiversion hardware execution is not claimed yet.
+
+The entry obtains joint feasibility validation after core normalization and
+existing UB-version preparation, rewrites the original unsynchronized function,
+then enters the existing full materializer with refreshed extraction. Its
+physical/core/address-map gates remain active; expanded capacity is checked
+directly. Only automatic solver infeasibility returns the untouched original
+function to the new-style sequential materializer with an explicit diagnostic.
+No legacy synchronization pass is used. Explicit Stage or version hints remain
+on their existing validated path, rather than being silently overridden.
+
+Solver search starts from necessary pipe-density and same-stage critical-path
+bounds. Feasibility FIFO edges follow lexical order within each selected
+stage/pipe, not old source order between K, P workspace receive and V. Reports
+remain feasibility models, not hardware timing predictions.
 
 Integration exposed an overly conservative compiler event registry: it grouped
 different local HardEvents by destination pipe alone. Official CANN 9.0 source

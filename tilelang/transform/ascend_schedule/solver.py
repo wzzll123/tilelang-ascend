@@ -181,6 +181,27 @@ def solve_schedule(
     deadline = monotonic() + timeout_ms / 1000
     upper = max_ii or sequential_ii
     lower = max(t.ii for t in tasks)
+    # Disjoint cyclic issue windows on one physical pipe require the sum of
+    # their lengths to fit inside II. Start the search at this necessary bound,
+    # rather than spending the timeout proving each smaller II impossible.
+    # Integer pipe masks contribute to each individual occupied pipe bit.
+    string_pipes = {t.pipe for t in tasks if isinstance(t.pipe, str) and t.pipe}
+    for pipe in string_pipes:
+        lower = max(lower, sum(t.ii for t in tasks if t.pipe == pipe))
+    masks = [t.pipe for t in tasks if isinstance(t.pipe, int) and t.pipe > 0]
+    for bit in range(max((mask.bit_length() for mask in masks), default=0)):
+        lower = max(lower,
+                    sum(t.ii for t in tasks if isinstance(t.pipe, int) and t.pipe & (1 << bit)))
+    if manual_stages is not None:
+        # Starts in one stage share an II-wide interval. A same-stage DAG
+        # path of length L needs II >= L+1 for integer start coordinates.
+        depths = [0] * n
+        for i in order:
+            for dep in dependencies:
+                if dep.dst == i and dep.distance == 0 and manual_stages[
+                        dep.src] == manual_stages[i]:
+                    depths[i] = max(depths[i], depths[dep.src] + latency(dep))
+        lower = max(lower, max(depths) + 1)
     ctx = z3.Context()
 
     def attempt(ii):

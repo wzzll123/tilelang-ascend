@@ -36,7 +36,8 @@ def test_production_causal_clock_is_group_dependent_and_native(platform, causal)
                 tir.stmt_functor.substitute(extent, {groups[0]: tir.IntImm("int32", group)})))
             for group in range(4)
         ]
-        assert counts == ([1, 1, 2, 2] if causal else [2, 2, 2, 2])
+        pipelined = int(mod["main"].attrs.get("tl.ascend.prefetch_materialized", 0))
+        assert [count - pipelined for count in counts] == ([1, 1, 2, 2] if causal else [2, 2, 2, 2])
         native = OptimizeForTarget(mod, target, platform)
         source = tvm.get_global_func("target.build.tilelang_ascend")(native, target,
                                                                      platform).get_source()
