@@ -15,6 +15,14 @@ l' = alpha*l + rowsum(p), and o' = alpha*o + FP16(p) @ V. Finally return
 FP16(o/l). Invalid KV columns are masked before rowmax and zeroed after exp.
 The persistent FP32 states are single-version, not scratch to be rotated.
 
+For causal mode, the KV trip count is now
+`min(ceildiv(Skv,64), ceildiv((q_tile+1)*32+Skv-Sq,64))`.
+Only columns beyond every valid Q row's allowed prefix are skipped; the
+existing per-row causal and KV-tail masks remain. Noncausal keeps the full
+KV trip count. The compiler certifies that this cid-derived bound is identical
+for the Cube and both Vector participants, bounded, and free of integer wrap.
+It does not use tensor values or introduce a per-participant branch.
+
 ## API, ownership and synchronization
 
 Reference: examples/developer_mode/flash_attn_bshd_developer.py (MIT).

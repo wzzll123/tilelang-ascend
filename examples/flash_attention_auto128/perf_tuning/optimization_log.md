@@ -47,5 +47,16 @@ causalSq<=Skv; noncausal fullKV prefix unchanged; uncovered_input:none.
 [HOST-METADATA-AUDIT] No host tensor operation introduced; cfg is metadata only.
 [SELF-CHECK] Only #1 changes numerical work executed. End count is ceildiv of
 the possible allowed-key prefix, clamped to total KV tiles; tail masks retained.
-[RESULT-#1] Pending actual production compilation, precision and profiling.
-No speedup claimed; no next optimization until these measurements establish it.
+[RESULT-#1] Test-first production lowering/native-source regressions: initially
+the2 causal tests failed on constant extent, then all4 A2/A3 causal/noncausal
+tests passed. Generated mode2 flags and MMA remain; no PIPE_ALL was introduced.
+Actual A2 card6 case10, (2,8,512,128) FP16 causal, passed the unchanged original
+CPU FP64/native CANN benchmark verifier. First profiler round:231.31us,
+warmup3/repeat20/no-boost/no-sol, versus earlier auto median381.47us (39.36%
+lower,1.649x). This is a single new round versus a historical three-round median,
+not the final alternating comparison or all-case acceptance. Reference v06
+median36.30us remains much faster. No full-pipeline completion claimed.
+Compilerae4b1a35 and isolated cache /tmp/fa128-auto-causal-cache-ae4b1a35;
+Python/TVM/native/CANN/card identities unchanged from the frozen baseline.
+Raw case10 precision/performance JSON is in ../results, profiler CSV remains in
+/tmp/perf_tilelang_401509_5l6ycctf. Other causal cases and repeated profiling pending.
