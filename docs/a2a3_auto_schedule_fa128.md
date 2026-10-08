@@ -181,6 +181,24 @@ buffer flattening discovers scratch absent from the initial shape collection.
 Source-only probes are intentionally not launched: loop-carried scratch reuse,
 slot materialization and unified synchronization still need implementation.
 
+The function-level milestone `d12d0e33` was fast-forwarded into the clean
+independent Docker worktree: **290 passed**, 66 warnings, 11.94 seconds. No NPU
+kernel was launched and the main Docker checkout was not modified.
+
+Loop-event follow-up: **303 local tests**, 66 subtests passed. A new local
+emitter handles an unconditional flat serial-loop body with same-iteration
+and distance-one dependencies. Each cross-pipe edge owns ready/release
+channels, with a single initial credit and a matching final drain; it does not
+rely on counter accumulation to protect repeated notifications. Thirteen tests
+include real A2/A3 sync-only execution for 0/1/2/5 iterations, a removed wait
+reported as a memory hazard, and removed drain reported as runtime flag
+accounting failure even for an empty loop. This remains a materialization
+building block, not the general guarded, versioned or cross-core pipeline.
+Distances greater than one are explicitly rejected until slot/cycle ownership
+materialization can establish their protocol. Full FA hardware gates remain
+unrun; neither this conservative handshake nor its performance is accepted as
+the final FA schedule.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

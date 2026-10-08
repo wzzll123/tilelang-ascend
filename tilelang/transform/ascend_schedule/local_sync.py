@@ -180,3 +180,80 @@ def emit_local_sync(extraction, dependencies, *, event_ids, order=None):
         tir.SeqStmt(statements), tuple(assignments), tuple(execution_edges),
         ("flat single-core local synchronization only",
          "event IDs supplied by caller; no ID reuse within destination pools"))
+
+
+def emit_loop_sync(extraction, loop, dependencies, *, event_ids):
+    """Emit bounded-credit local protocols around one unconditional serial loop.
+
+    The extraction describes the flat loop *body*, not the surrounding For.
+    Distance-zero edges transfer ready then release in the same iteration;
+    distance-one edges transfer ready into the next iteration. Each edge owns
+    two destination channels so an asynchronous producer cannot overwrite a
+    ready notification before its consumer takes it. Initial credits and final
+    drain are paired even for an empty loop. This is not slot rotation or the
+    general guarded/multicore software-pipeline materializer.
+    """
+    from tvm import ir, tir
+
+    if not isinstance(loop, tir.For) or loop.kind != tir.ForKind.SERIAL:
+        raise LocalSyncError("loop synchronization requires a serial For")
+    dependencies = tuple(dependencies)
+    if any(type(d.distance) is not int or d.distance not in (0, 1) for d in dependencies):
+        raise LocalSyncError("loop synchronization supports only dependency distance 0 or 1")
+    # Reuse strict flat-domain/guard/node validation, without pretending carried
+    # edges are distance-zero edges in its execution proof.
+    emit_local_sync(extraction, [d for d in dependencies if d.distance == 0], event_ids=event_ids)
+    tasks = tuple(extraction.tasks)
+    nodes = [extraction.task_nodes[t.id] for t in tasks]
+    expected = nodes[0] if len(nodes) == 1 else tir.SeqStmt(nodes)
+    if not ir.structural_equal(expected, loop.body):
+        raise LocalSyncError("extraction must cover the complete flat loop body in lexical order")
+    positions = {t.id: i for i, t in enumerate(tasks)}
+    pipes = {t.id: _pipe(t.pipe) for t in tasks}
+    pairs = {}
+    for d in dependencies:
+        if d.kind not in ("RAW", "WAR", "WAW"):
+            raise LocalSyncError("only RAW/WAR/WAW loop dependencies are supported")
+        if d.source not in positions or d.target not in positions:
+            raise LocalSyncError("dependency references missing loop task")
+        if d.distance == 0 and positions[d.source] >= positions[d.target]:
+            raise LocalSyncError("same-iteration dependency contradicts lexical order")
+        if pipes[d.source] != pipes[d.target]:
+            pairs[d.source, d.target, d.distance] = None
+
+    pools = {}
+
+    def channel(source_pipe, destination_pipe):
+        used = pools.setdefault(destination_pipe, set())
+        event = next((i for i in event_ids if i not in used), None)
+        if event is None:
+            raise EventCapacityError(
+                f"loop event capacity exhausted for destination {destination_pipe}")
+        used.add(event)
+        return source_pipe, destination_pipe, event
+
+    def flag(kind, key):
+        return tir.Evaluate(
+            tir.call_intrin("handle", tir.op.Op.get("tl.ascend_" + kind + "_flag"), *key))
+
+    before = {t.id: [] for t in tasks}
+    after = {t.id: [] for t in tasks}
+    initialize, drain = [], []
+    for source, target, distance in pairs:
+        ready = channel(pipes[source], pipes[target])
+        release = channel(pipes[target], pipes[source])
+        before[source].append(flag("wait", release))
+        after[source].append(flag("set", ready))
+        before[target].append(flag("wait", ready))
+        after[target].append(flag("set", release))
+        initial = ready if distance == 1 else release
+        initialize.append(flag("set", initial))
+        drain.append(flag("wait", initial))
+    statements = []
+    for task in tasks:
+        statements.extend(before[task.id])
+        statements.append(extraction.task_nodes[task.id])
+        statements.extend(after[task.id])
+    rewritten = tir.For(loop.loop_var, loop.min, loop.extent, loop.kind, tir.SeqStmt(statements),
+                        loop.thread_binding, loop.annotations, getattr(loop, "span", None))
+    return tir.SeqStmt([*initialize, rewritten, *drain])
