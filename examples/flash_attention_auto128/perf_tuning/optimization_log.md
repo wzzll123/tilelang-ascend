@@ -93,3 +93,24 @@ epochs, wrong single-slot reuse rejection, guard/flag coupling and overflow.
 It is not yet connected to production FA: joint storage eligibility/version
 selection, phased ring protocols and actual hardware checks remain required.
 The helper does not invent full overwrite proofs or silently enable old passes.
+
+## Iteration2: production input-prefetch waves
+
+The prerequisite paragraph above records the state at `bd9ae47d`.
+At `1aeedc56`, certified K/V input lifecycles, joint capacity validation,
+physical rings, per-edge event counts, phased synchronization and executable
+waves are connected to the compiler entry. Persistent softmax state is not
+rotated. Explicit hints stay on their existing validated path; automatic solver
+failure reports a sequential new-path fallback, never legacy synchronization.
+
+Native A2/A3 generation and compiler/solver/policy/report regressions passed:
+61 tests and11 subtests. The first A2 card6 real precision check, case0, passed
+the original CPU FP64/CANN-aligned script. Its actual cached native source has
+the prefetch wave and8192-element K/V slot offsets; it is not a solver fallback.
+Exact loaded-library/source hashes and the raw report are archived in
+`results/a2-prefetch-first-hardware.md`.
+
+This iteration has **no measured performance result yet**. Case42(first reuse)
+and case10(causal) are follow-up precision checks, followed by the remaining
+fixed cases and alternating profiler comparisons. Input prefetch alone is not
+claimed to complete broader C/V overlap or to satisfy the90% performance gate.
