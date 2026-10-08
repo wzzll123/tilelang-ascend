@@ -115,3 +115,42 @@ and case10(causal) subsequently passed their single precision checks; actual
 cached sources confirm wave emission for both. The remaining eleven fixed
 precision cases and alternating profiler comparisons are pending. Input prefetch alone is not
 claimed to complete broader C/V overlap or to satisfy the90% performance gate.
+
+### Iteration2 terminal evidence (supersedes the pending paragraph above)
+
+The frozen1aeedc56 build passed all14 fixed cases with20 finite/precision
+comparisons each on A2 card6. Three complete original-profiler rounds produced
+a geometric mean v06/auto ratio0.107698: **performance FAIL**, not completion.
+All84 reports and336 original CSVs are archived with the summary in
+`results/a2-prefetch-three-round-performance.md` (commit517b19de).
+
+## Iteration3: certified score-workspace overlap
+
+Compiler2c83b27d selects a pure Cube QK/score prefix at0 and the complete
+remaining softmax/PV/output epoch at1, rotating only the typed GM score
+workspace. Complete d0…2 dependencies and capacities gate mode2 wave emission.
+Runtime cache metadata and native source independently confirm two actual GM
+slots and disjoint score/score_recv UB intervals. Persistent softmax state
+remains single-version; no manual synchronization appears in the FA source.
+
+All14 fixed cases passed20 finite/precision comparisons each on A2 card6.
+Unchanged original JSONs are archived by commit93d34322. The three-round
+same-case A/B campaign is running against the frozen v06 build; do not modify
+the Docker checkout, ladder kernel or cache during measurement.
+
+Early first-round original JSONs show case0 v06=8.40us/auto=10.19us and
+case2 v06=39.25us/auto=393.31us. These are not three-round medians or the final
+geomean. They already show this partition alone has not removed the case2
+performance gap. Exact pipe-level attribution still requires the original
+`msprof_tilelang.sh` after the serial performance run; kernel-duration reports
+alone cannot distinguish DMA, Vector arithmetic and synchronization costs.
+
+## Next candidate: larger tiles, not yet hardware validated
+
+Commit51090ba8 adds explicit algorithm tile sizes while retaining32x64 defaults.
+64x128 native A2/A3 generation with Q/KV tails and causal/noncausal passes,
+including final physical UB capacity/disjointness checks. Compiler regression:
+297 passed; final tiling checks10 passed. No new hand flag/barrier/slot/address
+or simulator setting was added. This candidate has no real precision/timing
+result yet and is not deployed over the live frozen32x64 performance campaign.
+No performance gain or90% acceptance is inferred from tile size or generation.
