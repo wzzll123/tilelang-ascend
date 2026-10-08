@@ -8,7 +8,8 @@ from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
 
 
-def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
+def allow_warp_specialized(pass_ctx: PassContext | None = None,
+                           target: Target | None = None) -> bool:
     # avoid circular import
     from tilelang.jit.adapter.utils import is_cuda_target
 
@@ -20,7 +21,8 @@ def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target |
     return not disable_warp_specialized
 
 
-def allow_tma_and_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
+def allow_tma_and_warp_specialized(pass_ctx: PassContext | None = None,
+                                   target: Target | None = None) -> bool:
     # avoid circular import
     from tilelang.jit.adapter.utils import is_cuda_target
 
@@ -68,6 +70,11 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.CollectBufferShapes()(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
+    # Opt-in migration bootstrap extracts lowered tasks and fails closed until
+    # materialization and unified synchronization can emit executable TIR.
+    from tilelang.transform.ascend_schedule.entry import schedule_module
+
+    mod = schedule_module(mod, target.model, tilelang.transform.get_pass_context().config)
     # Propagate UB tail valid-regions and rewrite supported vector ops,
     # compare/select, broadcast, and allow-listed reductions to tail-aware
     # variants (must run before passes that reorder copy/vector ops).

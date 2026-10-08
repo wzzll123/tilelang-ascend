@@ -30,6 +30,7 @@ from .proxy import (
 from .parallel import Parallel  # noqa: F401
 from .pipeline import Pipelined  # noqa: F401
 from .persistent import Persistent  # noqa: F401
+from .annotations import Stage, annotate_buffer_versions  # noqa: F401
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .kernel import (
     Kernel,  # noqa: F401
@@ -96,7 +97,8 @@ def use_swizzle(panel_size: int, order: str = "row", enable: bool = True):
     # The panel size is the number of threads in a warp
     # Use to improve the L2 Cache Locality
     device_func = "rasterization2DRow" if order == "row" else "rasterization2DColumn"
-    return attr(None, "threadblock_swizzle_pattern", f"tl::{device_func}<{panel_size}>") if enable else None
+    return attr(None, "threadblock_swizzle_pattern",
+                f"tl::{device_func}<{panel_size}>") if enable else None
 
 
 def annotate_layout(layout_map: Dict):
@@ -205,12 +207,10 @@ def annotate_address(address_map: Dict):
 
 def __getattr__(name: str):
     if name == "alloc_local":
-        raise AttributeError(
-            "'T.alloc_local' is no longer supported and has been removed. "
-            "This interface is not supported on Ascend NPU. For scalar or "
-            "thread-private storage use 'T.alloc_var'; for tile buffers use "
-            "'T.alloc_shared' / 'T.alloc_fragment', or the Ascend-specific "
-            "'T.alloc_ub' / 'T.alloc_L1' / 'T.alloc_L0A' / 'T.alloc_L0B' / "
-            "'T.alloc_L0C'."
-        )
+        raise AttributeError("'T.alloc_local' is no longer supported and has been removed. "
+                             "This interface is not supported on Ascend NPU. For scalar or "
+                             "thread-private storage use 'T.alloc_var'; for tile buffers use "
+                             "'T.alloc_shared' / 'T.alloc_fragment', or the Ascend-specific "
+                             "'T.alloc_ub' / 'T.alloc_L1' / 'T.alloc_L0A' / 'T.alloc_L0B' / "
+                             "'T.alloc_L0C'.")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
