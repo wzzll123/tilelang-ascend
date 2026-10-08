@@ -49,8 +49,11 @@ class EventRegistry:
                 destination_pipe not in _CORE_PIPES.get(destination_core, ())):
             raise LocalSyncError("event channel is outside its core/pipe domain")
         cross = source_core != destination_core
+        # CANN TPipe::AllocEventID selects eventPool_ + EventToIndex(evt).
+        # HardEvent::<src>_<dst> therefore has its own local ID bitmap; a
+        # destination-only pool falsely exhausts different HardEvents together.
         pool = self._cross if cross else self._local.setdefault(
-            (destination_core, destination_pipe), set())
+            (destination_core, source_pipe, destination_pipe), set())
         candidates = self.cross_ids if cross else self.local_ids
         event = next((value for value in candidates if value not in pool), None)
         if event is None:

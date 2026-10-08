@@ -208,7 +208,11 @@ def test_production_fa_discovers_kv_but_not_q_or_softmax_probability(platform, c
     assert any(
         message.startswith("p:") and "readonly" in message for message in discovery.diagnostics)
     from tilelang.transform.ascend_schedule.l1_prefetch import materialize_l1_prefetch
-    physical = materialize_l1_prefetch(function, discovery, {"prefetch_0": 2, "prefetch_1": 2})
+    from tilelang.transform.ascend_schedule.core_scopes import normalize_core_scopes
+    scoped = normalize_core_scopes(function, extraction)
+    scoped_extraction = extract_tasks(scoped)
+    scoped_discovery = discover_l1_prefetch(scoped, scoped_extraction)
+    physical = materialize_l1_prefetch(scoped, scoped_discovery, {"prefetch_0": 2, "prefetch_1": 2})
     candidate_vars = [candidate.buffer.data for candidate in discovery.candidates]
     edges = [
         edge for edge in physical.dependencies if edge.storage is not None and any(
@@ -219,3 +223,29 @@ def test_production_fa_discovers_kv_but_not_q_or_softmax_probability(platform, c
     records = physical.function.attrs["tl.ascend.iteration_versions"]
     assert len(records) == 2
     assert all([int(record[0]), int(record[1])] == [2, 8192] for record in records.values())
+    from tilelang.transform.ascend_schedule.phases import emit_three_phase_sync
+    from dataclasses import replace
+    from tilelang.transform.ascend_schedule.local_sync import LocalSyncError
+    broken = replace(
+        physical,
+        slot_counts={
+            key: count for key, count in physical.slot_counts.items() if key[2] != 0
+        })
+    with pytest.raises(LocalSyncError, match="event slot count"):
+        emit_three_phase_sync(broken.function, broken.extraction, prefetch=broken)
+    synchronized = emit_three_phase_sync(physical.function, physical.extraction, prefetch=physical)
+    waves = []
+    tir.stmt_functor.post_order_visit(
+        synchronized.body, lambda node: waves.append(node) if isinstance(node, tir.For) else None)
+    assert len(waves) == 1
+    assert waves[0].loop_var.name.endswith("_wave")
+    assert len(waves[0].body.seq) == len(physical.stages)
+    from tilelang.engine.phase import OptimizeForTarget
+    synchronized = synchronized.with_attr("tl.ascend.schedule_materialized", 1)
+    with tvm.transform.PassContext(config=pass_configs):
+        native = OptimizeForTarget(tvm.IRModule({"main": synchronized}), target, platform)
+        source = tvm.get_global_func("target.build.tilelang_ascend")(native, target,
+                                                                     platform).get_source()
+    assert "_wave" in source and "8192" in source
+    assert "CrossCoreSetFlag<0x2," in source
+    assert "PipeBarrier<PIPE_ALL>" not in source

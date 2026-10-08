@@ -76,5 +76,21 @@ stage1 in the same wave. Persistent storage keeps its original distance1 edges.
 
 Tests exercise combined K/V rewrites for actual A2/A3 causal/noncausal FA input,
 and a scoped native DMA fixture feeding the real mode2 event emitter and stage
-wave reconstruction. This does not yet prove production phase-boundary emission
-or hardware execution. Those remain integration gates before enabling the path.
+wave reconstruction. `emit_three_phase_sync(prefetch=...)` now consumes that
+exact materialization, verifies complete ring dependencies/slot counts, emits
+boundary notifications and seed/drain outside the wave, and reconstructs whole
+task/event bundles. Actual FA tests reach OptimizeForTarget and native AscendC
+source generation on A2/A3. Omitting distance0 slot counts is a fail-closed
+mutation test. The production entry still does not select this path, and no
+multiversion hardware execution is claimed yet.
+
+Integration exposed an overly conservative compiler event registry: it grouped
+different local HardEvents by destination pipe alone. Official CANN 9.0 source
+on NPU3 confirms independent `eventPool_ + EventToIndex(evt)` bitmaps:
+`aarch64-linux/ascendc/include/basic_api/impl/kernel_tpipe_impl.h:450–487`.
+`kernel_event.h:80–87,141–153,233–242` maps `MTE2_MTE1` and `M_MTE1` to different
+AIC indices, with AIC/AIV handling for 2201/3510. Native codegen also emits
+`HardEvent::<src>_<dst>`. The compiler registry now keys local pools by core and
+both pipes; each pool still has IDs0–7, and no lifetime reuse was introduced.
+Cross-core IDs remain shared across directions. Simulator semantics were not
+changed as part of this compiler fix.

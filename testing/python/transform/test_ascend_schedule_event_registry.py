@@ -32,8 +32,8 @@ def test_flat_and_loop_emitters_do_not_restart_local_event_numbering():
     assert prefix.assignments[0].event_id == 0
     assert suffix.assignments[0].event_id == 2
     records = registry.records
-    assert len({(item.destination_core, item.destination_pipe, item.event_id) for item in records
-               }) == len(records)
+    assert len({(item.destination_core, item.source_pipe, item.destination_pipe, item.event_id)
+                for item in records}) == len(records)
 
 
 def test_cross_channels_are_shared_across_directions_and_local_pools_are_per_core():
@@ -47,5 +47,6 @@ def test_cross_channels_are_shared_across_directions_and_local_pools_are_per_cor
     assert registry.allocate("C", "MTE1", "C", "MTE2").event_id == 0
     with pytest.raises(EventCapacityError, match="capacity"):
         registry.allocate("C", "FIX", "V", "MTE2")
+    assert registry.allocate("V", "MTE3", "V", "MTE2").event_id == 0
     with pytest.raises(EventCapacityError, match="capacity"):
         registry.allocate("V", "MTE3", "V", "MTE2")

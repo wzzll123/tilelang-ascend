@@ -152,11 +152,16 @@ def _flat(function, extraction, registry):
     return function.with_body(tir.stmt_functor.ir_transform(function.body, None, rewrite))
 
 
-def emit_three_phase_sync(function, extraction, *, local_ids=_DEFAULT_IDS, cross_ids=_DEFAULT_IDS):
+def emit_three_phase_sync(function,
+                          extraction,
+                          *,
+                          local_ids=_DEFAULT_IDS,
+                          cross_ids=_DEFAULT_IDS,
+                          prefetch=None):
     from tvm import tir
     if (extraction.scalar_bindings or
             any(task.guard not in (None, ()) for task in extraction.tasks) or any(
-                access.ring_size not in (None, 1)
+                access.ring_size not in (None, 1) and prefetch is None
                 for task in extraction.tasks
                 for access in task.accesses)):
         raise LocalSyncError("three-phase reconstruction requires unguarded single-version state")
@@ -165,6 +170,9 @@ def emit_three_phase_sync(function, extraction, *, local_ids=_DEFAULT_IDS, cross
             any(not context[0].same_as(contexts[0][0]) for context in contexts)):
         raise LocalSyncError("three-phase reconstruction requires one shared serial owner")
     owner = contexts[0][0]
+    if prefetch is not None and (not function.same_as(prefetch.function) or extraction
+                                 is not prefetch.extraction or not owner.same_as(prefetch.owner)):
+        raise LocalSyncError("prefetch proof does not describe this phase function/owner")
     partition, phase = {0: [], 1: [], 2: []}, 0
     for task in extraction.tasks:
         if extraction.loops[task.id]:
@@ -245,6 +253,23 @@ def emit_three_phase_sync(function, extraction, *, local_ids=_DEFAULT_IDS, cross
         return sequence[0] if len(sequence) == 1 else tir.SeqStmt(sequence)
 
     dependencies = analyze_dependencies(body.tasks, max_distance=1)
+    if prefetch is not None:
+        from .dependency import validate_dependencies
+        if set(prefetch.stages) != {task.id for task in body.tasks}:
+            raise LocalSyncError("prefetch stage assignments must cover the complete body")
+        validate_dependencies(body.tasks, prefetch.dependencies)
+        dependencies = prefetch.dependencies
+        by_id = {task.id: task for task in body.tasks}
+        for edge in dependencies:
+            counts = {
+                access.ring_size
+                for task_id in (edge.source, edge.target)
+                for access in by_id[task_id].accesses
+                if access.storage is edge.storage and access.ring_size not in (None, 1)
+            }
+            if counts and (len(counts) != 1 or prefetch.slot_counts.get(
+                (edge.source, edge.target, edge.distance)) != next(iter(counts))):
+                raise LocalSyncError("prefetch ring edge lacks its certified event slot count")
     if len({task.core for task in body.tasks}) > 1:
         from .materializer import _validate_cv_owner
         _validate_cv_owner(function, owner, body)
@@ -256,8 +281,21 @@ def emit_three_phase_sync(function, extraction, *, local_ids=_DEFAULT_IDS, cross
             local_ids=local_ids,
             cross_ids=cross_ids,
             registry=registry,
+            slot_counts=None if prefetch is None else prefetch.slot_counts,
             protocol_wrapper=wrap_protocol)
+        if prefetch is not None:
+            from .stage_skew import materialize_staged_owner
+            owners = []
+            tir.stmt_functor.post_order_visit(
+                result.body, lambda node: owners.append(node)
+                if isinstance(node, tir.For) else None)
+            if len(owners) != 1:
+                raise LocalSyncError("prefetch phase emission lost its unique owner")
+            result = materialize_staged_owner(result, owners[0], body.task_nodes, prefetch.stages,
+                                              dependencies)
     else:
+        if prefetch is not None:
+            raise LocalSyncError("prefetch phases currently require the scoped mixed C/V emitter")
         synchronized = emit_loop_sync(
             body, owner, dependencies, event_ids=local_ids, registry=registry)
         result = result.with_body(
