@@ -330,6 +330,14 @@ private:
     // rows to shard. Classify them before creating any reduced buffer mapping.
     PostOrderVisit(body, [this](const ObjectRef &node) {
       const auto *call = node.as<CallNode>();
+      if (call && call->op.same_as(Op::Get("tl.ascend_select")) &&
+          call->args.size() > 3 && call->args[3].as<CallNode>()) {
+        Buffer tmp = FindUbPointer(call->args[3]);
+        ICHECK(tmp.defined())
+            << "VID select workspace requires known UB storage";
+        buffers_skip_vid_reduction_.insert(tmp);
+        return;
+      }
       if (!call || !call->op.same_as(Op::Get("tl.ascend_broadcast"))) {
         return;
       }
@@ -803,6 +811,82 @@ private:
     return Call(op->dtype, op->op, args, op->span);
   }
 
+  PrimExpr RequireShardedCount(const PrimExpr &ptr, const PrimExpr &count,
+                               const char *label) {
+    Buffer buffer = FindUbPointer(ptr);
+    ICHECK(buffer.defined() && origin_to_new_buffer_.count(buffer))
+        << label << " requires a proven sharded UB operand";
+    PrimExpr simplified_count = analyzer_->Simplify(count);
+    const auto *value = simplified_count.as<IntImmNode>();
+    ICHECK(value && value->value > 0 && value->value % 2 == 0 &&
+           AccessPtrOffsetIsZero(ptr) && buffer->strides.empty() &&
+           analyzer_->CanProve(buffer->elem_offset == 0))
+        << label << " requires full compact even-count operands";
+    PrimExpr capacity = make_const(count.dtype(), 1);
+    PrimExpr lane_capacity = capacity;
+    for (const PrimExpr &extent : buffer->shape) {
+      capacity = capacity * extent;
+    }
+    for (const PrimExpr &extent : origin_to_new_buffer_.at(buffer)->shape) {
+      lane_capacity = lane_capacity * extent;
+    }
+    const auto *call = ptr.as<CallNode>();
+    PrimExpr half = make_const(count.dtype(), value->value / 2);
+    ICHECK(analyzer_->CanProve(capacity == count) &&
+           analyzer_->CanProve(call->args[3] == count) &&
+           analyzer_->CanProve(lane_capacity == half))
+        << label << " count does not match its full row partition";
+    return half;
+  }
+
+  PrimExpr ModifyCreateVecIndex(const CallNode *op) {
+    ICHECK_EQ(op->args.size(), 4U) << "VID index requires the canonical ABI";
+    Buffer dst = FindUbPointer(op->args[1]);
+    if (!dst.defined() || !origin_to_new_buffer_.count(dst)) {
+      return IRMutatorWithAnalyzer::VisitExpr_(op);
+    }
+    PrimExpr count = RequireShardedCount(op->args[1], op->args[3], "VID index");
+    Array<PrimExpr> args = op->args;
+    args.Set(1, VisitExpr(args[1]));
+    PrimExpr first = VisitExpr(args[2]);
+    args.Set(2, analyzer_->Simplify(first + cast(first.dtype(), vid_ * count)));
+    args.Set(3, count);
+    return Call(op->dtype, op->op, args, op->span);
+  }
+
+  PrimExpr ModifySelect(const CallNode *op) {
+    const size_t shift =
+        op->args.size() > 3 && op->args[3].as<CallNode>() ? 1 : 0;
+    ICHECK_GE(op->args.size(), 7U + shift)
+        << "VID select requires the canonical ABI";
+    const auto *kind = op->args[3 + shift].as<IntImmNode>();
+    ICHECK(kind && (kind->value == 1 || kind->value == 2))
+        << "VID select tensor-scalar reads require separate scalar "
+           "decomposition";
+    const size_t index = 6 + shift;
+    PrimExpr count =
+        RequireShardedCount(op->args[0], op->args[index], "VID select");
+    RequireShardedCount(op->args[2], op->args[index], "VID select");
+    if (kind->value == 2) {
+      RequireShardedCount(op->args[4 + shift], op->args[index], "VID select");
+    }
+    Buffer mask = FindUbPointer(op->args[1]);
+    ICHECK(mask.defined() && mask->dtype == DataType::UInt(8))
+        << "VID select requires a packed uint8 mask";
+    const auto *elements = op->args[index].as<IntImmNode>();
+    ICHECK(elements && elements->value % 16 == 0)
+        << "VID select mask partition requires byte-aligned lane bits";
+    RequireShardedCount(
+        op->args[1], make_const(op->args[index].dtype(), elements->value / 8),
+        "VID select mask");
+    Array<PrimExpr> args = op->args;
+    for (size_t i = 0; i < args.size(); ++i) {
+      args.Set(i, VisitExpr(args[i]));
+    }
+    args.Set(index, count);
+    return Call(op->dtype, op->op, args, op->span);
+  }
+
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (threads_cnt_ != 2) {
       return IRMutatorWithAnalyzer::VisitExpr_(op);
@@ -866,6 +950,12 @@ private:
 
     if (op_name == "tl.ascend_broadcast") {
       return ModifyAscendBroadcast(op);
+    }
+    if (op_name == "tl.ascend_createvecindex") {
+      return ModifyCreateVecIndex(op);
+    }
+    if (op_name == "tl.ascend_select") {
+      return ModifySelect(op);
     }
 
     if (IsTileOp(op_name)) {

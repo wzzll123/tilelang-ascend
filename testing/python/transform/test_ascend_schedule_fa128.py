@@ -11,13 +11,16 @@ from fa128_auto_fixture import fa128_auto_fixture
 
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
-def test_regular_fa128_has_values_sync_and_native_generation(platform):
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_len,kv_len", [(128, 128), (64, 128), (128, 256)])
+def test_regular_fa128_has_values_sync_and_native_generation(platform, causal, q_len, kv_len):
     from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget
     from tilelang.simulator import (build_kernel_program, FunctionalSimulator, SimulatorConfig,
                                     BufferRegion, MemoryScope, SimulationDeadlockError,
                                     UninitializedMemoryError)
 
-    function = fa128_auto_fixture().with_attr("npu_platform", platform)
+    function = fa128_auto_fixture(
+        causal=causal, q_len=q_len, kv_len=kv_len).with_attr("npu_platform", platform)
     target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
     config = {
         "tl.ascend_auto_schedule": True,
@@ -36,11 +39,14 @@ def test_regular_fa128_has_values_sync_and_native_generation(platform):
     report = json.loads(str(scheduled.attrs["tl.ascend.schedule_report"]))
     assert any(edge["kind"] == "WAR" and edge["distance"] == 1 for edge in report["dependencies"])
     inputs = [
-        np.random.default_rng(seed).normal(0, .3, (1, 1, 128, 128)).astype("float16")
-        for seed in (7, 8, 9)
+        np.random.default_rng(seed).normal(0, .3, (1, 1, length, 128)).astype("float16")
+        for seed, length in zip((7, 8, 9), (q_len, kv_len, kv_len))
     ]
     q, k, v = [values.astype("float64") for values in inputs]
     score = q @ k.swapaxes(-1, -2) / 128**.5
+    if causal:
+        allowed = np.arange(kv_len)[None, :] <= np.arange(q_len)[:, None] + kv_len - q_len
+        score = np.where(allowed, score, -np.inf)
     probability = np.exp(score - score.max(-1, keepdims=True))
     probability /= probability.sum(-1, keepdims=True)
     golden = probability @ v

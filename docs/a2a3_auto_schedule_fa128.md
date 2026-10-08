@@ -617,6 +617,39 @@ is sm_scale. Existing verification helpers also need top-level/input-attribute
 causal propagation, using the existing bottom-right golden convention, not a
 new scoring rule. All required implementation/test selections must be explicit.
 
+Docker regular FA follow-up at **899f94f0b4ba15b4e73e492098372480260e97ef**:
+**823 passed, 1 deselected**, 944 warnings, 66.45 seconds, clean independent
+checkout. No NPU launch or remote push.
+
+### Causal coordinate/count integration
+
+Native VID now rewrites full compact CreateVecIndex destinations using the
+actual lane capacity and rebases the first value by `vid * lane_capacity`.
+Replicated column sources retain their complete count and origin. Select's
+scalar-constant and tensor variants use their actual count argument (six, or
+seven with optional workspace), not the trailing dtype strings. Packed uint8
+masks must partition on byte boundaries. Immediate tensor-scalar variants,
+nonzero-offset slices, odd/unproven counts and incompatible capacities fail
+closed. Select workspace stays replicated when present; real AscendC lowering
+normally removes its unused explicit workspace before VID.
+
+The FA integration fixture now constructs causal coordinates and masks entirely
+in the kernel, using the existing right-bottom convention `j <= i + Skv - Sq`.
+It selects a finite negative score before maximum reduction and zero probability
+after exponentiation for masked elements. No host mask or hand synchronization.
+Full numeric/sync-only/native tests cover both platforms and `(Sq,Skv)`
+`(128,128)`, `(64,128)`, `(128,256)`, causal and noncausal. Primitive tests observe
+different global row coordinates on both Vector lanes and packed-bit Select
+results, not only changed argument counts. Expanded local regression:
+**842 passed, 1 deselected**, 66 subtests, 52.51 seconds.
+
+Existing `model.py` and `fa_kvend_runner.py::golden_fa` do not sanitize fully
+masked causal rows; no root case JSONL contains causal `Sq > Skv`. This fixture
+explicitly rejects that boundary rather than substituting a zero-output golden.
+Final support/precision policy must not be inferred from a new scoring rule.
+Q/KV tails, final ladder integration, automatic coordinated versions/pipeline,
+and all fourteen hardware stability/performance gates remain incomplete.
+
 Task root:
 `/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention`.
 New kernel destination: `design/tile_level/ladder/fa_auto128.py` under that root.
