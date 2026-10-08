@@ -1,0 +1,14 @@
+operator:
+  name: FlashAttentionAuto128
+  category: Fusion
+  formula: "softmax(Q K^T * sm_scale + bottom_right_causal_mask) V"
+  attrs:
+    - {name: causal, type: Bool, default: false, required: false}
+    - {name: dim, type: Int, default: 128, required: true}
+  inputs:
+    - {name: Q, dtype: [float16]}
+    - {name: K, dtype: [float16]}
+    - {name: V, dtype: [float16]}
+  outputs:
+    - {name: Output, dtype: [float16]}
+  schema: "(Q[B,H,Sq,128], K[B,H,Skv,128], V[B,H,Skv,128], sm_scale) -> Output[B,H,Sq,128]"

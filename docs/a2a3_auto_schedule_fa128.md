@@ -704,3 +704,60 @@ missing-cross-set/wait mutations. Expanded local regression: **871 passed,
 alignment test remains documented; no checker or precision threshold was
 relaxed. These results do not constitute the required fourteen-case hardware
 precision, stability or performance acceptance.
+
+### First actual A2 execution
+
+The automatic ladder entry is now installed at the specified task's
+`design/tile_level/ladder/fa_auto128.py`. The task's existing
+`model_new_tilelang.py` adds only an explicit `FA_STEP=auto128` import branch;
+its default and previous ladder versions are unchanged. A tracked copy of the
+kernel lives in `examples/flash_attention_auto128/fa_auto128.py`. It supports
+BHSD tensors using a flattened batch/head/Q-tile grid, runtime `sm_scale`,
+bottom-right causal masking and Q/KV tails. This initial 32x64 version is a
+correctness baseline; coordinated multiversion/performance acceptance remains
+open. Its native signature is Q/K/V/Output/sm_scale followed by generated
+workspaces: legacy manually supplied workspace indices 4/5/6 must not be used.
+
+On NPU3's `wzz_cann`, physical card 6 was healthy and had no running processes.
+The actual existing `verification_tilelang.py` ran case **0**, FP16
+`[1,4,128,128]`, with `FA_STEP=auto128`, `ASCEND_RT_VISIBLE_DEVICES=6` and
+`ASCEND_LAUNCH_BLOCKING=1`. It reported **PASS / matched**, against CPU FP64
+golden and original-dtype native using its unchanged cannbench comparison.
+No timing, repetition stability, remaining case or A3 hardware result is
+claimed by this single smoke result. Output: `/tmp/a2a3-auto128-case0.json`
+inside Docker. The fixed fourteen-case precision run was subsequently launched
+using the same script; it is not recorded as passed until terminal evidence.
+
+Environment fingerprints for this execution:
+
+- Compiler checkout: `cb896f6c35a9328d108e7ceeb9c181c89e064c48`.
+- Python: `/tmp/a2a3-auto-schedule-fa128-venv.JsRZee/bin/python` (3.12.13),
+  using system torch 2.10.0+cpu plus torch_npu; NPU availability was True.
+- Package: `/home/wenzhongzhen/tilelang-ascend-wt/auto-schedule-fa128/tilelang`.
+- Native module SHA256:
+  `4ce6649be570c447d58f5fa1e5b236eb1a1473a6a9f88a010de4e4578eddd98b`.
+- TVM library SHA256:
+  `2df7999bbed69490640f5bc50166a5a650ac543bdea22514878e86ae31ccd36e`.
+- Installed ladder source SHA256:
+  `fbe8d1805e6865f6a66f89c7506ec948e9c83fa16d13579f38dfb9408e5c87d1`.
+- CANN 9.0.0; Bisheng 2026-04-25 clang15.0.5; architecture dav-2201.
+- Passes: auto_schedule, auto_cv_combine, auto_cross_core_sync enabled.
+
+Independent worktree dependency preflight must include actual device headers,
+not just successful host module build or CPU tests. Two initial attempts stopped
+at compilation, before kernel execution: missing CATLASS, then missing shmem.h
+(unconditionally included by common.h even though this kernel does not use
+SHMEM). Both dependencies were independently checked out from clean local
+object repositories at the checkout's exact gitlinks: CATLASS
+`769cd40a8716b28650b6bebb08db4834eea4462f`, SHMEM
+`157eecf7d2102c7282269db55e54362e90dbac7b`. Main-checkout dependencies and
+global Python were not changed. This initializes required build headers only;
+it does not extend the task's SHMEM feature scope.
+
+For reproduction, source `/usr/local/Ascend/ascend-toolkit/set_env.sh`; set
+PYTHONPATH to the independent checkout and existing TVM Python directory,
+TVM_LIBRARY_PATH to `/home/wenzhongzhen/tilelang-ascend/build/tvm`,
+TILELANG_LIBRARY_PATH to the independent `build-auto-schedule`, and prepend
+both library directories to LD_LIBRARY_PATH. Use the original designer
+`verification_tilelang.py <task-root> --case 0 --json <report>` with the
+explicit selector and card environment above. Do not switch global installs.
