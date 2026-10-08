@@ -38,7 +38,9 @@ Next integration steps:
 1. Verify unique owner and all accesses, then attach overwrite/read footprints
    to task accesses; retain persistent online-softmax state at one version.
 2. Select K/V versions jointly with stages and total L1 capacity.
-3. Teach physical version materialization to consume the certified flattened
-   geometry; its current generic Cube path requires a 2D allocation.
+3. Physical version materialization now consumes certified flattened L1 geometry
+   and rechecks each native DMA endpoint before rewriting. Other Cube scopes
+   continue to require aligned 2D allocation geometry. This step is complete;
+   it does not independently choose versions or generate ring synchronization.
 4. Reconstruct executable stage waves together with ready/release selectors,
    initialization and drain. Then run real A2 precision and performance tests.

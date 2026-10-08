@@ -112,7 +112,8 @@ def test_reader_source_geometry_is_bounded_in_native_layout(transpose):
 
 
 @pytest.mark.parametrize("causal", [False, True])
-def test_actual_fa_lowered_kv_dma_and_l0_readers_are_certified(causal):
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+def test_actual_fa_lowered_kv_dma_and_l0_readers_are_certified(causal, platform):
     import tvm
     from examples.flash_attention_auto128.fa_auto128 import (FlashAttentionConfig,
                                                              flash_attention_auto128_fwd,
@@ -125,7 +126,8 @@ def test_actual_fa_lowered_kv_dma_and_l0_readers_are_certified(causal):
                                                              certify_l1_epoch_read)
 
     function = flash_attention_auto128_fwd.__wrapped__(
-        FlashAttentionConfig(1, 1, 128, 192, 128, causal=causal)).with_attr("npu_platform", "A2")
+        FlashAttentionConfig(1, 1, 128, 192, 128,
+                             causal=causal)).with_attr("npu_platform", platform)
     target = tvm.target.Target({"kind": "llvm", "model": "ascendc"})
     with tvm.transform.PassContext(config=pass_configs):
         mod = LowerAndLegalize(tvm.IRModule({"main": function}), target)
@@ -158,5 +160,28 @@ def test_actual_fa_lowered_kv_dma_and_l0_readers_are_certified(causal):
             elif name.startswith("copy_l1_to_l0") and call.args[1].args[1].same_as(buffer.data):
                 reads.append(certify_l1_epoch_read(buffer, call, analyzer))
         assert len(writes) == len(reads) == 1
+        from tilelang.transform.ascend_schedule.buffer_versions import materialize_iteration_versions
+        from tilelang.transform.ascend_schedule.ownership import EpochPlan, OwnerEpochPlan
+        plan = EpochPlan(buffer.data, True, 2, (OwnerEpochPlan(owner, "iteration", object()),))
+        physical = materialize_iteration_versions(function, buffer, plan)
+        allocations, pointers = [], []
+
+        def physical_collect(node, allocations=allocations, pointers=pointers, buffer=buffer):
+            if isinstance(node, tir.Block):
+                allocations.extend(
+                    view for view in node.alloc_buffers if view.data.same_as(buffer.data))
+            elif (isinstance(node, tir.Call) and node.op.name == "tir.tvm_access_ptr" and
+                  node.args[1].same_as(buffer.data)):
+                pointers.append(node)
+
+        tir.stmt_functor.post_order_visit(physical.body, physical_collect)
+        assert len(allocations) == 1
+        assert tuple(map(int, allocations[0].shape)) == (16384,)
+        assert len(pointers) == 2
+        for epoch in (0, 1):
+            for pointer in pointers:
+                offset = tir.stmt_functor.substitute(pointer.args[2],
+                                                     {owner.loop_var: tir.IntImm("int32", epoch)})
+                assert int(arith.Analyzer().simplify(offset)) == epoch * 8192
         tested.append(buffer.name)
     assert sorted(tested) == ["k", "v"]

@@ -41,8 +41,9 @@ def materialize_iteration_versions(function, buffer, plan):
     if scope not in ("global", "shared.ub", "shared.l1", "wmma.matrix_a", "wmma.matrix_b",
                      "wmma.accumulator"):
         raise ValueError("unsupported versioned storage scope")
-    if scope not in ("global", "shared.ub") and (len(shape) != 2 or
-                                                 any(int(x) % 16 for x in shape)):
+    flattened_l1 = scope == "shared.l1" and len(shape) == 1
+    if scope not in ("global", "shared.ub") and not flattened_l1 and (len(shape) != 2 or any(
+            int(x) % 16 for x in shape)):
         raise ValueError("Cube version tiles require aligned 2D fractal dimensions")
     pitch = 1
     for extent in shape:
@@ -130,6 +131,12 @@ def materialize_iteration_versions(function, buffer, plan):
                       (tir.BufferLoad, tir.BufferStore)) and node.buffer.data.same_as(storage):
             raise ValueError(
                 "logical buffer indexing must be lowered before version materialization")
+        if isinstance(node, tir.Block) and (any(
+                region.buffer.data.same_as(storage)
+                for region in (*node.reads, *node.writes)) or any(
+                    match.buffer.data.same_as(storage) or match.source.buffer.data.same_as(storage)
+                    for match in node.match_buffers)):
+            raise ValueError("logical block views need a version-aware region rewrite")
         if isinstance(node, tir.DeclBuffer) and node.buffer.data.same_as(storage):
             raise ValueError("logical buffer declarations need a version-aware view rewrite")
         if isinstance(node, tir.Call) and getattr(
@@ -138,12 +145,35 @@ def materialize_iteration_versions(function, buffer, plan):
             raise ValueError(
                 "raw buffer handles cannot escape the versioned access-pointer rewrite")
         if (isinstance(node, tir.Call) and
+                getattr(node.op, "name", None) == "tir.tvm_access_ptr" and
+                any(isinstance(arg, tir.Var) and arg.same_as(storage) for arg in node.args) and
+            (len(node.args) != 5 or not isinstance(node.args[1], tir.Var) or
+             not node.args[1].same_as(storage))):
+            raise ValueError("malformed versioned access pointer cannot escape the rewrite")
+        if (isinstance(node, tir.Call) and
                 getattr(node.op, "name", None) == "tir.tvm_access_ptr" and len(node.args) == 5 and
                 isinstance(node.args[1], tir.Var) and node.args[1].same_as(storage)):
             if not any(active):
                 raise ValueError("versioned storage is accessed outside its certified owner")
             if str(node.args[0].dtype) != str(buffer.dtype):
                 raise ValueError("mixed-dtype aliases require a physical bit-pitch proof")
+            if flattened_l1:
+                # Flattening erased the two zN dimensions. Reconstruct and
+                # certify them from EACH actual helper, never the pointer
+                # extent or an eligible=True descriptor alone. Tail clears at
+                # the original offset zero do not survive arbitrary rotation.
+                from .l1_epoch import certify_l1_epoch_write, certify_l1_epoch_read
+                mode = int(node.args[4]) if isinstance(node.args[4], tir.IntImm) else None
+                operand = 2 if mode == 2 else 1
+                if (parent_call is None or len(parent_call.args) <= operand or
+                        not node.same_as(parent_call.args[operand])):
+                    raise ValueError("L1 epoch pointer is not the native DMA endpoint")
+                if mode == 2:
+                    certify_l1_epoch_write(buffer, parent_call, analyzer)
+                elif mode == 1:
+                    certify_l1_epoch_read(buffer, parent_call, analyzer)
+                else:
+                    raise ValueError("L1 epoch requires a certified native read or write")
             span = node.args[3]
             if scope == "global" and not analyzer.can_prove(node.args[2] + span <= pitch):
                 proven_span = gm_copy_span(parent_call, node)
@@ -177,8 +207,9 @@ def materialize_iteration_versions(function, buffer, plan):
             return tir.Allocate(node.buffer_var, node.dtype, enlarged, node.condition, node.body,
                                 node.annotations, getattr(node, "span", None))
         if isinstance(node, tir.Block) and any(b.data.same_as(storage) for b in node.alloc_buffers):
-            if any(active
-                  ) or node.reads or node.writes or node.match_buffers or node.init is not None:
+            target_regions = any(
+                region.buffer.data.same_as(storage) for region in (*node.reads, *node.writes))
+            if any(active) or target_regions or node.match_buffers or node.init is not None:
                 raise ValueError(
                     "logical block views or inner allocation need lifecycle reconstruction")
             buffers = []

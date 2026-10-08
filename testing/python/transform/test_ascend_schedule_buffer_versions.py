@@ -49,6 +49,92 @@ def test_pre_flatten_root_block_allocation_is_versioned_and_certified():
     assert certificate[2].same_as(loop.loop_var)
 
 
+def flattened_l1_fixture(tail=64, unsupported=False):
+    buffer = tir.decl_buffer((8192,), "float16", name="kv", scope="shared.l1")
+    gm = tir.decl_buffer((128, 128), "float16", name="gm")
+    l0 = tir.decl_buffer((8192,), "float16", name="l0", scope="wmma.matrix_b")
+    epoch = tir.Var("epoch", "int32")
+    write = tir.Evaluate(
+        tir.call_extern("handle", "tl::ascend::copy_gm_to_l1<half,64,128>", gm.access_ptr("r"),
+                        buffer.access_ptr("w"), 128, tail, 128, 64, 128))
+    read = tir.Evaluate(
+        tir.call_extern("handle", "probe" if unsupported else "copy_l1_to_l0b<half,64,128,true>",
+                        buffer.access_ptr("r"), l0.access_ptr("w"), 128, 64))
+    owner = tir.For(epoch, 0, 3, tir.ForKind.SERIAL, tir.SeqStmt([write, read]))
+    function = tir.PrimFunc([],
+                            tir.BlockRealize([], True,
+                                             tir.Block([], [], [],
+                                                       "root",
+                                                       owner,
+                                                       alloc_buffers=[buffer])))
+    plan = EpochPlan(buffer.data, True, 2, (OwnerEpochPlan(owner, "iteration", object()),))
+    return buffer, owner, function, plan
+
+
+def test_flattened_l1_ring_uses_native_geometry_and_rewrites_both_endpoints():
+    buffer, owner, function, plan = flattened_l1_fixture()
+    result = materialize_iteration_versions(function, buffer, plan)
+    root = result.body.block
+    assert tuple(map(int, root.alloc_buffers[0].shape)) == (16384,)
+    write, read = root.body.body.seq
+    pointers = (write.value.args[2], read.value.args[1])
+    for epoch in range(3):
+        offsets = [
+            int(arith.Analyzer().simplify(
+                tir.stmt_functor.substitute(pointer.args[2],
+                                            {owner.loop_var: tir.IntImm("int32", epoch)})))
+            for pointer in pointers
+        ]
+        assert offsets == [epoch % 2 * 8192] * 2
+    assert all(int(pointer.args[3]) == 8192 for pointer in pointers)
+
+
+@pytest.mark.parametrize("case", ["tail", "unknown_reader"])
+def test_flattened_l1_geometry_is_revalidated_not_trusted_from_epoch_plan(case):
+    buffer, _, function, plan = flattened_l1_fixture(
+        tail=32 if case == "tail" else 64, unsupported=case == "unknown_reader")
+    with pytest.raises(ValueError, match="L1 epoch"):
+        materialize_iteration_versions(function, buffer, plan)
+
+
+@pytest.mark.parametrize("case", ["malformed", "extra_pointer"])
+def test_flattened_l1_cannot_skip_or_miscertify_pointer_occurrences(case):
+    buffer, owner, function, _ = flattened_l1_fixture()
+    write, read = owner.body.seq
+    if case == "malformed":
+        pointer = buffer.access_ptr("w")
+        pointer = tir.Call(pointer.dtype, pointer.op, list(pointer.args[:-1]))
+        write = tir.Evaluate(tir.call_extern("handle", "probe", pointer))
+    else:
+        args = list(write.value.args)
+        args[6] = buffer.access_ptr("w")
+        write = tir.Evaluate(tir.Call(write.value.dtype, write.value.op, args))
+    owner = tir.For(owner.loop_var, owner.min, owner.extent, owner.kind, tir.SeqStmt([write, read]))
+    function = function.with_body(
+        tir.BlockRealize([], True, tir.Block([], [], [], "root", owner, alloc_buffers=[buffer])))
+    plan = EpochPlan(buffer.data, True, 2, (OwnerEpochPlan(owner, "iteration", object()),))
+    with pytest.raises(ValueError, match="malformed|DMA endpoint"):
+        materialize_iteration_versions(function, buffer, plan)
+
+
+def test_unrelated_root_regions_are_preserved_but_nested_target_views_are_rejected():
+    buffer, owner, function, plan = flattened_l1_fixture()
+    unrelated = tir.decl_buffer((8,), "float32", name="input")
+    region = tir.BufferRegion(unrelated, [ir.Range(0, 8)])
+    root = tir.Block([], [region], [], "root", owner, alloc_buffers=[buffer])
+    function = function.with_body(tir.BlockRealize([], True, root))
+    result = materialize_iteration_versions(function, buffer, plan)
+    assert result.body.block.reads[0].same_as(region)
+    target = tir.BufferRegion(buffer, [ir.Range(0, 8192)])
+    nested = tir.BlockRealize([], True, tir.Block([], [target], [], "view", owner.body))
+    owner = tir.For(owner.loop_var, owner.min, owner.extent, owner.kind, nested)
+    function = function.with_body(
+        tir.BlockRealize([], True, tir.Block([], [], [], "root", owner, alloc_buffers=[buffer])))
+    plan = EpochPlan(buffer.data, True, 2, (OwnerEpochPlan(owner, "iteration", object()),))
+    with pytest.raises(ValueError, match="block views"):
+        materialize_iteration_versions(function, buffer, plan)
+
+
 @pytest.mark.parametrize("case", ["inside_owner", "conditional", "logical_view", "sibling"])
 def test_allocation_without_dominating_physical_lifetime_is_rejected(case):
     buffer, loop, function, plan = fixture()
