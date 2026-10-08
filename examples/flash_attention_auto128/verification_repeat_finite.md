@@ -36,10 +36,14 @@ Docker Python environment extracted the deployed `_require_finite` function
 and used real Torch: nested finite floating/integer/complex outputs passed;
 NaN, positive infinity and negative infinity each raised `ValueError`.
 
-The serial NPU twenty-launch validation has started. Cases0 and2 passed all
-twenty numerical comparisons with the finite gate enabled. The remaining
-cases and terminal process status are still pending; do not infer a fourteen-
-case stability pass from this partial result.
+The serial NPU twenty-launch validation completed with exit code0. All fourteen
+fixed cases passed all twenty numerical comparisons with the finite gate
+enabled. Each original JSON is archived under `results/` as
+`fa128-prefetch-1aeedc56-caseN-stability20.json`. An independent read-back
+checked every report's `ok`, `device`, `check_finite`, `repeat_checks` and
+twenty-launch comparison message before performance measurement started.
+This establishes stability for these fixed inputs across these 280 launches,
+not all inputs or all future scheduling variants.
 
 Hardware validation uses the original script with the original task directory:
 
