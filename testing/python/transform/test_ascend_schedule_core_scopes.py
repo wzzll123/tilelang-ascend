@@ -51,6 +51,50 @@ def test_single_core_wrap_is_outside_owner_to_preserve_flat_loop_contract():
     assert result.body.body.same_as(owner)
 
 
+def test_single_core_scope_is_inside_participant_binding_and_executes_both_lanes():
+    import numpy as np
+    import tvm
+    from tilelang.transform.ascend_schedule.entry import schedule_module
+    from tilelang.simulator import (build_kernel_program, FunctionalSimulator, SimulatorConfig,
+                                    BufferRegion, MemoryScope)
+
+    ub = tir.decl_buffer((8,), "float32", name="lane_value", scope="shared.ub")
+    axis = tir.IterVar(None, tir.Var("threadIdx_x", "int32"), tir.IterVar.ThreadIndex,
+                       "threadIdx.x")
+    root = tir.Block([], [], [],
+                     "root",
+                     tir.Evaluate(T.tile.fill(ub, axis.var + 1)),
+                     alloc_buffers=[ub])
+    body = tir.AttrStmt(axis, "thread_extent", 2, tir.BlockRealize([], True, root))
+    function = tir.PrimFunc([], body).with_attr("npu_platform", "A2")
+    scheduled = schedule_module(
+        tvm.IRModule({"main": function}), "ascendc", {"tl.ascend_auto_schedule": True})["main"]
+    assert scheduled.body.attr_key == "thread_extent"
+    sim = FunctionalSimulator(
+        build_kernel_program(scheduled, platform="A2"), SimulatorConfig(platform="A2"))
+    sim.run()
+    for index, owner in enumerate((0, sim.memory.vector1_owner(0))):
+        np.testing.assert_array_equal(
+            sim.read(BufferRegion("lane_value", MemoryScope.UB, (8,), "float32", core_id=owner)),
+            np.full(8, index + 1))
+
+
+def test_single_core_cannot_scope_across_separate_participant_groups():
+    from tilelang.transform.ascend_schedule.core_scopes import normalize_core_scopes
+    from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks
+
+    _, _, vector = fixture()
+    groups = []
+    for index in (0, 1):
+        axis = tir.IterVar(None, tir.Var(f"vid_{index}", "int32"), tir.IterVar.ThreadIndex,
+                           "threadIdx.x")
+        # Distinct Evaluate identities even when they call the same operation.
+        groups.append(tir.AttrStmt(axis, "thread_extent", 2, tir.Evaluate(vector.value)))
+    function = tir.PrimFunc([], tir.SeqStmt(groups))
+    with pytest.raises(ValueError, match="common participant binding"):
+        normalize_core_scopes(function, extract_tasks(function))
+
+
 def test_opposing_nested_scope_and_duplicate_tasks_are_not_normalized_away():
     from tilelang.transform.ascend_schedule.core_scopes import normalize_core_scopes
     from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks

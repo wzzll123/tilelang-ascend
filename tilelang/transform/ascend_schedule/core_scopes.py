@@ -91,8 +91,40 @@ def normalize_core_scopes(function, extraction):
 
     cores = {task.core for task in tasks.values()}
     if len(cores) == 1:
-        # Keep a local owner body flat; initialization/drain inherit this scope.
-        return function.with_body(scope(function.body, next(iter(cores))))
+        # Keep owners flat, but bind participants before selecting their lane.
+        # The deepest common launch attribute must dominate *all* task nodes;
+        # scoping outside it selects V0 before threadIdx.x becomes known.
+        groups, participants = [], []
+
+        def collect_group(node):
+            if not isinstance(node, tir.AttrStmt) or node.attr_key != "thread_extent":
+                return
+            if isinstance(node.node,
+                          tir.IterVar) and node.node.thread_tag in ("threadIdx.x", "blockIdx.y"):
+                participants.append(node)
+            contained = []
+            tir.stmt_functor.post_order_visit(
+                node.body, lambda item: contained.append(item)
+                if isinstance(item, tir.Evaluate) else None)
+            if all(any(original.same_as(item) for item in contained) for _, original in nodes):
+                groups.append(node)
+
+        tir.stmt_functor.post_order_visit(function.body, collect_group)
+        core = next(iter(cores))
+        if participants and (not groups or
+                             not any(groups[0].same_as(node) for node in participants)):
+            raise ValueError("single-core placement requires a common participant binding")
+        if not groups:
+            return function.with_body(scope(function.body, core))
+        group = groups[0]
+
+        def bind_scope(node):
+            if node.same_as(group):
+                return tir.AttrStmt(node.node, node.attr_key, node.value, scope(node.body, core),
+                                    getattr(node, "span", None))
+            return None
+
+        return function.with_body(tir.stmt_functor.ir_transform(function.body, None, bind_scope))
 
     def rewrite(node):
         for original, core in missing:

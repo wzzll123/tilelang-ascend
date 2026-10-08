@@ -570,6 +570,16 @@ placement follow-up must test single-core scopes inside participant attributes:
 the simulator chooses Vector lanes when it encounters `resource_scope`, so a
 scope outside `thread_extent` does not demonstrate correct per-lane execution.
 
+Docker native broadcast milestone **cdb4f87472b56c09c7e5db922162c5beec4e672b**
+was rebuilt as `tilelang_module` and validated in the independent worktree:
+**814 passed, 1 deselected**, 348 warnings, **44.14 seconds**, clean checkout.
+No NPU was launched. The single-core placement follow-up now inserts its scope
+inside the deepest common launch/participant binding while remaining outside
+the flat owner. Separate participant groups without a common binding fail closed.
+A real automatic-entry CPU test fills lane-private UB using each participant's
+index and observes distinct values one/two on both Vector lanes. This fixes a
+previous admission/bridge mismatch; it does not waive the upcoming full-FA tests.
+
 Task root:
 `/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention`.
 New kernel destination: `design/tile_level/ladder/fa_auto128.py` under that root.
