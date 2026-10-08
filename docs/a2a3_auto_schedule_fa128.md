@@ -227,6 +227,29 @@ mixed owner clocks, guarded tasks, cross-core protocols and whole-function
 automatic materialization are still outstanding. This result is CPU sync-only,
 not NPU FA correctness or performance acceptance.
 
+The slot integration milestone `325fcae2` was transferred to the clean
+independent Docker worktree: **322 passed**, 66 warnings, 12.44 seconds.
+
+CV workspace task follow-up: **326 local tests**, 66 subtests passed. The
+enabled extraction path reuses AscendWorkspaceReduction's existing numerical
+lowering before task extraction: UB-to-L1 becomes V/MTE3 GM write followed by
+C/MTE2 GM read; L0C-to-UB becomes C/FIX GM write followed by V/MTE2 GM read.
+Four native A2/A3 tests check both directions, generated workspace parameters,
+shared-storage RAW edges, and the enabled entry reaching its materializer
+diagnostic rather than treating composites as one atomic pipe operation. The
+wrapper skips composite-free input because the native pass refreshes workspace
+attributes even when rerun without composites. Numerical helper templates,
+row pitches, dtype handling and core/vid offsets remain native-pass owned.
+
+An attempted static simulator hazard acceptance check did **not** report these
+unfenced GM-hop probes. It is not counted as a passing negative test or evidence
+of safe synchronization. Explicit mode-2 protocols and real execution negative
+tests remain required. No event is emitted by workspace lowering, and inferred
+GM data edges must not be treated as runtime execution fences. When the full
+entry becomes executable, its physical-workspace lowering must replace (not
+run twice with) the later legacy workspace pass. Dual-vector/tail numerical
+acceptance and FA hardware gates remain unverified.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash
