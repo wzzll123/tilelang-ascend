@@ -580,6 +580,43 @@ A real automatic-entry CPU test fills lane-private UB using each participant's
 index and observes distinct values one/two on both Vector lanes. This fixes a
 previous admission/bridge mismatch; it does not waive the upcoming full-FA tests.
 
+### First whole regular FA128 integration (not final ladder acceptance)
+
+`testing/python/transform/fa128_auto_fixture.py` adapts the existing Developer
+FA online-softmax example to full vector broadcasts, without manual scopes,
+flags, barriers, physical addresses or slot indices. Its fixed shape is BHSD
+`[1,1,128,128]`, block M/N=32/64, two KV epochs, noncausal with no tails.
+`test_ascend_schedule_fa128.py` runs real LowerAndLegalize/OptimizeForTarget for
+A2 and A3, generates exposed MMA/native mode-two events without PIPE_ALL,
+checks finite numeric output against CPU FP64 golden, and truly executes
+sync-only with the unchanged 60-second timeout and error-level flag balance.
+Removed cross sets deadlock; removed cross waits read uninitialized GM
+workspace at runtime. The static local-memory checker does not diagnose these
+GM-hop mutants, so the tests do not claim it does.
+
+This fixture first failed because the function-level destination event pool
+exhausted. No event limit was increased. A distance-zero A->B protocol's release
+already proves B(i)->A(i+slot_count), so an exactly matching reciprocal carried
+protocol is redundant. Local and mode-two emitters now discharge only this exact
+endpoint/slot match, retaining all analyzer hazards in the report. Different
+slot counts/endpoints and carried-only protocols remain. Drain mutation tests
+remove the actual suffix, rather than assuming the old protocol count.
+
+The first standalone CPU observation was approximately 0.029 seconds for true
+sync-only execution, approximately 0.34 seconds for the numeric run plus golden
+comparison, finite output and max absolute difference 3.7e-5. These are not
+hardware timing or a baseline comparison. Expanded local regression:
+**823 passed, 1 deselected**, 66 subtests, 13.52 seconds.
+
+The final ladder module, causal/tail support, coordinated automatic multiversion
+pipeline, fourteen-case stability and NPU performance acceptance are still open.
+Designer integration must export the existing config/factory/runtime-scale
+interface and explicit `auto128` selection. Generated workspaces change signature
+indices: do not reuse runners' hardcoded 4/5/6 workspace indices if index four
+is sm_scale. Existing verification helpers also need top-level/input-attribute
+causal propagation, using the existing bottom-right golden convention, not a
+new scoring rule. All required implementation/test selections must be explicit.
+
 Task root:
 `/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention`.
 New kernel destination: `design/tile_level/ladder/fa_auto128.py` under that root.

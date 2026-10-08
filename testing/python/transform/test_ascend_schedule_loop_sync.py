@@ -96,7 +96,10 @@ def test_deleted_drain_fails_runtime_flag_accounting(extent):
     result = emit_loop_sync(
         extraction, loop,
         [Dependency(0, 1, "RAW"), Dependency(1, 0, "WAR", 1)], event_ids=(0, 1))
-    mutated = tir.SeqStmt(list(result.seq)[:-2])
+    cut = next(i for i, child in enumerate(result.seq) if isinstance(child, tir.For))
+    # Remove every final drain without assuming the number of protocols.
+    kept = list(result.seq)[:cut + 1]
+    mutated = kept[0] if len(kept) == 1 else tir.SeqStmt(kept)
     root = tir.Block([], [], [],
                      "root",
                      tir.AttrStmt(tir.IntImm("int32", 1), "resource_scope", 1, mutated),

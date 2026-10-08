@@ -176,6 +176,8 @@ def emit_mode2_loop_sync(function,
             if key in pairs and pairs[key] != count:
                 raise LocalSyncError("conflicting slot counts for one dependency channel")
             pairs[key] = count
+    from .loop_protocols import remove_reciprocal_protocols
+    pairs = remove_reciprocal_protocols(pairs)
     from .events import EventRegistry
     registry = EventRegistry(
         local_ids=local_ids, cross_ids=cross_ids) if registry is None else registry

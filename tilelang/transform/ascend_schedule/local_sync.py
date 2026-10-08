@@ -235,7 +235,10 @@ def emit_loop_sync(extraction, loop, dependencies, *, event_ids, slot_count=1, r
         if d.distance > minimum_distance[d.source, d.target]:
             continue
         if pipes[d.source] != pipes[d.target]:
-            pairs[d.source, d.target, d.distance] = None
+            pairs[d.source, d.target, d.distance] = slot_count
+
+    from .loop_protocols import remove_reciprocal_protocols
+    pairs = remove_reciprocal_protocols(pairs)
 
     from .events import EventRegistry
     registry = EventRegistry(local_ids=event_ids, cross_ids=()) if registry is None else registry
