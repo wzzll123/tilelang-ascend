@@ -80,7 +80,11 @@ def flash_attention_auto128_fwd(cfg: FlashAttentionConfig):
             T.copy(
                 Q[cid // (q_tiles * heads), (cid // q_tiles) % heads,
                   (cid % q_tiles) * bm:((cid % q_tiles) + 1) * bm, :], q)
-            for epoch in T.serial(T.ceildiv(skv, bn)):
+            # The last row of this Q tile bounds the possible causal key prefix.
+            # The count is identical for Cube and both Vector participants.
+            for epoch in T.serial(
+                    T.min(T.ceildiv(skv, bn), T.ceildiv(((cid % q_tiles) + 1) * bm + skv -
+                                                        sq, bn)) if causal else T.ceildiv(skv, bn)):
                 T.copy(
                     K[cid // (q_tiles * heads), (cid // q_tiles) % heads,
                       epoch * bn:(epoch + 1) * bn, :], k)
