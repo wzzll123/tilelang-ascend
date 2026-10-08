@@ -1,12 +1,13 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""Fail-closed entry for opt-in lowered-TIR scheduling during migration."""
+"""Opt-in lowered-TIR scheduling with explicit unsupported-structure errors."""
 
 from .policy import resolve_options, schedule_enabled
 from .tir_adapter import extract_tasks
 from .conditions import normalize_conditions
 from .gemm_decomposition import decompose_function_gemms
 from .workspace_tasks import prepare_cross_core_copies
+from .materializer import materialize_flat_function, MaterializationError
 
 
 class AutoScheduleError(NotImplementedError):
@@ -14,11 +15,10 @@ class AutoScheduleError(NotImplementedError):
 
 
 def schedule_module(mod, target_model, config):
-    """Normalize and extract enabled modules, then stop before legacy sync.
+    """Materialize supported epochs; never silently use legacy synchronization.
 
-    This bootstrap intentionally cannot return a scheduled module: ring
-    materialization and unified synchronization are not implemented. Disabling
-    the opt-in flag restores the existing lowering path.
+    The flat epoch path is executable. Structured owner-loop/guard reconstruction
+    still reports a migration error. Disabling the flag preserves legacy lowering.
     """
     config = {} if config is None else config
     # Disabled policy does not inspect targets, platform attrs, or Stage metadata.
@@ -29,10 +29,16 @@ def schedule_module(mod, target_model, config):
         platform = str(attrs.get("npu_platform", "")) if attrs is not None else ""
         resolve_options(config, target_model, platform)
     mod = prepare_cross_core_copies(mod)
-    for function in mod.functions.values():
-        extract_tasks(normalize_conditions(decompose_function_gemms(function)))
-    raise AutoScheduleError(
-        "tl.ascend_auto_schedule extraction succeeded, but the scheduling materializer "
-        "and unified synchronization emitter are not implemented. Disable "
-        "tl.ascend_auto_schedule to use existing lowering; no legacy synchronization "
-        "fallback was applied.")
+    functions = {}
+    for name, function in mod.functions.items():
+        function = normalize_conditions(decompose_function_gemms(function))
+        extraction = extract_tasks(function)
+        try:
+            functions[name] = materialize_flat_function(function, extraction,
+                                                        str(function.attrs["npu_platform"]))
+        except MaterializationError as error:
+            raise AutoScheduleError(
+                "tl.ascend_auto_schedule extraction succeeded, but the scheduling materializer: " +
+                str(error) + "; no legacy synchronization fallback was applied.") from error
+    from tvm import IRModule
+    return IRModule(functions, mod.type_definitions, mod.attrs)

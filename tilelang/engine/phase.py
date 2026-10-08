@@ -70,11 +70,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.CollectBufferShapes()(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
-    # Opt-in migration bootstrap extracts lowered tasks and fails closed until
-    # materialization and unified synchronization can emit executable TIR.
-    from tilelang.transform.ascend_schedule.entry import schedule_module
-
-    mod = schedule_module(mod, target.model, tilelang.transform.get_pass_context().config)
     # Propagate UB tail valid-regions and rewrite supported vector ops,
     # compare/select, broadcast, and allow-listed reductions to tail-aware
     # variants (must run before passes that reorder copy/vector ops).
@@ -97,6 +92,11 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.Simplify()(mod)
     # Try to vectorize loop with dynamic shape
     # mod = tilelang.transform.LoopVectorizeDynamic()(mod)
+    # Schedule fully legalized physical operations, still before pipeline and
+    # flattening. Unsupported structures fail here, before any legacy rewrite.
+    from tilelang.transform.ascend_schedule.entry import schedule_module
+
+    mod = schedule_module(mod, target.model, tilelang.transform.get_pass_context().config)
     return mod
 
 
@@ -104,11 +104,20 @@ def OptimizeForTarget(mod: IRModule, target: Target, platform: str) -> IRModule:
     from tilelang.utils.target import check_npu_availability
 
     pass_ctx = tilelang.transform.get_pass_context()
+    from tilelang.transform.ascend_schedule.policy import schedule_enabled
+    from tilelang.transform.ascend_schedule.materializer import MARKER
+
+    automatic = schedule_enabled(pass_ctx.config)
+    if automatic and any(not function.attrs or not function.attrs.get(MARKER, False)
+                         for function in mod.functions.values()):
+        raise ValueError(
+            "automatic scheduling requires completed materialization before target optimization")
     mod = tir.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-    mod = tilelang.transform.CrossCorePipeline()(mod)
-    mod = tilelang.transform.CombineCV()(mod)
-    mod = tilelang.transform.PipelinePlanning()(mod)
-    mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+    if not automatic:
+        mod = tilelang.transform.CrossCorePipeline()(mod)
+        mod = tilelang.transform.CombineCV()(mod)
+        mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
     mod = tilelang.transform.AscendLowerOpaqueBlock()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.ConfigIndexBitwidth()(mod)
@@ -117,15 +126,24 @@ def OptimizeForTarget(mod: IRModule, target: Target, platform: str) -> IRModule:
     mod = tilelang.transform.FlattenBuffer()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(mod)
-    mod = tilelang.transform.AscendStorageRewrite(is_npu=check_npu_availability())(mod)
+    if not automatic:
+        mod = tilelang.transform.AscendStorageRewrite(is_npu=check_npu_availability())(mod)
     mod = tir.transform.UnrollLoop()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tir.transform.RemoveNoOp()(mod)
     mod = tir.transform.RewriteUnsafeSelect()(mod)
-    mod = tir.transform.HoistIfThenElse()(mod)
-    mod = tilelang.transform.AscendMemoryPlanning()(mod)
-    mod = tilelang.transform.AscendSyncInsert(target, platform)(mod)
-    mod = tilelang.transform.AscendSyncInsertVS(target, platform)(mod)
+    if automatic:
+        # No lexical-lifetime aliasing: a later milestone may admit only
+        # allocations accompanied by a validated asynchronous alias contract.
+        config = dict(pass_ctx.config)
+        config["tl.ascend_memory_planning"] = False
+        with PassContext(opt_level=pass_ctx.opt_level, config=config):
+            mod = tilelang.transform.AscendMemoryPlanning()(mod)
+    else:
+        mod = tir.transform.HoistIfThenElse()(mod)
+        mod = tilelang.transform.AscendMemoryPlanning()(mod)
+        mod = tilelang.transform.AscendSyncInsert(target, platform)(mod)
+        mod = tilelang.transform.AscendSyncInsertVS(target, platform)(mod)
     # print(mod)
     return mod

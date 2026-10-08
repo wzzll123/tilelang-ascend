@@ -345,6 +345,34 @@ generated row-major GM scratch copies, not every on-chip layout or dynamic
 counter/guard owner. The full automatic entry, FA kernel and NPU correctness /
 stability / performance acceptance are still outstanding.
 
+Executable-entry follow-up: enabled scheduling now returns materialized TIR
+for supported unconditional flat local/CV epochs. It validates defined storage,
+core accessibility and static per-core capacity, emits actual local/mode-2
+fences and stores a JSON feasibility report on the function. Report costs are
+explicit unit costs, **not calibrated NPU performance predictions**. Unsupported
+loops, guards, scalar bindings or version hints still fail closed; this does
+not enable the complete FA schedule yet.
+
+Entry placement is after numerical/tail/workspace/safe-access legalization,
+still before pipeline rewriting and flattening. This avoids changing the
+analyzed operation stream after synchronization materialization. On the enabled
+path target optimization requires the completed-materialization marker, skips
+legacy cross-core/software pipeline and sync passes, and disables lexical
+storage reuse. Native memory planning uses disjoint linear addresses until
+asynchronous alias contracts are integrated. The disabled path retains its
+existing pass sequence and configuration.
+
+Four additional A2/A3 tests execute the automatic entry without manual flags:
+vector fill/store passes true sync-only and native source generation after
+target optimization; FP16 GEMM plus FIX GM store produces the expected CPU
+numeric output. Both CV workspace directions also execute through the automatic
+entry under normal and delayed producers. Spies reject any legacy pipeline or
+sync pass invoked on the enabled path. Expanded local regression: **751 passed,
+1 deselected**, 66 subtests, with the same previously verified row-expand test
+failure excluded. These are CPU/native-source results, not NPU FA acceptance.
+Whole-function loop/guard reconstruction, calibrated optimization and safe
+alias admission remain necessary for the original FA128 performance goal.
+
 Reproduce CPU validation inside `wzz_cann`:
 
 ```bash

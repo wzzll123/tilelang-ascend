@@ -9,10 +9,15 @@ from tvm import tir
 from tilelang.transform.ascend_schedule.workspace_tasks import prepare_cross_core_copies
 from tilelang.transform.ascend_schedule.tir_adapter import extract_tasks
 from tilelang.transform.ascend_schedule.dependency import analyze_dependencies
-from tilelang.transform.ascend_schedule.entry import schedule_module, AutoScheduleError
+from tilelang.transform.ascend_schedule.entry import schedule_module
 
 
-def assert_mode2_execution(function, extracted, dependencies, platform, source_name):
+def assert_mode2_execution(function,
+                           extracted,
+                           dependencies,
+                           platform,
+                           source_name,
+                           automatic_function=None):
     import numpy as np
     from dataclasses import replace
     from tilelang.transform.ascend_schedule.cross_sync import emit_mode2_sync
@@ -65,6 +70,9 @@ def assert_mode2_execution(function, extracted, dependencies, platform, source_n
         return sim
 
     simulator(synced).run()
+    if automatic_function is not None:
+        simulator(automatic_function).run()
+        simulator(automatic_function, delayed_producer=True).run()
     simulator(synced, delayed_producer=True).run()
 
     def remove_set(node):
@@ -202,9 +210,9 @@ def test_ub_to_l1_is_two_real_pipes_with_a_shared_gm_dependency(platform):
     assert len(prepared["main"].params) == 1  # Generated GM workspace parameter.
     assert tvm.ir.structural_equal(prepared, prepare_cross_core_copies(prepared))
     assert all("flag" not in node.value.op.name for node in extracted.task_nodes.values())
-    with pytest.raises(AutoScheduleError, match="extraction succeeded"):
-        schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})
-    assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "ub")
+    automatic = schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})["main"]
+    assert int(automatic.attrs["tl.ascend.schedule_materialized"]) == 1
+    assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "ub", automatic)
 
 
 @pytest.mark.parametrize("platform", ["A2", "A3"])
@@ -241,6 +249,6 @@ def test_l0c_to_ub_exposes_fix_write_and_vector_mte2_read(platform):
     assert any(d.source == 0 and d.target == 1 and d.kind == "RAW" for d in dependencies)
     assert len(prepared["main"].params) == 1
     assert all("flag" not in node.value.op.name for node in extracted.task_nodes.values())
-    with pytest.raises(AutoScheduleError, match="extraction succeeded"):
-        schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})
-    assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "acc")
+    automatic = schedule_module(mod, "ascendc", {"tl.ascend_auto_schedule": True})["main"]
+    assert int(automatic.attrs["tl.ascend.schedule_materialized"]) == 1
+    assert_mode2_execution(prepared["main"], extracted, dependencies, platform, "acc", automatic)

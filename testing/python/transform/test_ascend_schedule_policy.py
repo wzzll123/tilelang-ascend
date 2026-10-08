@@ -102,13 +102,15 @@ class BootstrapTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "multi-pipe gemm_v0"):
             entry.schedule_module(mod, "ascendc", {KEY: True})
 
-    def test_phase_entry_is_immediately_after_lower_tile_op(self):
+    def test_phase_entry_is_after_legalization_before_pipeline(self):
         source = (ROOT / "tilelang/engine/phase.py").read_text()
         lower_index = source.index("mod = tilelang.transform.LowerTileOp()(mod)")
         scheduler_index = source.index("mod = schedule_module(", lower_index)
         tail_index = source.index("AscendTailMaskPropagation(", lower_index)
         self.assertLess(lower_index, scheduler_index)
-        self.assertLess(scheduler_index, tail_index)
+        self.assertLess(tail_index, scheduler_index)
+        self.assertLess(source.index("AscendWorkspaceReduction(", lower_index), scheduler_index)
+        self.assertLess(source.index("LegalizeSafeMemoryAccess(", lower_index), scheduler_index)
 
 
 class NativePolicyTests(unittest.TestCase):
@@ -162,7 +164,7 @@ class NativePolicyTests(unittest.TestCase):
             entry.schedule_module(mod, "ascendc", {KEY: True})
         self.assertEqual(self.tvm.ir.save_json(mod), source)
 
-    def test_phase_stops_immediately_after_lower_tile_op(self):
+    def test_unsupported_phase_stops_after_legalization_before_target_pipeline(self):
         from tilelang.engine import phase
 
         T = self.tvm.tir
@@ -184,7 +186,9 @@ class NativePolicyTests(unittest.TestCase):
 
         early = ("InjectTmpBuffer", "AscendInferBufferScope", "AscendVidReduction",
                  "BufferShapeCollector", "HostProcesser", "AscendLowerParallelToVector",
-                 "LayoutInference", "CollectBufferShapes", "LowerTileOp")
+                 "LayoutInference", "CollectBufferShapes", "LowerTileOp",
+                 "AscendTailMaskPropagation", "AscendWorkspaceReduction", "LegalizeVectorizedLoop",
+                 "LegalizeSafeMemoryAccess")
         with ExitStack() as stack:
             for name in early:
                 stack.enter_context(patch.object(self.tilelang.transform, name, fake_pass(name)))
@@ -195,12 +199,10 @@ class NativePolicyTests(unittest.TestCase):
                     self.tilelang.transform,
                     "get_pass_context",
                     return_value=types.SimpleNamespace(config={KEY: True})))
-            legacy = stack.enter_context(
-                patch.object(self.tilelang.transform, "AscendTailMaskPropagation"))
             with self.assertRaisesRegex(NotImplementedError, "materializer"):
                 phase.LowerAndLegalize(mod, types.SimpleNamespace(model="ascendc"))
-            self.assertEqual(passes[-1], "LowerTileOp")
-            legacy.assert_not_called()
+            self.assertEqual(passes[-1], "Simplify")
+            self.assertIn("AscendWorkspaceReduction", passes)
 
 
 if __name__ == "__main__":
