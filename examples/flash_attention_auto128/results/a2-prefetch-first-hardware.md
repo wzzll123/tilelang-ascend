@@ -31,5 +31,16 @@ case the optimizer simplified the two-slot modulo expression to the epoch.
 
 This is one precision run, not the fourteen-case gate, repeated numerical
 stability, explicit finite-output validation, or a performance measurement.
-Case42 (three iterations, first slot reuse) and case10 (causal) are separate
-follow-up checks; their results are not claimed here.
+Follow-up single precision runs also passed:
+
+| Case | B,H,Sq,Skv,D | Mode | Coverage |
+| --- | --- | --- | --- |
+| 42 | 2,4,192,192,128 | noncausal | three iterations, first slot reuse |
+| 10 | 2,8,512,512,128 | causal | cid-dependent trip count and repeated reuse |
+
+Both original JSON reports are preserved alongside case0. Their real cached
+sources also contain the new wave: case42 has `epoch_wave < 4`; case10 has
+`epoch_wave < floordiv(floormod(cid,16),2)+2`. These are not sequential fallback
+passes. Three of fourteen fixed cases have passed one precision run. The other
+eleven, repeated numerical stability, explicit finiteness and performance gates
+are still pending.

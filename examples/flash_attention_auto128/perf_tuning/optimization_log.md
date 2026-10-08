@@ -111,6 +111,7 @@ Exact loaded-library/source hashes and the raw report are archived in
 `results/a2-prefetch-first-hardware.md`.
 
 This iteration has **no measured performance result yet**. Case42(first reuse)
-and case10(causal) are follow-up precision checks, followed by the remaining
-fixed cases and alternating profiler comparisons. Input prefetch alone is not
+and case10(causal) subsequently passed their single precision checks; actual
+cached sources confirm wave emission for both. The remaining eleven fixed
+precision cases and alternating profiler comparisons are pending. Input prefetch alone is not
 claimed to complete broader C/V overlap or to satisfy the90% performance gate.
