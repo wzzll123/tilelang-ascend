@@ -31,8 +31,15 @@ Local regression: `python -m pytest -q
 examples/flash_attention_auto128/test_verification_repeat_finite.py`:
 10 control-flow checks passed. These use minimal test doubles and do not
 constitute NPU precision evidence. Docker deployment passed Python syntax
-compilation. Real-Torch finite-gate checks and the actual NPU twenty-launch
-results must be recorded separately after their processes finish.
+compilation and the exact post-patch hash check. A separate CPU test in the
+Docker Python environment extracted the deployed `_require_finite` function
+and used real Torch: nested finite floating/integer/complex outputs passed;
+NaN, positive infinity and negative infinity each raised `ValueError`.
+
+The serial NPU twenty-launch validation has started. Cases0 and2 passed all
+twenty numerical comparisons with the finite gate enabled. The remaining
+cases and terminal process status are still pending; do not infer a fourteen-
+case stability pass from this partial result.
 
 Hardware validation uses the original script with the original task directory:
 
