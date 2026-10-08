@@ -83,6 +83,34 @@ private:
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
       buffers_skip_vid_reduction_;
 
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
+      broadcast_row_buffers_;
+
+  Buffer FindUbPointer(const PrimExpr &arg) const {
+    const auto *ptr = arg.as<CallNode>();
+    if (!ptr || !ptr->op.same_as(builtin::tvm_access_ptr()) ||
+        ptr->args.size() != 5) {
+      return Buffer();
+    }
+    const auto *var = ptr->args[1].as<VarNode>();
+    for (const Buffer &buffer : ub_buffers_) {
+      if (buffer->data.get() == var) {
+        return buffer;
+      }
+    }
+    return Buffer();
+  }
+
+  size_t BroadcastDimIndex(const CallNode *op) const {
+    ICHECK_GE(op->args.size(), 8U)
+        << "VID broadcast requires explicit 2D shapes";
+    const size_t index = op->args[3].as<CallNode>() ? 4 : 3;
+    const auto *dim = op->args[index].as<IntImmNode>();
+    ICHECK(dim && dim->value == 2 && op->args.size() == index + 5)
+        << "VID broadcast requires explicit 2D shapes";
+    return index;
+  }
+
   // Collect current loop variables and their extents
   std::vector<std::pair<Var, PrimExpr>> current_loops_;
 
@@ -297,6 +325,57 @@ private:
           return IndicesContainUbBufferLoad(indices, ub_set);
         });
     analyzer(body);
+
+    // A broadcast's column source and workspace are replicated storage, not
+    // rows to shard. Classify them before creating any reduced buffer mapping.
+    PostOrderVisit(body, [this](const ObjectRef &node) {
+      const auto *call = node.as<CallNode>();
+      if (!call || !call->op.same_as(Op::Get("tl.ascend_broadcast"))) {
+        return;
+      }
+      const size_t index = BroadcastDimIndex(call);
+      Buffer dst = FindUbPointer(call->args[1]);
+      Buffer src = FindUbPointer(call->args[2]);
+      ICHECK(dst.defined() && src.defined())
+          << "VID broadcast operands require known UB allocations";
+      broadcast_row_buffers_.insert(dst);
+      const auto *src_rows = call->args[index + 3].as<IntImmNode>();
+      ICHECK(src_rows) << "VID broadcast requires static source rows";
+      if (src_rows->value == 1) {
+        buffers_skip_vid_reduction_.insert(src);
+      } else {
+        broadcast_row_buffers_.insert(src);
+      }
+      if (index == 4) {
+        Buffer tmp = FindUbPointer(call->args[3]);
+        ICHECK(tmp.defined())
+            << "VID broadcast workspace requires known UB storage";
+        buffers_skip_vid_reduction_.insert(tmp);
+      }
+    });
+    for (const Buffer &buffer : broadcast_row_buffers_) {
+      ICHECK(!buffers_skip_vid_reduction_.count(buffer))
+          << "VID broadcast storage has contradictory sharded/replicated roles";
+    }
+    if (!broadcast_row_buffers_.empty()) {
+      PostOrderVisit(body, [this](const ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        const auto *op = call ? call->op.as<OpNode>() : nullptr;
+        if (!op || !IsTileOp(op->name)) {
+          return;
+        }
+        bool replicated = false, sharded = false;
+        for (const PrimExpr &arg : call->args) {
+          Buffer buffer = FindUbPointer(arg);
+          if (buffer.defined()) {
+            replicated |= buffers_skip_vid_reduction_.count(buffer) != 0;
+            sharded |= buffers_skip_vid_reduction_.count(buffer) == 0;
+          }
+        }
+        ICHECK(!(replicated && sharded))
+            << "VID broadcast storage has contradictory elementwise row roles";
+      });
+    }
   }
 
   Stmt VisitStmt_(const BlockNode *op) override {
@@ -662,6 +741,68 @@ private:
                 ascend_reduce->span);
   }
 
+  PrimExpr ModifyAscendBroadcast(const CallNode *op) {
+    const size_t index = BroadcastDimIndex(op);
+    Buffer dst = FindUbPointer(op->args[1]);
+    Buffer src = FindUbPointer(op->args[2]);
+    ICHECK(dst.defined() && src.defined() && origin_to_new_buffer_.count(dst))
+        << "VID broadcast requires a proven row-sharded destination";
+    const auto *rows = op->args[index + 1].as<IntImmNode>();
+    const auto *cols = op->args[index + 2].as<IntImmNode>();
+    const auto *src_rows = op->args[index + 3].as<IntImmNode>();
+    const auto *src_cols = op->args[index + 4].as<IntImmNode>();
+    ICHECK(rows && cols && src_rows && src_cols && rows->value >= 2 &&
+           rows->value % 2 == 0 && cols->value > 0 && src_cols->value > 0 &&
+           ((src_rows->value == rows->value && src_cols->value == 1) ||
+            (src_rows->value == 1 && src_cols->value == cols->value)))
+        << "VID broadcast requires static even rows and matching row/column "
+           "sources";
+    auto check_full = [this](const PrimExpr &arg, const Buffer &buffer,
+                             int64_t count) {
+      const auto *ptr = arg.as<CallNode>();
+      ICHECK(ptr && AccessPtrOffsetIsZero(arg))
+          << "VID broadcast slices require a separate span proof";
+      ICHECK(buffer->strides.empty() &&
+             analyzer_->CanProve(buffer->elem_offset == 0))
+          << "VID broadcast requires compact allocation-base operands";
+      PrimExpr capacity = make_const(ptr->args[3].dtype(), 1);
+      for (const PrimExpr &extent : buffer->shape) {
+        capacity = capacity * extent;
+      }
+      PrimExpr required = make_const(ptr->args[3].dtype(), count);
+      ICHECK(analyzer_->CanProve(capacity == required) &&
+             analyzer_->CanProve(ptr->args[3] == required))
+          << "VID broadcast requires full operands matching allocation "
+             "capacity";
+    };
+    check_full(op->args[1], dst, rows->value * cols->value);
+    check_full(op->args[2], src, src_rows->value * src_cols->value);
+    const bool row_source = src_rows->value != 1;
+    ICHECK((src->shape.size() == 1 &&
+            analyzer_->CanProve(src->shape[0] ==
+                                op->args[index + (row_source ? 3 : 4)])) ||
+           (src->shape.size() == 2 &&
+            analyzer_->CanProve(src->shape[0] == op->args[index + 3]) &&
+            analyzer_->CanProve(src->shape[1] == op->args[index + 4])))
+        << "VID broadcast source shape must match its row/column partition";
+    ICHECK(row_source ? origin_to_new_buffer_.count(src) != 0
+                      : buffers_skip_vid_reduction_.count(src) != 0)
+        << "VID broadcast source partition was not established";
+    ICHECK(dst->shape.size() == 2 &&
+           analyzer_->CanProve(dst->shape[0] == op->args[index + 1]) &&
+           analyzer_->CanProve(dst->shape[1] == op->args[index + 2]))
+        << "VID broadcast destination shape must match its allocation";
+    Array<PrimExpr> args = op->args;
+    for (size_t i = 1; i < args.size(); ++i) {
+      args.Set(i, VisitExpr(args[i]));
+    }
+    args.Set(index + 1, origin_to_new_buffer_.at(dst)->shape[0]);
+    if (row_source) {
+      args.Set(index + 3, make_const(src_rows->dtype, rows->value / 2));
+    }
+    return Call(op->dtype, op->op, args, op->span);
+  }
+
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (threads_cnt_ != 2) {
       return IRMutatorWithAnalyzer::VisitExpr_(op);
@@ -722,6 +863,10 @@ private:
       return IRMutatorWithAnalyzer::VisitExpr_(op);
     }
     std::string op_name = call_op->name;
+
+    if (op_name == "tl.ascend_broadcast") {
+      return ModifyAscendBroadcast(op);
+    }
 
     if (IsTileOp(op_name)) {
       return ModifyTileOpSize(op);

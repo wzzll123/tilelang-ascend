@@ -550,6 +550,26 @@ halving, introduce a host mask as a hidden fallback, or launch a candidate with
 these unverified shape/count rewrites. These are source-confirmed admission gaps,
 not an observed NPU failure or a completed native fix.
 
+Native broadcast follow-up now implements the regular full-operand slice:
+axis-one row geometry and pointer spans halve consistently; axis-zero column
+sources and explicit/injected broadcast workspace remain replicated. Source
+layout must actually be `[M]`/`[M,1]` or `[N]`/`[1,N]`, not merely have the same
+element count. Slices, odd/symbolic rows, noncompact bases and conflicting
+replicated/sharded broadcast or elementwise roles fail closed. Threads-one is
+unchanged. Nineteen native tests cover these contracts, A2/A3 generated arrays,
+the 256-byte arena and different values on both Vector lanes. This is native
+source plus CPU numeric validation, not NPU validation.
+Expanded local regression: **814 passed, 1 deselected**, 66 subtests, 8.20 seconds.
+
+The local module build target is `cmake --build build-auto-schedule --target
+tilelang_module -j 4`. The unrelated macOS aggregate shared-library target has
+unresolved TVM link symbols; the actual loaded module target builds successfully.
+Do not treat an aggregate build failure as permission to silently load an old
+module. Causal create-index/select count handling remains open. A separate
+placement follow-up must test single-core scopes inside participant attributes:
+the simulator chooses Vector lanes when it encounters `resource_scope`, so a
+scope outside `thread_extent` does not demonstrate correct per-lane execution.
+
 Task root:
 `/home/wenzhongzhen/kernel-tool/cannbot-skills-0817/plugins-community/tilelang2ascendc-ops-generator/workflows/templates/archive_tasks/flash_attention`.
 New kernel destination: `design/tile_level/ladder/fa_auto128.py` under that root.
