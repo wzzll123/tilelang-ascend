@@ -199,6 +199,7 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     assert stats.task_count == 4
     assert stats.busy_cycles_by_resource["core-0/cube/mte2"] == 15
     assert stats.utilization_by_resource["core-0/cube/mte2"] == pytest.approx(0.5)
+    assert "core-1/vector0/s" not in stats.busy_cycles_by_resource
     assert stats.wait_cycles_by_reason == {"event": 4}
     assert stats.completion_cycle_by_core == {0: 30, 1: 12}
     assert stats.operation_counts == {
@@ -247,6 +248,23 @@ def test_trace_export_and_stats_are_overlap_aware(tmp_path: Path) -> None:
     ]
 
 
+def test_dependency_wait_is_not_scalar_busy_time() -> None:
+    records = (
+        ExecutionRecord("flag", "set_flag", 0, Lane.CUBE, Pipe.SCALAR, 0, 1),
+        ExecutionRecord(
+            "blocked", "wait", 0, Lane.CUBE, Pipe.SCALAR, 1, 20,
+            category="wait", stall_reason="local flag",
+        ),
+        ExecutionRecord("mma", "mma", 0, Lane.CUBE, Pipe.MATRIX, 0, 20),
+    )
+    stats = SimulationStats.from_records(records)
+
+    assert stats.makespan_cycles == 20
+    assert stats.busy_cycles_by_resource["core-0/cube/s"] == 1
+    assert stats.utilization_by_resource["core-0/cube/s"] == pytest.approx(0.05)
+    assert stats.wait_cycles_by_reason == {"local flag": 19}
+
+
 def test_empty_stats_are_well_defined() -> None:
     stats = SimulationStats.from_records([])
 
@@ -283,6 +301,7 @@ def test_performance_report_is_compact_and_marks_pto_timing_unmeasured(
     assert document["timing"]["measured"] is False
     assert document["schedule"]["makespan_cycles"] == 20
     assert document["top_resources"][0]["resource"] == "core-0/cube/m"
+    assert all(item["resource"] != "core-0/cube/s" for item in document["top_resources"])
     assert document["major_stalls"] == [{"reason": "local flag", "cycles": 4}]
     assert document["critical_path"]["status"] == "unavailable"
     assert "not measured hardware latency" in report.to_text()

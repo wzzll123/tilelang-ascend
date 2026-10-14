@@ -131,6 +131,7 @@ _SYNC_ONLY_EXPLICIT_OPERATIONS = frozenset(
         "fill",
         "reducesum_experiment",
         "sum_experiment",
+        "binary_mask_experiment",
         "brcb_experiment",
         "row_expand_mul_experiment",
         "row_expand_sub_experiment",
@@ -529,6 +530,9 @@ class FunctionalSimulator:
             return
         if operation == "brcb_experiment":
             self._brcb(task)
+            return
+        if operation == "binary_mask_experiment":
+            self._binary_mask_experiment(task)
             return
         if operation in {
             "row_expand_mul_experiment",
@@ -993,6 +997,61 @@ class FunctionalSimulator:
                     task_core_id=task.core_id,
                 )
 
+    def _binary_mask_experiment(self, task: Task) -> None:
+        kind = task.metadata.get("binary_kind")
+        if kind not in _BINARY_OPERATIONS:
+            raise UnsupportedSimOpError(f"binary_mask_experiment requires a known binary_kind, got {kind!r}")
+        left = _operand(task, "lhs")
+        right = _operand(task, "rhs")
+        destination = _operand(task, "dst")
+        mask_words = task.metadata.get("binary_mask")
+        if (not isinstance(mask_words, tuple) or len(mask_words) != 2
+                or not all(isinstance(word, int) for word in mask_words)):
+            raise ProgramValidationError("binary_mask_experiment requires two mask words")
+        itemsize = _numpy_dtype(destination.dtype).itemsize
+        elements_per_block = 32 // itemsize
+        elements_per_repeat = 8 * elements_per_block
+        active_mask = mask_words[0] | (mask_words[1] << 64)
+        if active_mask & ((1 << elements_per_repeat) - 1) == 0:
+            return
+        if active_mask & ((1 << elements_per_repeat) - 1) == (1 << elements_per_repeat) - 1:
+            result = _BINARY_OPERATIONS[kind](
+                self.read(left, task_core_id=task.core_id),
+                self.read(right, task_core_id=task.core_id),
+            )
+            self.write(destination, result, task_core_id=task.core_id)
+            return
+
+        operands = (destination, left, right)
+        offsets = tuple(_resolve_int(region.byte_offset, self.bindings) for region in operands)
+        strides = tuple(
+            tuple(_resolve_int(stride, self.bindings) for stride in region.strides_bytes)
+            for region in operands
+        )
+        pending_writes = []
+        for repeat in range(destination.shape[0]):
+            for lane in range(elements_per_repeat):
+                if not (active_mask >> lane) & 1:
+                    continue
+                block, element = divmod(lane, elements_per_block)
+                regions = tuple(
+                    replace(
+                        region,
+                        shape=(1,),
+                        strides_bytes=(itemsize,),
+                        byte_offset=offset + repeat * stride[0]
+                        + block * stride[1] + element * stride[2],
+                    )
+                    for region, offset, stride in zip(operands, offsets, strides)
+                )
+                value = _BINARY_OPERATIONS[kind](
+                    self.read(regions[1], task_core_id=task.core_id),
+                    self.read(regions[2], task_core_id=task.core_id),
+                )
+                pending_writes.append((regions[0], value))
+        for region, value in pending_writes:
+            self.write(region, value, task_core_id=task.core_id)
+
     def _row_expand_binop(self, task: Task) -> None:
         destination = _operand(task, "dst")
         source = _operand(task, "src")
@@ -1357,7 +1416,9 @@ class FunctionalSimulator:
         source = _operand(task, "src")
         destination = _operand(task, "dst")
         values = self.read(source, task_core_id=task.core_id)
-        result = self.read(destination, task_core_id=task.core_id)
+        # Every destination element in this view is overwritten below. Reading
+        # it first falsely requires initialized UB, unlike BlockReduce itself.
+        result = np.empty(destination.shape, dtype=_numpy_dtype(destination.dtype))
         mask = _resolve_int(task.metadata.get("mask"), self.bindings)
         elements_per_block = _resolve_int(task.metadata.get("elements_per_block"), self.bindings)
         kind = task.metadata.get("reduce_kind")

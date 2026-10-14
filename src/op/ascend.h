@@ -282,6 +282,8 @@ TVM_DLL const Op &ascend_reduce_fold_max_experiment();
 
 TVM_DLL const Op &ascend_reduce_fold_sum_experiment();
 
+TVM_DLL const Op &ascend_binary_mask_experiment();
+
 TVM_DLL const Op &ascend_row_expand_mul_experiment();
 
 TVM_DLL const Op &ascend_row_expand_sub_experiment();

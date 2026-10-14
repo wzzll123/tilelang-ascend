@@ -1815,6 +1815,36 @@ CATLASS_DEVICE void reduce_fold_sum(LocalTensor<T> const &dst,
   AscendC::BlockReduceSum<T>(dst, brTmp, rows * 8 / 64, 64, 1, 1, 8);
 }
 
+template <typename T>
+CATLASS_DEVICE void
+max_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+         const LocalTensor<T> &src1, const uint64_t mask0, const uint64_t mask1,
+         const uint8_t repeatTime, const uint8_t dstBlkStride,
+         const uint8_t src0BlkStride, const uint8_t src1BlkStride,
+         const uint8_t dstRepStride, const uint8_t src0RepStride,
+         const uint8_t src1RepStride) {
+  uint64_t mask[2] = {mask0, mask1};
+  AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride, src1BlkStride,
+                                     dstRepStride, src0RepStride,
+                                     src1RepStride);
+  AscendC::Max<T, false>(dst, src0, src1, mask, repeatTime, params);
+}
+
+template <typename T>
+CATLASS_DEVICE void
+add_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+         const LocalTensor<T> &src1, const uint64_t mask0, const uint64_t mask1,
+         const uint8_t repeatTime, const uint8_t dstBlkStride,
+         const uint8_t src0BlkStride, const uint8_t src1BlkStride,
+         const uint8_t dstRepStride, const uint8_t src0RepStride,
+         const uint8_t src1RepStride) {
+  uint64_t mask[2] = {mask0, mask1};
+  AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride, src1BlkStride,
+                                     dstRepStride, src0RepStride,
+                                     src1RepStride);
+  AscendC::Add<T, false>(dst, src0, src1, mask, repeatTime, params);
+}
+
 // Strided masked exp for the narrow online-softmax window: exp only the `mask`
 // valid columns of each row, striding `srcRepStride`/`dstRepStride` 32B-blocks
 // between rows so one call touches just the [0:tw] window of a wider,

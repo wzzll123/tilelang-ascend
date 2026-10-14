@@ -59,10 +59,16 @@ private:
 //    log a warning or handle accordingly.
 struct GlobalMemChecker : public StmtExprVisitor {
 
-  GlobalMemChecker(arith::Analyzer *analyzer) : analyzer_(analyzer) {}
+  explicit GlobalMemChecker(arith::Analyzer *analyzer, bool check_loads = true)
+      : analyzer_(analyzer), check_loads_(check_loads) {}
   void VisitExpr_(const BufferLoadNode *op) final {
-    // Check if the buffer is in global scope
-    if (IsGlobalBuffer(op->buffer)) {
+    // Check if the buffer is in global scope.  When inspecting a BufferStore,
+    // the global loads inside its value are protected per-load by
+    // SafeMemorysRewriter::VisitExpr_(BufferLoadNode); collecting them here and
+    // hoisting their bounds onto the whole value would incorrectly intersect
+    // unrelated per-corner bounds (e.g. a GM gather with clamped indices).
+    // check_loads_ is therefore disabled on that path.
+    if (check_loads_ && IsGlobalBuffer(op->buffer)) {
       CheckBufferIndices(op->buffer, op->indices, /*is_load=*/true);
     }
     StmtExprVisitor::VisitExpr_(op);
@@ -132,6 +138,7 @@ struct GlobalMemChecker : public StmtExprVisitor {
 private:
   Array<PrimExpr> _conditions;
   arith::Analyzer *analyzer_;
+  bool check_loads_;
 };
 
 class SafeMemorysRewriter : public StmtExprMutator {
@@ -143,11 +150,47 @@ public:
       : annotated_padding_map_(annotated_padding_map), analyzer_(analyzer) {}
 
 private:
+  // Protect each global load with its own bounds check, rather than collecting
+  // every load's bounds and hoisting them onto the surrounding store value.
+  // The latter intersects unrelated bounds (e.g. the four corners of a GM
+  // gather), so a coordinate just outside the valid region would zero the whole
+  // interpolated value instead of a single corner.
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    auto load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    if (!IsGlobalBuffer(load->buffer) || inside_address_of_) {
+      return std::move(load);
+    }
+    GlobalMemChecker checker(analyzer_, /*check_loads=*/true);
+    checker(load);
+    Array<PrimExpr> conditions = checker.GetConditions();
+    if (conditions.empty()) {
+      return std::move(load);
+    }
+    PrimExpr value = load;
+    for (auto cond : conditions) {
+      value = if_then_else(cond, value, GetPadding(load->buffer));
+    }
+    return value;
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    // address_of requires a raw BufferLoad as its argument; don't wrap it in an
+    // if_then_else.  Such loads are guarded at the whole-call level by
+    // VisitStmt_(EvaluateNode) instead.
+    if (op->op.same_as(builtin::address_of())) {
+      inside_address_of_ = true;
+      auto result = StmtExprMutator::VisitExpr_(op);
+      inside_address_of_ = false;
+      return result;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     // Check if the buffer is in global scope
     auto store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
 
-    GlobalMemChecker checker(analyzer_);
+    GlobalMemChecker checker(analyzer_, /*check_loads=*/false);
     checker(store);
     Array<PrimExpr> conditions = checker.GetConditions();
 
@@ -253,6 +296,7 @@ private:
   }
 
   Map<Buffer, PrimExpr> annotated_padding_map_;
+  bool inside_address_of_ = false;
 };
 
 // Class to legalize safe memory access by transforming them appropriately

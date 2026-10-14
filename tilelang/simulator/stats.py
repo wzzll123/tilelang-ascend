@@ -135,7 +135,13 @@ class SimulationStats:
             hazard_counts[diagnostic.kind] = hazard_counts.get(diagnostic.kind, 0) + 1
         for record in record_list:
             resource = f"core-{record.core_id}/{record.resource}"
-            intervals.setdefault(resource, []).append((record.start_cycle, record.end_cycle))
+            # A dependency wait occupies time on the trace, not execution
+            # capacity on the named pipe. Keep it in makespan/wait totals,
+            # but do not report it as resource work.
+            if record.category == "operation":
+                intervals.setdefault(resource, []).append(
+                    (record.start_cycle, record.end_cycle)
+                )
             completion[record.core_id] = max(
                 completion.get(record.core_id, 0), record.end_cycle
             )

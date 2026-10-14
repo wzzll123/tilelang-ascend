@@ -746,6 +746,8 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_reduce_fold_max_experiment()) ||
              op->op.same_as(tl::ascend_reduce_fold_sum_experiment())) {
     ReduceFoldExperimentCodegen(op);
+  } else if (op->op.same_as(tl::ascend_binary_mask_experiment())) {
+    BinaryMaskExperimentCodegen(op);
   } else if (op->op.same_as(builtin::if_then_else())) {
     IfThenElseCodegen(op, os);
   } else {
@@ -3411,6 +3413,49 @@ void CodeGenTileLangAscend::ReduceFoldExperimentCodegen(const CallNode *op) {
   std::string op_name =
       "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
   PrintOpCall(op, op_name, {1, 5}, {5, 7});
+}
+
+// args = [name, dst, src0, src1, mask0, mask1, repeat,
+//         dst_blk, src0_blk, src1_blk, dst_rep, src0_rep, src1_rep]
+// —— 3 个 buffer 指针 + 9 个标量透传（通用跨步二元 op，op 名在 args[0]
+// 模板串里，对应 tl::ascend::{max,add,sub,mul,div}_mask<T>，
+// 即 AscendC::{Max,Add,Sub,Mul,Div}<T,false> + BinaryRepeatParams）。
+// mask 走 IntImm→uint64 hex 直印（PrintExpr 会把 2^64-1 打成 -1）。
+void CodeGenTileLangAscend::BinaryMaskExperimentCodegen(const CallNode *op) {
+  std::string op_name =
+      "tl::ascend::" + Downcast<StringImm>(op->args[0])->value;
+  this->PrintIndent();
+  this->stream << op_name << "(";
+  for (int i = 1; i <= 3; ++i) {
+    this->stream << PrintBufferOffset(op->args[i].as<CallNode>(), true)
+                 << ", ";
+  }
+  for (int i = 4; i <= 5; ++i) {
+    // mask 常量两种 TIR 形态：uint64 IntImm，或 tir.const(>2^63) 拆成的
+    // builtin::large_uint_imm(low32, high32) Call。
+    uint64_t mask = 0;
+    if (const auto *imm = op->args[i].as<IntImmNode>()) {
+      mask = static_cast<uint64_t>(imm->value);
+    } else if (const auto *call = op->args[i].as<CallNode>();
+               call && call->op.same_as(builtin::large_uint_imm())) {
+      ICHECK_EQ(call->args.size(), 2U);
+      uint64_t low =
+          static_cast<uint64_t>(Downcast<IntImm>(call->args[0])->value);
+      uint64_t high =
+          static_cast<uint64_t>(Downcast<IntImm>(call->args[1])->value);
+      mask = (high << 32U) | low;
+    } else {
+      LOG(FATAL) << "BinaryMaskExperimentCodegen: mask arg " << i
+                 << " must be a uint64 constant";
+    }
+    std::ostringstream oss;
+    oss << "0x" << std::hex << std::uppercase << mask;
+    this->stream << oss.str() << ", ";
+  }
+  for (int i = 6; i <= 11; ++i) {
+    this->stream << PrintExpr(op->args[i]) << ", ";
+  }
+  this->stream << PrintExpr(op->args[12]) << ");\n";
 }
 
 } // namespace codegen

@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any
 
 from .config import SimulatorConfig
 from .stats import SimulationStats
@@ -25,8 +26,9 @@ class PerformanceReport:
     """A compact schedule summary intended for people and automated consumers.
 
     The report deliberately summarizes an already-produced schedule.  It does
-    not claim a critical path or measured hardware timing when the selected
-    profile is an analytical PTO fallback.
+    not claim measured hardware timing when the selected profile is an
+    analytical PTO fallback. Its critical chain and resource pressure fields
+    are explicitly schedule-derived.
     """
 
     platform: str
@@ -45,7 +47,7 @@ class PerformanceReport:
         config: SimulatorConfig,
         *,
         trace_path: Path | None = None,
-    ) -> "PerformanceReport":
+    ) -> PerformanceReport:
         return cls(
             platform=config.platform,
             calibration=config.timing_profile.calibration,
@@ -62,11 +64,11 @@ class PerformanceReport:
     @classmethod
     def from_schedule(
         cls,
-        result: "ScheduleResult",
+        result: ScheduleResult,
         config: SimulatorConfig,
         *,
         trace_path: Path | None = None,
-    ) -> "PerformanceReport":
+    ) -> PerformanceReport:
         """Build a report with a critical chain from actual scheduler edges.
 
         This is deliberately a simulator-schedule chain, not a claim about a
@@ -180,6 +182,7 @@ class PerformanceReport:
                     if measured
                     else "analytical schedule estimate; not measured hardware latency"
                 ),
+                "coverage": self._timing_coverage(),
             },
             "schedule": self.stats.to_dict(),
             "top_resources": [
@@ -197,6 +200,7 @@ class PerformanceReport:
             "critical_path": dict(self.critical_path),
             "top_inactive_intervals": self._top_inactive_intervals(),
             "copy_compute_overlap": self._copy_compute_overlap(),
+            "resource_pressure": self._resource_pressure(),
             "trace_path": self.trace_path,
         }
 
@@ -205,6 +209,37 @@ class PerformanceReport:
         return tuple(
             record for record in self.schedule_records if record.category == "operation"
         )
+
+    def _timing_coverage(self) -> dict[str, Any]:
+        """Account for matched and fallback task costs without implying wall time."""
+        if not self.schedule_records:
+            return {
+                "status": "unavailable",
+                "reason": "a schedule result is required for per-task timing coverage",
+            }
+        by_source: dict[str, dict[str, int]] = {}
+        for record in self._operation_records():
+            source = record.metadata.get("timing_source")
+            if not isinstance(source, str) or not source:
+                source = "unattributed"
+            entry = by_source.setdefault(
+                source, {"task_count": 0, "task_cycles": 0, "cce_call_count": 0}
+            )
+            entry["task_count"] += 1
+            entry["task_cycles"] += record.duration_cycles
+            calls = record.metadata.get("cce_calls")
+            if isinstance(calls, (tuple, list)):
+                entry["cce_call_count"] += len(calls)
+        return {
+            "status": "schedule-derived",
+            "scope": (
+                "sum of operation task durations by timing source; overlapping "
+                "task cycles are not kernel makespan or hardware active time"
+            ),
+            "total_task_count": sum(entry["task_count"] for entry in by_source.values()),
+            "total_task_cycles": sum(entry["task_cycles"] for entry in by_source.values()),
+            "by_source": {source: by_source[source] for source in sorted(by_source)},
+        }
 
     def _top_inactive_intervals(self) -> list[dict[str, int]]:
         """Return largest core-level intervals without any operation running.
@@ -279,6 +314,140 @@ class PerformanceReport:
             "scope": "per-core union of copy and compute intervals; not a bandwidth estimate",
             "total_per_core_cycles": sum(item["cycles"] for item in by_core),
             "by_core": by_core[:5],
+        }
+
+    def _resource_pressure(self) -> dict[str, Any]:
+        """Rank resources by FIFO queueing first, then busy utilization.
+
+        Queue delay is summed per task (not unioned): it measures how much task
+        delay this resource contributed in this schedule. It is not a claim
+        about hardware queue depth or physical saturation.
+        """
+        pressure: dict[str, dict[str, int]] = {}
+        for record in self._operation_records():
+            resource = f"core-{record.core_id}/{record.resource}"
+            entry = pressure.setdefault(
+                resource, {"operation_count": 0, "fifo_queued_task_cycles": 0}
+            )
+            entry["operation_count"] += 1
+            queued_at = record.metadata.get("queue_enter_cycle")
+            if isinstance(queued_at, int) and queued_at < record.start_cycle:
+                entry["fifo_queued_task_cycles"] += record.start_cycle - queued_at
+        resources = [
+            {
+                "resource": resource,
+                "busy_cycles": self.stats.busy_cycles_by_resource.get(resource, 0),
+                "utilization": self.stats.utilization_by_resource.get(resource, 0.0),
+                "operation_count": entry["operation_count"],
+                "fifo_queued_task_cycles": entry["fifo_queued_task_cycles"],
+            }
+            for resource, entry in pressure.items()
+        ]
+        resources.sort(
+            key=lambda item: (
+                -item["fifo_queued_task_cycles"],
+                -item["utilization"],
+                item["resource"],
+            )
+        )
+        return {
+            "scope": (
+                "schedule-derived FIFO queued task-cycles then utilization; "
+                "not physical queue depth or hardware saturation"
+            ),
+            "top_resources": resources[:5],
+        }
+
+    @staticmethod
+    def compare(
+        baseline: PerformanceReport, candidate: PerformanceReport
+    ) -> dict[str, Any]:
+        """Return a compact, schedule-derived comparison of two reports.
+
+        ``candidate - baseline`` is used consistently for deltas. Both reports
+        must describe the same platform: comparing A2 to A3 schedules has no
+        stable interpretation without a separate normalization model.
+        """
+        if baseline.platform != candidate.platform:
+            raise ValueError(
+                "cannot compare simulator reports from different platforms: "
+                f"{baseline.platform} != {candidate.platform}"
+            )
+        baseline_document = baseline.to_dict()
+        candidate_document = candidate.to_dict()
+        baseline_schedule = baseline_document["schedule"]
+        candidate_schedule = candidate_document["schedule"]
+        baseline_makespan = int(baseline_schedule["makespan_cycles"])
+        candidate_makespan = int(candidate_schedule["makespan_cycles"])
+        makespan_delta = candidate_makespan - baseline_makespan
+
+        baseline_utilization = baseline_schedule["utilization_by_resource"]
+        candidate_utilization = candidate_schedule["utilization_by_resource"]
+        resource_changes = []
+        for resource in sorted(set(baseline_utilization) | set(candidate_utilization)):
+            before = float(baseline_utilization.get(resource, 0.0))
+            after = float(candidate_utilization.get(resource, 0.0))
+            resource_changes.append(
+                {
+                    "resource": resource,
+                    "baseline_utilization": before,
+                    "candidate_utilization": after,
+                    "delta": after - before,
+                }
+            )
+        resource_changes.sort(
+            key=lambda item: (-abs(item["delta"]), item["resource"])
+        )
+
+        baseline_waits = baseline_schedule["wait_cycles_by_reason"]
+        candidate_waits = candidate_schedule["wait_cycles_by_reason"]
+        wait_changes = []
+        for reason in sorted(set(baseline_waits) | set(candidate_waits)):
+            before = int(baseline_waits.get(reason, 0))
+            after = int(candidate_waits.get(reason, 0))
+            wait_changes.append(
+                {
+                    "reason": reason,
+                    "baseline_cycles": before,
+                    "candidate_cycles": after,
+                    "delta_cycles": after - before,
+                }
+            )
+        wait_changes.sort(key=lambda item: (-abs(item["delta_cycles"]), item["reason"]))
+
+        return {
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "scope": (
+                "comparison of simulator schedules; candidate minus baseline; "
+                "not a measured hardware-performance comparison"
+            ),
+            "platform": candidate.platform,
+            "timing_comparable": (
+                baseline.calibration == candidate.calibration
+                and baseline.timing_estimator == candidate.timing_estimator
+            ),
+            "makespan_cycles": {
+                "baseline": baseline_makespan,
+                "candidate": candidate_makespan,
+                "delta": makespan_delta,
+                "ratio": (
+                    None if baseline_makespan == 0 else candidate_makespan / baseline_makespan
+                ),
+            },
+            "critical_chain_span_cycles": {
+                "baseline": baseline_document["critical_path"].get("span_cycles"),
+                "candidate": candidate_document["critical_path"].get("span_cycles"),
+            },
+            "copy_compute_overlap_per_core_cycles": {
+                "baseline": baseline_document["copy_compute_overlap"]["total_per_core_cycles"],
+                "candidate": candidate_document["copy_compute_overlap"]["total_per_core_cycles"],
+                "delta": (
+                    candidate_document["copy_compute_overlap"]["total_per_core_cycles"]
+                    - baseline_document["copy_compute_overlap"]["total_per_core_cycles"]
+                ),
+            },
+            "top_resource_utilization_changes": resource_changes[:5],
+            "top_wait_cycle_changes": wait_changes[:5],
         }
 
     @staticmethod

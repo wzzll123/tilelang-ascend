@@ -52,6 +52,7 @@ _VECTOR_OPS = frozenset(
         "block_reduce_min",
         "block_reduce_sum",
         "broadcast",
+        "binary_mask_experiment",
         "brcb_experiment",
         "cast",
         "clamp",
@@ -198,6 +199,8 @@ def classify_operation(operation: str, lane: Lane) -> tuple[Lane, Pipe, str]:
         "reinterpretcast",
     }:
         return lane, Pipe.SCALAR, short
+    if short == "init_const_value":
+        return Lane.CUBE, Pipe.MTE2, short
     if "im2col" in short:
         return Lane.CUBE, Pipe.MTE1, short
     if "gemm" in short or short in {"mma", "mma_bias"}:
@@ -299,6 +302,276 @@ def build_kernel_program(
     return bridge.build(func_or_mod)
 
 
+_FA19_COPY_ORDER = (
+    ("q", 0, 0),
+    ("k", 0, 0), ("k", 1, 1), ("k", 2, 0),
+    ("v", 0, 0), ("k", 3, 1), ("v", 1, 1),
+    ("p", 0, 0), ("v", 2, 0), ("k", 4, 0),
+    ("p", 1, 1), ("v", 3, 1), ("k", 5, 1),
+    ("p", 2, 2), ("v", 4, 0), ("p", 0, 0),
+    ("v", 5, 1), ("p", 1, 1), ("p", 2, 2),
+)
+_FA13_COPY_ORDER = (
+    ("q", 0, 0),
+    ("k", 0, 0), ("k", 1, 1), ("k", 2, 0),
+    ("v", 0, 0), ("k", 3, 1), ("v", 1, 1),
+    ("p", 0, 0), ("v", 2, 0), ("p", 1, 1),
+    ("v", 3, 1), ("p", 2, 2), ("p", 0, 0),
+)
+_FA7_COPY_ORDER = (
+    ("q", 0, 0), ("k", 0, 0), ("k", 1, 1),
+    ("v", 0, 0), ("v", 1, 1), ("p", 0, 0), ("p", 1, 1),
+)
+_FA19_MTE2_EXTRA_CYCLES = 301
+_FA13_MTE2_EXTRA_CYCLES = 329
+_FA7_MTE2_EXTRA_CYCLES = 380
+
+
+def _calibrate_fa_gm_l1_copies(
+    tasks_by_core: Mapping[int, list[Task]], profile: TimingProfile
+) -> None:
+    """Apply a whole-pattern A3 active-time analogue to FA-order zN copies.
+
+    The 19-copy increment uses 64/128 FP16 controls and a 96 holdout. The
+    7/13-copy increments use independent 128x128 ring-copy controls; full
+    FA KV256/KV512 are holdouts. These distribute an *aggregate* PMU excess
+    over exact-pattern tasks, not an isolated DataCopy latency.
+    """
+    if (
+        profile.estimator != "pto-cce-mock"
+        or profile.platform != "A3"
+        or "copy_gm_to_l1" in profile.operation_cycles
+    ):
+        return
+    for core_id, tasks in tasks_by_core.items():
+        positions = [
+            index for index, task in enumerate(tasks)
+            if task.operation in {"copy_gm_to_l1", "copy_gm_to_l1_linear"}
+        ]
+        if len(positions) == len(_FA19_COPY_ORDER):
+            order = _FA19_COPY_ORDER
+            extra_cycles = _FA19_MTE2_EXTRA_CYCLES
+            pattern_name = "fa19"
+        elif len(positions) == len(_FA13_COPY_ORDER):
+            order = _FA13_COPY_ORDER
+            extra_cycles = _FA13_MTE2_EXTRA_CYCLES
+            pattern_name = "fa13"
+        elif len(positions) == len(_FA7_COPY_ORDER):
+            order = _FA7_COPY_ORDER
+            extra_cycles = _FA7_MTE2_EXTRA_CYCLES
+            pattern_name = "fa7"
+        else:
+            continue
+        copies = [tasks[index] for index in positions]
+        first_copy = copies[0].metadata.get("copy")
+        size = first_copy.get("valid_rows") if isinstance(first_copy, Mapping) else None
+        if (pattern_name == "fa19" and size not in {64, 96, 128}) or (
+            pattern_name in {"fa7", "fa13"} and size != 128
+        ):
+            continue
+        tile_bytes = size * size * 2
+        source_buffers: dict[str, str] = {}
+        destination_buffers: dict[str, str] = {}
+        source_bases: dict[str, int] = {}
+        destination_bases: dict[str, int] = {}
+        for task, (role, source_tile, destination_slot) in zip(
+            copies, order, strict=True
+        ):
+            metadata = task.metadata
+            source, destination = metadata.get("src"), metadata.get("dst")
+            details, helper = metadata.get("copy"), metadata.get("copy_helper")
+            calls = metadata.get("cce_calls")
+            if (
+                task.operation != "copy_gm_to_l1"
+                or task.core_id != core_id
+                or task.lane is not Lane.CUBE
+                or task.pipe is not Pipe.MTE2
+                or metadata.get("timing_source") != "pto-cce-mock"
+                or metadata.get("dynamic_predicates")
+                or not isinstance(details, Mapping)
+                or not isinstance(helper, Mapping)
+                or details.get("layout") != "zN"
+                or any(details.get(key) != size for key in (
+                    "valid_rows", "valid_cols", "source_cols",
+                    "physical_rows", "physical_cols"
+                ))
+                or details.get("need_clear") is not False
+                or helper.get("helper_clear") is not False
+                or not isinstance(source, BufferRegion)
+                or not isinstance(destination, BufferRegion)
+                or source.scope is not MemoryScope.GM
+                or destination.scope is not MemoryScope.L1
+                or source.shape != (size, size)
+                or source.strides_bytes != (size * 2, 2)
+                or destination.shape != (size * size,)
+                or destination.strides_bytes is not None
+                or source.dtype != "float16"
+                or destination.dtype != "float16"
+                or source.core_id is not None
+                or destination.core_id != core_id
+                or not isinstance(source.byte_offset, int)
+                or not isinstance(destination.byte_offset, int)
+                or not isinstance(calls, tuple)
+                or len(calls) != 1
+                or calls[0].get("name") != "copy_gm_to_cbuf_multi_nd2nz_b16"
+                or calls[0].get("cycles") != task.duration_cycles
+            ):
+                break
+            if role in source_buffers:
+                if (
+                    source.buffer != source_buffers[role]
+                    or destination.buffer != destination_buffers[role]
+                ):
+                    break
+            else:
+                if (source.buffer in source_buffers.values()
+                        or destination.buffer in destination_buffers.values()):
+                    break
+                source_buffers[role] = source.buffer
+                destination_buffers[role] = destination.buffer
+                source_bases[role] = source.byte_offset
+                destination_bases[role] = destination.byte_offset
+                if source.byte_offset % tile_bytes or destination.byte_offset % tile_bytes:
+                    break
+            if (
+                source.byte_offset != source_bases[role] + source_tile * tile_bytes
+                or destination.byte_offset
+                != destination_bases[role] + destination_slot * tile_bytes
+            ):
+                break
+        else:
+            # All conditions were checked before changing any frozen Task.
+            for ordinal, position in enumerate(positions):
+                task = tasks[position]
+                original_call = task.metadata["cce_calls"][0]
+                calibrated_cycles = task.duration_cycles + extra_cycles
+                call = {
+                    "name": f"{pattern_name}_zn_gm_to_l1_a3_calibrated_analogue",
+                    "pipe": "mte2",
+                    "cycles": calibrated_cycles,
+                    "args": {
+                        **original_call["args"],
+                        "pto_cce_cycles": original_call["cycles"],
+                        "pattern": f"{pattern_name}-qkvp-ring",
+                        "ordinal": ordinal,
+                        "basis": "A3 PMU MTE2 active-time aggregate, distributed heuristic",
+                    },
+                }
+                tasks[position] = replace(
+                    task,
+                    duration_cycles=calibrated_cycles,
+                    metadata={
+                        **task.metadata,
+                        "timing_source": "a3-hardware-calibrated",
+                        f"{pattern_name}_copy_ordinal": ordinal,
+                        "cce_calls": (call,),
+                    },
+                )
+
+
+def _calibrate_fa_row_div_pairs(
+    tasks_by_core: Mapping[int, list[Task]], profile: TimingProfile
+) -> None:
+    """Split measured aggregate Vector work over an exact two-window Div pair.
+
+    The A3 control executes left/right FP32 windows of a [64,128] tile without
+    an intervening barrier. Count 1/6 PMU differences give 491 hardware cycles
+    per pair at 1.8 GHz. The 245/246 split is bookkeeping, NOT measured
+    individual instruction latency or a real intermediate completion timestamp.
+    """
+    operation = "row_expand_div_experiment"
+    if (
+        profile.estimator != "pto-cce-mock" or profile.platform != "A3"
+        or operation in profile.operation_cycles
+    ):
+        return
+    for core_id, tasks in tasks_by_core.items():
+        for position in range(len(tasks) - 1):
+            pair = tasks[position:position + 2]
+            # Require immediate source-task adjacency, not only Vector FIFO
+            # adjacency: an intervening MTE3 reader could observe one half.
+            if any(
+                task.operation != operation or task.core_id != core_id
+                or task.lane not in {Lane.VECTOR_0, Lane.VECTOR_1}
+                or task.pipe is not Pipe.VECTOR or task.duration_cycles != 550
+                or task.metadata.get("timing_source") != "pto-cce-mock"
+                or task.metadata.get("dynamic_predicates")
+                or task.metadata.get("scratch") is not None
+                or task.metadata.get("lowered_operation")
+                != "tl.ascend_row_expand_div_experiment"
+                or task.metadata.get("row_expand") != {"rows": 64, "row_elements": 64}
+                for task in pair
+            ) or pair[0].lane is not pair[1].lane:
+                continue
+            accepted = True
+            regions = []
+            for task in pair:
+                source, destination, packed = (
+                    task.metadata.get("src"), task.metadata.get("dst"),
+                    task.metadata.get("scalar_src"),
+                )
+                calls = task.metadata.get("cce_calls")
+                if (
+                    not all(isinstance(region, BufferRegion)
+                            for region in (source, destination, packed))
+                    or source != destination
+                    or any(
+                        region.scope is not MemoryScope.UB or region.dtype != "float32"
+                        or region.core_id != core_id
+                        or type(region.byte_offset) is not int or region.byte_offset % 32
+                        for region in (source, packed)
+                    )
+                    or source.shape != (64, 64) or source.strides_bytes != (512, 4)
+                    or packed.shape != (512,) or packed.strides_bytes is not None
+                    or source.buffer == packed.buffer
+                    or not isinstance(calls, tuple) or len(calls) != 1
+                    or calls[0].get("name") != "vdiv" or calls[0].get("pipe") != "v"
+                    or calls[0].get("cycles") != 550
+                ):
+                    accepted = False
+                    break
+                args = calls[0].get("args")
+                if not isinstance(args, Mapping) or any(
+                    args.get(key) != value for key, value in {
+                        "repeat": 64, "mask": ((1 << 64) - 1, 0),
+                        "block_strides": (1, 1, 0), "repeat_strides": (16, 16, 1),
+                        "dtype": "float32", "helper_form": "explicit_bitmask_no_tmp",
+                    }.items()
+                ):
+                    accepted = False
+                    break
+                regions.append((source, packed))
+            if not accepted:
+                continue
+            left, right = regions[0][0], regions[1][0]
+            if (
+                left.buffer != right.buffer or left.byte_offset % 32768
+                or right.byte_offset != left.byte_offset + 256
+                or regions[0][1] != regions[1][1]
+            ):
+                continue
+            for ordinal, cycles in enumerate((245, 246)):
+                task = pair[ordinal]
+                original_call = task.metadata["cce_calls"][0]
+                call = {
+                    "name": "fa_row_div_pair_a3_calibrated_analogue",
+                    "pipe": "v", "cycles": cycles,
+                    "args": {
+                        **original_call["args"], "pto_cce_cycles": 550,
+                        "pair_hardware_cycles": 491, "pair_clock_hz": 1_800_000_000,
+                        "pair_task_ids": (pair[0].task_id, pair[1].task_id),
+                        "pair_ordinal": ordinal,
+                        "basis": "A3 PMU Vector active-time difference, aggregate pair split",
+                        "not_individual_call_latency": True,
+                    },
+                }
+                tasks[position + ordinal] = replace(
+                    task, duration_cycles=cycles,
+                    metadata={**task.metadata, "timing_source": "a3-hardware-calibrated",
+                              "cce_calls": (call,)},
+                )
+
+
 class _LoopBreak(Exception):
     """Internal control-flow signal for the lowered ``tl.loop_break`` intrinsic."""
 
@@ -321,6 +594,10 @@ class _TirBridge:
         self.timing_profile = timing_profile
         self.max_unrolled_iterations = max_unrolled_iterations
         self.tasks: dict[int, list[Task]] = defaultdict(list)
+        # Diagnostic logical GM source history for the guarded A3 PTO copy
+        # path. This does not infer physical cache hits or change durations.
+        self._gm_l1_seen_offsets: dict[tuple[int, Lane, Pipe, str], set[int]] = defaultdict(set)
+        self._gm_l1_last_offset: dict[tuple[int, Lane, Pipe, str], int] = {}
         self.buffers: dict[str, BufferSpec] = {}
         self.buffer_name_by_data_var: dict[str, str] = {}
         self.storage_scope_by_var: dict[str, MemoryScope] = {}
@@ -375,6 +652,8 @@ class _TirBridge:
         self._collect_parameter_buffers(func)
         self._visit(func.body, _Context())
         self._validate_unit_flag_pairs()
+        _calibrate_fa_gm_l1_copies(self.tasks, self.timing_profile)
+        _calibrate_fa_row_div_pairs(self.tasks, self.timing_profile)
         cores = tuple(CoreProgram(core_id, tuple(self.tasks[core_id])) for core_id in sorted(self.tasks))
         if not cores:
             cores = (CoreProgram(0),)
@@ -690,6 +969,12 @@ class _TirBridge:
             )
         else:
             tail_kind = None
+        if _short_operation(operation) in {
+            "brcb_experiment", "row_expand_mul_experiment", "row_expand_div_experiment"
+        }:
+            # Keep raw helper provenance for strict literal CCE timing guards.
+            # This diagnostic field does not change default timing or execution.
+            metadata["lowered_operation"] = lowered_operation
         metadata.update(self._functional_metadata(operation, arguments, context, tail_kind=tail_kind))
         metadata.update(self._sync_metadata(operation, arguments, context))
         span = getattr(call, "span", None)
@@ -698,8 +983,23 @@ class _TirBridge:
         if _short_operation(operation) == "gemm_v0" and (
             metadata.get("gemm", {}).get("step_count", 1) > 1
             or metadata.get("gemm", {}).get("n_actual") != metadata.get("gemm", {}).get("cols")
+            or self.timing_profile.estimator == "pto-cce-mock"
         ):
             self._emit_gemm_v0_trace_tasks(operation, context, metadata)
+            return
+        if (
+            self.timing_profile.estimator == "pto-cce-mock"
+            and _short_operation(operation) == "copy_gm_to_l1"
+            and metadata.get("copy_helper", {}).get("helper_clear") is True
+        ):
+            self._emit_gm_to_l1_clear_trace_tasks(operation, context, metadata)
+            return
+        if (
+            self.timing_profile.estimator == "pto-cce-mock"
+            and _short_operation(operation) == "copy_gm_to_ub"
+            and self._is_padded_gm_to_ub_duplicate(metadata)
+        ):
+            self._emit_padded_gm_to_ub_trace_tasks(operation, context, metadata)
             return
         self._emit_task(operation, context, metadata=metadata)
         if _short_operation(operation) == "reinterpretcast":
@@ -710,6 +1010,99 @@ class _TirBridge:
                 self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
                 self.region_overlap_cache.clear()
                 self.memory_history_candidate_key_cache.clear()
+
+    def _emit_gm_to_l1_clear_trace_tasks(
+        self, operation: str, context: _Context, metadata: Mapping[str, Any]
+    ) -> None:
+        """Expose common.h's InitConstValue -> MTE2 barrier -> data copy.
+
+        The original copy retains functional zero-fill/copy behavior. The
+        extra clear task only reserves MTE2 time and makes its order visible.
+        Neither the clear nor the barrier has a calibrated instruction cost.
+        """
+        destination = metadata["dst"]
+        physical_elements = metadata["copy_helper"]["physical_elements"]
+        self._emit_task(
+            "init_const_value", context,
+            metadata={
+                "copy_helper_phase": "l1_clear",
+                "trace_only": True,
+                "dst": destination,
+                "transfer_bytes": physical_elements * dtype_size_bytes(destination.dtype),
+            },
+        )
+        self._emit_task(
+            "pipe_barrier", replace(context, lane=Lane.CUBE),
+            metadata={"copy_helper_phase": "l1_clear_barrier", "target_pipe": "mte2"},
+        )
+        self._emit_task(
+            operation, context,
+            metadata={**metadata, "copy_helper_phase": "data_copy_after_l1_clear"},
+        )
+
+    @staticmethod
+    def _is_padded_gm_to_ub_duplicate(metadata: Mapping[str, Any]) -> bool:
+        """Recognize common.h's zero-left-pad Duplicate -> DataCopyPad branch."""
+        details = metadata.get("copy")
+        helper = metadata.get("copy_helper")
+        destination = metadata.get("pad_dst") or metadata.get("dst")
+        if not isinstance(details, Mapping) or not isinstance(helper, Mapping):
+            return False
+        if not isinstance(destination, BufferRegion) or helper.get("left_pad") != 0:
+            return False
+        if destination.dtype not in {
+            "float16", "bfloat16", "float32", "int16", "uint16", "int32", "uint32"
+        }:
+            return False
+        rows, cols = details.get("valid_rows"), details.get("valid_cols")
+        physical_rows, physical_cols = details.get("physical_rows"), details.get("physical_cols")
+        return (
+            all(isinstance(value, int) and value > 0
+                for value in (rows, cols, physical_rows, physical_cols))
+            and (rows != physical_rows or cols != physical_cols)
+            and isinstance(details.get("pad_value"), (bool, int, float))
+        )
+
+    def _emit_padded_gm_to_ub_trace_tasks(
+        self, operation: str, context: _Context, metadata: Mapping[str, Any]
+    ) -> None:
+        """Expose the helper's V fill and MTE2 transfer as separate tasks.
+
+        The original copy task retains the functional fill+copy semantics;
+        the trace-only Duplicate only reserves Vector time.  Helper flags
+        preserve the actual MTE2/MTE3 -> V -> MTE2 order.
+        """
+        helper_metadata = {"copy_helper_sync": True}
+        for source_pipe in ("mte2", "mte3"):
+            for kind in ("set_flag", "wait_flag"):
+                self._emit_task(
+                    kind, context,
+                    metadata={**helper_metadata, "src_pipe": source_pipe,
+                              "dst_pipe": "v", "flag_id": 0},
+                )
+        pad_destination = metadata.get("pad_dst") or metadata["dst"]
+        self._emit_task(
+            "duplicate", context,
+            metadata={
+                "copy_helper_phase": "pad_duplicate",
+                "trace_only": True,
+                "dst": pad_destination,
+                "transfer_bytes": (
+                    metadata["copy"]["physical_rows"]
+                    * metadata["copy"]["physical_cols"]
+                    * dtype_size_bytes(pad_destination.dtype)
+                ),
+            },
+        )
+        for kind in ("set_flag", "wait_flag"):
+            self._emit_task(
+                kind, context,
+                metadata={**helper_metadata, "src_pipe": "v",
+                          "dst_pipe": "mte2", "flag_id": 0},
+            )
+        self._emit_task(operation, context, metadata={
+            **metadata, "copy_helper_phase": "data_copy_pad"
+        })
 
     def _emit_gemm_v0_trace_tasks(self, _operation: str, context: _Context, metadata: Mapping[str, Any]) -> None:
         details = metadata["gemm"]
@@ -765,6 +1158,30 @@ class _TirBridge:
                 cursor += width
             return tuple(regions)
 
+        expand_sync = self.timing_profile.estimator == "pto-cce-mock"
+
+        def helper_flag(kind: str, source_pipe: str, destination_pipe: str, flag_id: int) -> None:
+            self._emit_task(
+                kind,
+                context,
+                metadata={
+                    "gemm_helper_sync": True,
+                    "src_pipe": source_pipe,
+                    "dst_pipe": destination_pipe,
+                    "flag_id": flag_id,
+                },
+            )
+
+        if expand_sync:
+            # common.h::gemm_v0 primes GM/L1 and the two ping-pong slots.
+            helper_flag("set_flag", "mte2", "mte1", 0)
+            helper_flag("wait_flag", "mte2", "mte1", 0)
+            helper_flag("set_flag", "fix", "m", 0)
+            helper_flag("wait_flag", "fix", "m", 0)
+            for slot in range(2):
+                helper_flag("set_flag", "m", "mte1", slot)
+
+        mma_tasks: list[Task] = []
         for step in range(step_count):
             n_index, k_index = divmod(step, k_split)
             slot = step % 2
@@ -813,10 +1230,20 @@ class _TirBridge:
                 a_source_metadata["src_regions"] = a_regions
             if len(b_regions) > 1:
                 b_source_metadata["src_regions"] = b_regions
+            if expand_sync:
+                helper_flag("wait_flag", "m", "mte1", slot)
             reuse_event = {"wait_event": "M_MTE1"} if step >= 2 else {}
+            # The helper's WaitFlag<M_MTE1>(slot) prevents MTE1 from
+            # overwriting the ping-pong slot until the MMA two steps earlier
+            # has finished consuming it. This is a real hardware edge, not
+            # an inferred memory hazard.
+            reuse_dependencies = (
+                (mma_tasks[step - 2].task_id,) if expand_sync and step >= 2 else ()
+            )
             load_a = self._emit_task(
                 "copy_l1_to_l0a",
                 context,
+                extra_dependencies=reuse_dependencies,
                 metadata={
                     **stage,
                     "timing_key": "gemm_v0.load_a",
@@ -841,6 +1268,7 @@ class _TirBridge:
             load_b = self._emit_task(
                 "copy_l1_to_l0b",
                 context,
+                extra_dependencies=reuse_dependencies,
                 metadata={
                     **stage,
                     "timing_key": "gemm_v0.load_b",
@@ -862,6 +1290,13 @@ class _TirBridge:
                     },
                 },
             )
+            if expand_sync:
+                helper_flag("set_flag", "mte1", "m", slot)
+                helper_flag("wait_flag", "mte1", "m", slot)
+                self._emit_task(
+                    "pipe_barrier", context,
+                    metadata={"gemm_helper_sync": True, "target_pipe": "m"},
+                )
             c_offset = metadata["dst"].byte_offset + (n_start * ((details["rows"] + 15) // 16 * 16) * accumulator_bytes)
             l0c = replace(
                 metadata["dst"],
@@ -897,12 +1332,23 @@ class _TirBridge:
             }
             if not initialize:
                 mma_metadata["accumulator"] = l0c
-            self._emit_task(
+            mma_tasks.append(self._emit_task(
                 "mma",
                 context,
                 metadata=mma_metadata,
                 extra_dependencies=(load_a.task_id, load_b.task_id),
-            )
+            ))
+            if expand_sync:
+                helper_flag("set_flag", "m", "mte1", slot)
+
+        if expand_sync:
+            # Drain both L0 slots and expose the finished accumulator to FIX.
+            for slot in range(2):
+                helper_flag("wait_flag", "m", "mte1", slot)
+            helper_flag("set_flag", "mte1", "mte2", 0)
+            helper_flag("wait_flag", "mte1", "mte2", 0)
+            helper_flag("set_flag", "m", "fix", 0)
+            helper_flag("wait_flag", "m", "fix", 0)
 
     def _functional_metadata(
         self,
@@ -931,7 +1377,19 @@ class _TirBridge:
             "leaky_relu",
             "mins_experiment",
         }:
-            return self._scalar_metadata(arguments, context, tail=tail_kind is not None)
+            metadata = self._scalar_metadata(arguments, context, tail=tail_kind is not None)
+            if short == "muls" and tail_kind is None and len(arguments) == 4:
+                count = self._runtime_int(arguments[3], context.environment)
+                if (
+                    isinstance(count, int)
+                    and count > 0
+                    and getattr(metadata.get("dst"), "shape", None) == (count,)
+                    and getattr(metadata.get("lhs"), "shape", None) == (count,)
+                ):
+                    # The four-argument TileLang helper uses CANN's count-mask
+                    # overload, not a repeat-count vmuls call.
+                    metadata["scalar_helper"] = {"form": "count_mask", "count": count}
+            return metadata
         if short == "axpy":
             metadata = self._scalar_metadata(arguments, context, tail=False)
             if isinstance(metadata.get("dst"), BufferRegion):
@@ -1046,6 +1504,8 @@ class _TirBridge:
             return self._ub_to_l1_metadata(normalized, arguments, context)
         if short == "brcb_experiment":
             return self._brcb_metadata(arguments, context)
+        if short == "binary_mask_experiment":
+            return self._binary_mask_metadata(arguments, context)
         if short in {
             "row_expand_mul_experiment",
             "row_expand_sub_experiment",
@@ -1070,6 +1530,7 @@ class _TirBridge:
             return {}
         if len(arguments) < 3:
             return {}
+        copy_helper_left_pad = None
         if len(arguments) >= 5:
             valid_rows = self._runtime_int(arguments[3], context.environment)
             valid_cols = self._runtime_int(arguments[4], context.environment)
@@ -1089,6 +1550,19 @@ class _TirBridge:
             # region so poison tracking marks the real strided rows.
             gm_row_stride = self._runtime_int(arguments[2], context.environment)
             gm_to_ub = "copy_gm_to_ub" in normalized
+            if gm_to_ub:
+                template_start = normalized.find("<")
+                template_end = normalized.rfind(">")
+                if 0 <= template_start < template_end:
+                    template_args = normalized[template_start + 1:template_end]
+                    physical_dims = 2 if template_args.count(",") >= 2 else 1
+                    no_left_pad_args = 6 + physical_dims
+                    if len(arguments) == no_left_pad_args:
+                        copy_helper_left_pad = 0
+                    elif len(arguments) == no_left_pad_args + 1:
+                        copy_helper_left_pad = self._runtime_int(
+                            arguments[-1], context.environment
+                        )
             legacy_ub_to_gm = not gm_to_ub and len(arguments) >= 8
             if (gm_to_ub or legacy_ub_to_gm) and len(arguments) > 5:
                 details["pad_value"] = self._literal(self.analyzer.simplify(arguments[5]))
@@ -1141,6 +1615,8 @@ class _TirBridge:
         if source is None or destination is None:
             return {}
         metadata = {"src": source, "dst": destination, "copy": details}
+        if copy_helper_left_pad is not None:
+            metadata["copy_helper"] = {"left_pad": copy_helper_left_pad}
         if "copy_gm_to_ub" in normalized and "pad_value" in details and "physical_rows" in details:
             pad_destination = self._access_buffer_region(
                 arguments[1],
@@ -1269,9 +1745,17 @@ class _TirBridge:
         if destination.byte_offset % tile_bytes == 0:
             if destination_size is not None and (destination.byte_offset + tile_bytes > destination_size):
                 raise ProgramValidationError("GM-to-L1 zN physical tile exceeds the destination buffer")
+            helper_clear = (
+                valid_rows != physical_rows
+                or valid_cols != physical_cols
+                or physical_elements != physical_rows * physical_cols
+            )
             return {
                 "src": source,
                 "dst": destination,
+                **({"copy_helper": {
+                    "helper_clear": helper_clear, "physical_elements": physical_elements,
+                }} if self.timing_profile.estimator == "pto-cce-mock" else {}),
                 "copy": {
                     "layout": "zN",
                     "valid_rows": valid_rows,
@@ -1305,6 +1789,9 @@ class _TirBridge:
             return {
                 "src": source,
                 "dst_regions": written_regions,
+                **({"copy_helper": {
+                    "helper_clear": False, "physical_elements": physical_elements,
+                }} if self.timing_profile.estimator == "pto-cce-mock" else {}),
                 "copy": {
                     "layout": "zN",
                     "valid_rows": valid_rows,
@@ -1336,6 +1823,9 @@ class _TirBridge:
         return {
             "src": source,
             "dst_regions": written_regions,
+            **({"copy_helper": {
+                "helper_clear": False, "physical_elements": physical_elements,
+            }} if self.timing_profile.estimator == "pto-cce-mock" else {}),
             "copy": {
                 "layout": "zN",
                 "valid_rows": valid_rows,
@@ -1560,6 +2050,98 @@ class _TirBridge:
                 "blk_stride": blk_stride,
                 "rep_stride": rep_stride,
             },
+        }
+
+    def _binary_mask_metadata(
+        self,
+        arguments: tuple[Any, ...],
+        context: _Context,
+    ) -> dict[str, Any]:
+        # Final ABI: template("{op}_mask<{dtype}>"), dst, src0, src1,
+        # mask0, mask1, repeat, dst_blk, src0_blk, src1_blk,
+        # dst_rep, src0_rep, src1_rep —— 通用跨步二元 op
+        # (AscendC::{Max,Add,Sub,Mul,Div}<T,false> + BinaryRepeatParams)。
+        # 每个 repeat 处理 8 个 32B block，block j 偏移 j*blk_stride，
+        # repeat i 基址 i*rep_stride；三个操作数 stride 独立。
+        if len(arguments) != 13:
+            raise UnsupportedSimOpError(
+                "functional binary_mask_experiment requires the thirteen-argument "
+                "(template, dst, src0, src1, mask0, mask1, repeat, 6 strides) ABI"
+            )
+        template = self._literal(arguments[0])
+        if not isinstance(template, str) or "<" not in template or not template.endswith(">"):
+            raise ProgramValidationError("binary_mask_experiment template must be {op}_mask<dtype>")
+        tag_head, tag_dtype_str = template.split("<", 1)
+        binary_kind = tag_head.removesuffix("_mask")
+        if binary_kind not in {"max", "add", "sub", "mul", "div"}:
+            raise ProgramValidationError(f"binary_mask_experiment unsupported op tag: {tag_head!r}")
+        template_dtype = _ascend_template_dtype(tag_dtype_str[:-1].strip())
+
+        def mask_word(value: Any) -> int:
+            # TVM represents uint64 values above 2^63-1 as
+            # tir.large_uint_imm(low32, high32), while smaller values are
+            # IntImm. Match the native codegen's two accepted forms.
+            if (isinstance(value, self.tir.Call)
+                    and str(value.op.name) == "tir.large_uint_imm"):
+                if len(value.args) != 2:
+                    raise ProgramValidationError("binary mask large_uint_imm needs two words")
+                low = self._const_int(value.args[0], context.environment)
+                high = self._const_int(value.args[1], context.environment)
+                if (low is None or high is None
+                        or not (0 <= low < 1 << 32 and 0 <= high < 1 << 32)):
+                    raise ProgramValidationError("binary mask uint32 words are invalid")
+                return low | (high << 32)
+            integer = self._const_int(value, context.environment)
+            if integer is None or not -(1 << 63) <= integer < 1 << 64:
+                raise UnsupportedSimOpError("binary mask must be a uint64 constant")
+            return integer & ((1 << 64) - 1)
+
+        mask0 = mask_word(arguments[4])
+        mask1 = mask_word(arguments[5])
+        repeat = self._runtime_int(arguments[6], context.environment)
+        strides = tuple(self._runtime_int(arguments[index], context.environment) for index in range(7, 13))
+        if repeat is None or any(value is None for value in strides):
+            return {}
+        if not isinstance(repeat, int) or not all(isinstance(value, int) for value in strides):
+            raise UnsupportedSimOpError("functional binary_mask_experiment requires a static repeat and strides")
+        if repeat < 0 or any(value < 0 for value in strides):
+            raise ProgramValidationError("binary_mask_experiment repeat and strides must not be negative")
+        dst_base = self._access_buffer_region(arguments[1], (1,), context)
+        src0_base = self._access_buffer_region(arguments[2], (1,), context)
+        src1_base = self._access_buffer_region(arguments[3], (1,), context)
+        if dst_base is None or src0_base is None or src1_base is None:
+            return {}
+        if not (dst_base.dtype == src0_base.dtype == src1_base.dtype):
+            raise ProgramValidationError("binary_mask_experiment operand dtypes must match")
+        if dst_base.dtype not in {"float16", "float32"}:
+            raise UnsupportedSimOpError("functional binary_mask_experiment supports only float16/float32")
+        if template_dtype is not None and template_dtype != dst_base.dtype:
+            raise ProgramValidationError("binary_mask_experiment template dtype must match the operands")
+        itemsize = dtype_size_bytes(dst_base.dtype)
+        elements_per_block = 32 // itemsize
+        shape = (repeat, 8, elements_per_block)
+        dst_blk, src0_blk, src1_blk, dst_rep, src0_rep, src1_rep = strides
+        destination = replace(
+            dst_base,
+            shape=shape,
+            strides_bytes=(dst_rep * 32, dst_blk * 32, itemsize),
+        )
+        left = replace(
+            src0_base,
+            shape=shape,
+            strides_bytes=(src0_rep * 32, src0_blk * 32, itemsize),
+        )
+        right = replace(
+            src1_base,
+            shape=shape,
+            strides_bytes=(src1_rep * 32, src1_blk * 32, itemsize),
+        )
+        return {
+            "dst": destination,
+            "lhs": left,
+            "rhs": right,
+            "binary_kind": binary_kind,
+            "binary_mask": (mask0, mask1),
         }
 
     def _row_expand_metadata(
@@ -2044,6 +2626,10 @@ class _TirBridge:
         return {
             "src": source,
             "dst": destination,
+            # Preserve the full L0C allocation separately from the logical
+            # copy rectangle.  Cost models must not mistake an N-tail for a
+            # complete physical tile.
+            "copy_helper": {"physical_shape": (physical_rows, physical_cols)},
             "copy": {
                 "layout_transform": True,
                 "source_layout": "l0c",
@@ -2581,14 +3167,22 @@ class _TirBridge:
         shape = self._vector_shape(arguments, context, tail=tail, count_index=3)
         if shape is None:
             return {}
-        destination = self._access_buffer_region(arguments[0], shape, context)
-        left = self._access_buffer_region(arguments[1], shape, context)
-        right = self._access_buffer_region(arguments[2], shape, context)
+        tail_details = self._tail_details(arguments, context, 3) if tail else None
+        physical_cols = tail_details["physical_cols"] if tail_details is not None else None
+        destination = self._access_buffer_region(
+            arguments[0], shape, context, physical_cols=physical_cols
+        )
+        left = self._access_buffer_region(
+            arguments[1], shape, context, physical_cols=physical_cols
+        )
+        right = self._access_buffer_region(
+            arguments[2], shape, context, physical_cols=physical_cols
+        )
         if destination is None or left is None or right is None:
             return {}
         metadata: dict[str, Any] = {"dst": destination, "lhs": left, "rhs": right}
-        if tail:
-            metadata["tail"] = self._tail_details(arguments, context, 3)
+        if tail_details is not None:
+            metadata["tail"] = tail_details
         return metadata
 
     def _unary_metadata(
@@ -4445,6 +5039,60 @@ class _TirBridge:
             core_id=(None if spec.scope in {MemoryScope.GM, MemoryScope.WORKSPACE} else context.core_id),
         )
 
+    def _annotate_gm_l1_source_locality(
+        self,
+        operation: str,
+        core_id: int,
+        lane: Lane,
+        pipe: Pipe,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Tag logical source reuse without claiming an L2 hit or changing cost."""
+        if (
+            self.timing_profile.estimator != "pto-cce-mock"
+            or operation != "copy_gm_to_l1"
+            or lane is not Lane.CUBE
+            or pipe is not Pipe.MTE2
+            or "dynamic_predicates" in metadata
+        ):
+            return
+        source = metadata.get("src")
+        destination = metadata.get("dst")
+        details = metadata.get("copy")
+        helper = metadata.get("copy_helper")
+        if (
+            not isinstance(source, BufferRegion)
+            or not isinstance(destination, BufferRegion)
+            or not isinstance(details, Mapping)
+            or not isinstance(helper, Mapping)
+            or source.scope is not MemoryScope.GM
+            or destination.scope is not MemoryScope.L1
+            or source.dtype != "float16"
+            or destination.dtype != "float16"
+            or not isinstance(source.byte_offset, int)
+            or tuple(source.shape) != (128, 128)
+            or details.get("layout") != "zN"
+            or any(details.get(name) != 128 for name in (
+                "valid_rows", "valid_cols", "source_cols", "physical_rows", "physical_cols"
+            ))
+            or details.get("need_clear") is not False
+            or helper.get("helper_clear") is not False
+        ):
+            return
+        key = (core_id, lane, pipe, source.buffer)
+        offset = source.byte_offset
+        seen = self._gm_l1_seen_offsets[key]
+        last = self._gm_l1_last_offset.get(key)
+        if offset in seen:
+            relation = "previously_seen_exact"
+        elif last is not None and abs(offset - last) == 128 * 128 * 2:
+            relation = "same_buffer_adjacent_32KiB"
+        else:
+            relation = "other"
+        metadata["logical_source_relation"] = relation
+        seen.add(offset)
+        self._gm_l1_last_offset[key] = offset
+
     def _emit_task(
         self,
         operation: str,
@@ -4458,6 +5106,33 @@ class _TirBridge:
         except UnsupportedSimOpError as error:
             span = metadata.get("span", "unknown")
             raise UnsupportedSimOpError(f"{error}; platform={self.platform}; span={span}; lane={context.lane.value}") from error
+        inferred_unscoped_lane = False
+        if (
+            self.timing_profile.estimator == "pto-cce-mock"
+            and context.lane is Lane.CONTROL
+            and context.vector_index in {0, 1}
+        ):
+            # An unscoped T.Kernel still has a concrete AIV instance. The
+            # original bridge classifies vector ops as vector0 but leaves
+            # their auto flags on CONTROL, then reports a false sync hazard.
+            # Limit this correction to the opt-in profile so default SimIR
+            # task/lane semantics remain unchanged.
+            vector_lane = Lane.VECTOR_0 if context.vector_index == 0 else Lane.VECTOR_1
+            if lane in {Lane.VECTOR_0, Lane.VECTOR_1} or normalized == "copy_gm_to_ub":
+                lane = vector_lane
+                inferred_unscoped_lane = True
+            elif normalized in {"set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
+                                "pipe_barrier", "auto_barrier"}:
+                pipes = {
+                    _normalize_pipe_name(metadata.get(key, ""))
+                    for key in ("src_pipe", "dst_pipe", "target_pipe")
+                }
+                if pipes & {"v", "mte3"} and not pipes & {"m", "mte1", "fix"}:
+                    lane = vector_lane
+                    inferred_unscoped_lane = True
+                elif pipes & {"m", "mte1", "fix"} and not pipes & {"v", "mte3"}:
+                    lane = Lane.CUBE
+                    inferred_unscoped_lane = True
         if lane is not Lane.CONTROL:
             pipe = self._sync_task_pipe(normalized, metadata, pipe)
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
@@ -4478,17 +5153,20 @@ class _TirBridge:
             )
         if context.predicates:
             task_metadata["dynamic_predicates"] = context.predicates
+        self._annotate_gm_l1_source_locality(
+            normalized, context.core_id, lane, pipe, task_metadata)
         timing_key = str(task_metadata.get("timing_key", normalized))
         task_metadata.setdefault("timing_key", timing_key)
         task_metadata.setdefault("timing_calibration", self.timing_profile.calibration)
-        memory_dependencies = self._memory_dependencies(task_metadata, context.core_id, context.lane, operation=normalized)
+        memory_lane = lane if inferred_unscoped_lane else context.lane
+        memory_dependencies = self._memory_dependencies(task_metadata, context.core_id, memory_lane, operation=normalized)
         if memory_dependencies:
             # Preserve why these edges exist.  They keep functional execution
             # deterministic, but are not hardware synchronization by
             # themselves; the adapter separately verifies cross-pipe edges.
             task_metadata["memory_dependencies"] = memory_dependencies
         alias_dependencies = self._alias_memory_dependencies(
-            task_metadata, context.core_id, context.lane, operation=normalized
+            task_metadata, context.core_id, memory_lane, operation=normalized
         )
         if alias_dependencies:
             task_metadata["alias_memory_dependencies"] = alias_dependencies
@@ -4502,22 +5180,27 @@ class _TirBridge:
         if hardware_dependencies:
             task_metadata["hardware_dependencies"] = tuple(sorted(hardware_dependencies))
         dependencies = tuple(sorted(set(memory_dependencies).union(extra_dependencies)))
+        duration_cycles, timing_source, cce_calls = self.timing_profile.estimate_task_with_calls(
+            timing_key,
+            pipe=pipe.value,
+            metadata=task_metadata,
+        )
+        if self.timing_profile.estimator == "pto-cce-mock":
+            task_metadata["timing_source"] = timing_source
+            if cce_calls:
+                task_metadata["cce_calls"] = cce_calls
         task = Task(
             task_id,
             normalized,
             context.core_id,
             lane,
             pipe,
-            self.timing_profile.estimate_task(
-                timing_key,
-                pipe=pipe.value,
-                metadata=task_metadata,
-            ),
+            duration_cycles,
             dependencies=dependencies,
             metadata=task_metadata,
         )
         self.tasks[context.core_id].append(task)
-        self._record_memory_accesses(task, context.core_id, context.lane)
+        self._record_memory_accesses(task, context.core_id, memory_lane)
         return task
 
     def _dynamic_condition(self, value: Any, environment: Mapping[Any, int]) -> Any:

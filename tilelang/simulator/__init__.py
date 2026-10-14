@@ -36,6 +36,7 @@ from .profile import (
     TimingProfile,
     default_timing_profile,
     get_device_profile,
+    pto_cce_mock_timing_profile,
     pto_fallback_timing_profile,
 )
 from .report import PerformanceReport
@@ -113,6 +114,7 @@ __all__ = [
     "contiguous_strides_bytes",
     "classify_operation",
     "default_timing_profile",
+    "pto_cce_mock_timing_profile",
     "pto_fallback_timing_profile",
     "dtype_size_bytes",
     "get_device_profile",

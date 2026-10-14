@@ -19,8 +19,6 @@ Fix: ``_memory_dependencies`` skips GM/WORKSPACE edges between different cores
 These tests are RED until cross-core GM/workspace edges are dropped.
 """
 
-import pytest
-
 from tilelang.simulator import BufferRegion, MemoryScope
 from tilelang.simulator.bridge import _TirBridge
 from tilelang.simulator.program import BufferSpec
@@ -45,6 +43,7 @@ def _bare_bridge() -> _TirBridge:
         "WS": BufferSpec("WS", MemoryScope.WORKSPACE, (2, 64, 8), "float32"),
     }
     bridge.active_aliases = {}
+    bridge.region_overlap_cache = {}
     return bridge
 
 

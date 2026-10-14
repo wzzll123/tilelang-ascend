@@ -181,6 +181,40 @@ def test_dependency_can_cross_core_and_lane() -> None:
     assert records["consumer"].end_cycle == 11
 
 
+def test_reverse_dependency_chain_schedules_each_task_once() -> None:
+    """A long, reverse-ordered DAG must not require a full task scan per step."""
+    count = 256
+    cores = tuple(
+        CoreProgram(
+            index,
+            (
+                Task(
+                    f"task-{index}",
+                    "copy",
+                    index,
+                    Lane.CUBE,
+                    Pipe.MTE2,
+                    1,
+                    dependencies=(f"task-{index + 1}",) if index + 1 < count else (),
+                ),
+            ),
+        )
+        for index in range(count)
+    )
+
+    result = DiscreteEventScheduler().run(_multi_core_program(*cores))
+    records = {record.task_id: record for record in result.records}
+
+    assert len(records) == count
+    assert result.stats.makespan_cycles == count
+    for index in range(count):
+        record = records[f"task-{index}"]
+        assert (record.start_cycle, record.end_cycle) == (
+            count - index - 1,
+            count - index,
+        )
+
+
 def test_max_cycles_fails_at_the_task_that_crosses_limit() -> None:
     task = Task("long", "mma", 0, Lane.CUBE, Pipe.MATRIX, 11)
     config = SimulatorConfig(platform="A2", max_cycles=10)

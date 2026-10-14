@@ -1600,6 +1600,11 @@ TIR_DEFINE_TL_BUILTIN(ascend_reduce_fold_sum_experiment)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_binary_mask_experiment)
+    .set_num_inputs(-1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_row_expand_mul_experiment)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",

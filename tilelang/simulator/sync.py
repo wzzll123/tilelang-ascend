@@ -390,6 +390,7 @@ class FlagBarrierSynchronizationModel:
         self._sync_all_task_phase: dict[str, SyncAllKey] = {}
         self._sync_all_release_dependencies: dict[str, SyncAllKey] = {}
         self._sync_all_expected: dict[str, tuple[Participant, ...]] = {}
+        self._task_by_id: dict[str, Task] = {}
 
     @staticmethod
     def _operation(task: Task) -> str:
@@ -409,6 +410,7 @@ class FlagBarrierSynchronizationModel:
         self._sync_all_task_phase.clear()
         self._sync_all_release_dependencies.clear()
         self._sync_all_expected.clear()
+        self._task_by_id = {task.task_id: task for task in program.tasks}
         wait_modes: dict[tuple[int, str, int | None], set[int]] = defaultdict(set)
         for task in program.tasks:
             operation = self._operation(task)
@@ -778,6 +780,50 @@ class FlagBarrierSynchronizationModel:
                 warnings.warn(message, RuntimeWarning, stacklevel=2)
             elif policy == "error":
                 raise SimulationDeadlockError(message)
+
+    def deadlock_diagnostics(self) -> str:
+        """Return compact state that can explain a scheduler no-progress error.
+
+        This is diagnostic only: it exposes live flag credits and collective
+        arrivals, but never changes the FIFO/counter synchronization model.
+        """
+        entries: list[str] = []
+        for key, tokens in sorted(self._tokens.items(), key=lambda item: str(item[0])):
+            if not tokens:
+                continue
+            producers = ", ".join(
+                self._format_producer(task_id) for _cycle, task_id in tokens
+            )
+            entries.append(
+                f"{self._format_flag_key(key)} outstanding={len(tokens)} producer={producers}"
+            )
+        for key, ready_by_participant in sorted(
+            self._collective_ready.items(), key=lambda item: str(item[0])
+        ):
+            ready = ", ".join(
+                f"{self._format_participant(participant)}={len(tokens)}"
+                for participant, tokens in sorted(ready_by_participant.items())
+            )
+            if ready:
+                mode, _scope, _core, flag_id = key
+                entries.append(f"collective mode={mode} id={flag_id} produced[{ready}]")
+        for key, arrivals in sorted(self._sync_all_arrivals.items()):
+            if arrivals:
+                entries.append(
+                    f"sync_all scope={key[0]} phase={key[1]} arrivals="
+                    + ", ".join(
+                        f"{self._format_participant(participant)}={self._format_producer(task_id)}"
+                        for participant, (_cycle, task_id) in sorted(arrivals.items())
+                    )
+                )
+        return "; ".join(entries[:16]) or "no outstanding synchronization producers"
+
+    def _format_producer(self, task_id: str) -> str:
+        task = self._task_by_id.get(task_id)
+        if task is None:
+            return task_id
+        span = task.metadata.get("span")
+        return f"{task_id}@{span}" if span else task_id
 
     def _local_flag_key(self, task: Task) -> FlagKey:
         flag_id = task.metadata.get("flag_id")

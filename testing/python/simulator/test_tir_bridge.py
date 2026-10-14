@@ -2994,7 +2994,7 @@ def _narrow_reduce_primfunc(
     )
 
 
-def _block_reduce_primfunc(kind, *, dtype="float16", mask=37):
+def _block_reduce_primfunc(kind, *, dtype="float16", mask=37, init_dest=True):
     source = tvm.tir.decl_buffer((256,), dtype, name="source", scope="global")
     initial = tvm.tir.decl_buffer((16,), dtype, name="initial", scope="global")
     output = tvm.tir.decl_buffer((16,), dtype, name="output", scope="global")
@@ -3011,9 +3011,12 @@ def _block_reduce_primfunc(kind, *, dtype="float16", mask=37):
             destination_buffer.access_ptr("w"), count,
         ))
 
-    body = tvm.tir.SeqStmt([
+    body_steps = [
         copy("copy_gm_to_ub", source, ub_source, 256),
-        copy("copy_gm_to_ub", initial, ub_output, 16),
+    ]
+    if init_dest:
+        body_steps.append(copy("copy_gm_to_ub", initial, ub_output, 16))
+    body_steps.extend([
         tvm.tir.Evaluate(tvm.tir.call_extern(
             "handle", f"tl.ascend_block_reduce_{kind}",
             ub_output.access_ptr("w"), ub_source.access_ptr("r"),
@@ -3021,6 +3024,7 @@ def _block_reduce_primfunc(kind, *, dtype="float16", mask=37):
         )),
         copy("copy_ub_to_gm", ub_output, output, 16),
     ])
+    body = tvm.tir.SeqStmt(body_steps)
     root = tvm.tir.Block(
         [], [], [], "root", body, alloc_buffers=[ub_source, ub_output]
     )
@@ -3766,6 +3770,111 @@ def test_brcb_validates_template_scope_alignment_and_dtypes() -> None:
             _brcb_primfunc(dst_scope="global"), platform="A2"
         )
 
+def _binary_mask_primfunc(dtype, mask0, mask1, *, repeat=2):
+    elements_per_block = 32 // np.dtype(dtype).itemsize
+    dst_blk, src0_blk, src1_blk = 2, 1, 2
+    dst_rep, src0_rep, src1_rep = 16, 8, 16
+    strides = (dst_blk, src0_blk, src1_blk, dst_rep, src0_rep, src1_rep)
+    sizes = tuple(
+        ((repeat - 1) * rep_stride + 7 * blk_stride + 1) * elements_per_block
+        for blk_stride, rep_stride in (
+            (dst_blk, dst_rep), (src0_blk, src0_rep), (src1_blk, src1_rep)
+        )
+    )
+    dst = tvm.tir.decl_buffer((sizes[0],), dtype, name="mask_dst", scope="shared.ub")
+    src0 = tvm.tir.decl_buffer((sizes[1],), dtype, name="mask_src0", scope="shared.ub")
+    src1 = tvm.tir.decl_buffer((sizes[2],), dtype, name="mask_src1", scope="shared.ub")
+    dtype_name = "half" if dtype == "float16" else "float"
+    call = tvm.tir.call_extern(
+        "handle", "tl.ascend_binary_mask_experiment", f"add_mask<{dtype_name}>",
+        dst.access_ptr("w"), src0.access_ptr("r"), src1.access_ptr("r"),
+        tvm.tir.const(mask0, "uint64"), tvm.tir.const(mask1, "uint64"),
+        repeat, *strides,
+    )
+    root = tvm.tir.Block(
+        [], [], [], "root", tvm.tir.Evaluate(call),
+        alloc_buffers=[dst, src0, src1],
+    )
+    primfunc = tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, root))
+    return primfunc, sizes, strides
+
+
+@pytest.mark.parametrize(
+    ("dtype", "mask0", "mask1"),
+    [
+        ("float16", (1 << 63) | 1, (1 << 63) | 1),
+        ("float32", (1 << 63) | 1, 0),
+        ("float32", (1 << 64) - 1, 0),
+    ],
+)
+def test_binary_mask_preserves_inactive_lanes_and_decodes_uint64(
+    dtype, mask0, mask1,
+) -> None:
+    primfunc, sizes, strides = _binary_mask_primfunc(dtype, mask0, mask1)
+    program = build_kernel_program(primfunc, platform="A3")
+    (task,) = program.tasks
+    assert task.metadata["binary_mask"] == (mask0, mask1)
+    assert task.operation == "binary_mask_experiment"
+
+    destination = np.full(sizes[0], -99, dtype=dtype)
+    source0 = np.arange(sizes[1], dtype=dtype) / 8
+    source1 = np.arange(sizes[2], dtype=dtype) / 16
+    simulator = FunctionalSimulator(program)
+    for name, values in (
+        ("mask_dst", destination), ("mask_src0", source0), ("mask_src1", source1)
+    ):
+        simulator.write(
+            BufferRegion(name, MemoryScope.UB, values.shape, dtype, core_id=0), values
+        )
+    simulator.run()
+
+    expected = destination.copy()
+    elements_per_block = 32 // np.dtype(dtype).itemsize
+    dst_blk, src0_blk, src1_blk, dst_rep, src0_rep, src1_rep = strides
+    for repeat in range(2):
+        for lane in range(8 * elements_per_block):
+            word = mask0 if lane < 64 else mask1
+            if not ((word >> (lane % 64)) & 1):
+                continue
+            block, element = divmod(lane, elements_per_block)
+            dst_index = (repeat * dst_rep + block * dst_blk) * elements_per_block + element
+            src0_index = (repeat * src0_rep + block * src0_blk) * elements_per_block + element
+            src1_index = (repeat * src1_rep + block * src1_blk) * elements_per_block + element
+            expected[dst_index] = source0[src0_index] + source1[src1_index]
+    np.testing.assert_array_equal(
+        simulator.read(BufferRegion("mask_dst", MemoryScope.UB, (sizes[0],), dtype, core_id=0)),
+        expected,
+    )
+
+
+def test_binary_mask_zero_and_sparse_masks_do_not_read_inactive_sources() -> None:
+    for mask in (0, 1):
+        primfunc, _, _ = _binary_mask_primfunc("float32", mask, 0, repeat=1)
+        program = build_kernel_program(primfunc, platform="A3")
+        simulator = FunctionalSimulator(program)
+        if mask:
+            for name, value in (("mask_src0", 2.0), ("mask_src1", 3.0)):
+                simulator.write(
+                    BufferRegion(name, MemoryScope.UB, (1,), "float32", core_id=0),
+                    np.array([value], dtype=np.float32),
+                )
+        simulator.run()
+        if mask:
+            np.testing.assert_array_equal(
+                simulator.read(
+                    BufferRegion("mask_dst", MemoryScope.UB, (1,), "float32", core_id=0)
+                ),
+                np.array([5.0], dtype=np.float32),
+            )
+        with pytest.raises(UninitializedMemoryError, match="read-before-write"):
+            simulator.read(
+                BufferRegion(
+                    "mask_dst", MemoryScope.UB, (1,), "float32",
+                    byte_offset=4 if mask else 0, core_id=0,
+                )
+            )
+
+
 _ROW_EXPAND_TAG_NAMES = {
     "mul": "RowExpandMulExperiment",
     "sub": "RowExpandSubExperiment",
@@ -3970,7 +4079,7 @@ def test_row_expand_orders_raw_against_producer() -> None:
 
 
 def test_row_expand_validates_rows_dtype_alignment_and_tag() -> None:
-    with pytest.raises(ProgramValidationError, match="256-byte"):
+    with pytest.raises(ProgramValidationError, match="physical row stride.*got 32"):
         build_kernel_program(
             _row_expand_primfunc(dtype="float16", cols_override=32),
             platform="A2",
@@ -7272,6 +7381,35 @@ def test_block_reduce_executes_masked_strided_repeats(dtype, kind, reducer) -> N
             start = repeat * 8 * elements_per_block + block_index * elements_per_block
             block = values[start:start + active].astype(np.float32)
             expected[repeat * 8 + block_index] = reducer(block)
+    np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize(
+    ("kind", "reducer"),
+    [("sum", np.sum), ("max", np.max), ("min", np.min)],
+)
+def test_block_reduce_overwrites_uninitialized_destination(dtype, kind, reducer) -> None:
+    elements_per_block = 32 // np.dtype(dtype).itemsize
+    mask = 8 * elements_per_block
+    program = build_kernel_program(
+        _block_reduce_primfunc(kind, dtype=dtype, mask=mask, init_dest=False),
+        platform="A3",
+    )
+    source_load, reduction, store = program.tasks
+    assert reduction.dependencies == (source_load.task_id,)
+
+    values = np.linspace(-8, 8, 256, dtype=np.float32).astype(dtype)
+    simulator = FunctionalSimulator(program)
+    simulator.write(source_load.metadata["src"], values)
+    simulator.run()
+
+    expected = np.array([
+        reducer(values[repeat * mask + block * elements_per_block:
+                       repeat * mask + (block + 1) * elements_per_block].astype(np.float32))
+        for repeat in range(2)
+        for block in range(8)
+    ], dtype=dtype)
     np.testing.assert_array_equal(simulator.read(store.metadata["dst"]), expected)
 
 

@@ -1163,6 +1163,75 @@ def _reduce_fold_impl(op_name, func_name, dst, src, fold_tmp, br_tmp, rows, cols
         cols,
     )
 
+_BINARY_MASK_OPS = ("max", "add", "sub", "mul", "div")
+
+
+def binary_mask_experiment(
+    dst: Buffer | BufferRegion | BufferLoad,
+    src0: Buffer | BufferRegion | BufferLoad,
+    src1: Buffer | BufferRegion | BufferLoad,
+    op: str,
+    mask0: int,
+    mask1: int,
+    repeat_times: PrimExpr,
+    dst_blk_stride: PrimExpr,
+    src0_blk_stride: PrimExpr,
+    src1_blk_stride: PrimExpr,
+    dst_repeat_stride: PrimExpr,
+    src0_repeat_stride: PrimExpr,
+    src1_repeat_stride: PrimExpr,
+):
+    """Generic strided masked binary vector op (counter-mode disabled form).
+
+    AscendC backend: emits
+    ``tl::ascend::{op}_mask<dtype>(dst, src0, src1, mask0, mask1, repeat,
+    dst_blk, src0_blk, src1_blk, dst_rep, src0_rep, src1_rep)`` —— 即
+    ``AscendC::{Max,Add,Sub,Mul,Div}<T, false>`` + BinaryRepeatParams，
+    dst/src0/src1 各有独立的 block stride 与 repeat stride（32B block 单位），
+    覆盖官方 NewReduce 折叠分支所需的跨步二元形态。
+
+    Args:
+        dst/src0/src1: operand buffers (start addresses 32-byte aligned).
+        op: one of "max" / "add" / "sub" / "mul" / "div".
+        mask0/mask1: 128-bit mask 的低/高 64 位（逐位有效元素）。
+        repeat_times: repeat count.
+        *_blk_stride: block stride within one repeat (per operand).
+        *_repeat_stride: repeat stride between repeats (per operand).
+    """
+    if op not in _BINARY_MASK_OPS:
+        raise ValueError(
+            f"binary_mask_experiment: op must be one of {_BINARY_MASK_OPS}, got {op!r}"
+        )
+
+    dst_ptr, _ = _get_folded_2d_access(dst, "w")
+    src0_ptr, _ = _get_folded_2d_access(src0, "r")
+    src1_ptr, _ = _get_folded_2d_access(src1, "r")
+
+    dtype = _dtype(dst)
+    if not (_dtype(src0) == _dtype(src1) == dtype):
+        raise ValueError(
+            f"binary_mask_experiment requires matching operand dtypes: "
+            f"dst={dtype}, src0={_dtype(src0)}, src1={_dtype(src1)}"
+        )
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_binary_mask_experiment"),
+        f"{op}_mask<{dtype}>",
+        dst_ptr,
+        src0_ptr,
+        src1_ptr,
+        tir.const(mask0, "uint64"),
+        tir.const(mask1, "uint64"),
+        repeat_times,
+        dst_blk_stride,
+        src0_blk_stride,
+        src1_blk_stride,
+        dst_repeat_stride,
+        src0_repeat_stride,
+        src1_repeat_stride,
+    )
+
 
 def binary_op(
     dst: Buffer | BufferRegion,

@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from collections.abc import Mapping
+from heapq import heapify, heappop, heappush
 
 from .config import SimulatorConfig
 from .errors import (
@@ -69,6 +70,24 @@ class DiscreteEventScheduler:
             task.task_id: self._execution_dependencies(task) for task in tasks
         }
         fifo_predecessor = self._fifo_predecessors(tasks)
+        task_index = {task.task_id: index for index, task in enumerate(tasks)}
+        required_by_task: dict[str, set[str]] = {}
+        successors: dict[str, list[int]] = {task.task_id: [] for task in tasks}
+        remaining_dependencies: dict[str, int] = {}
+        for task in tasks:
+            required = set(execution_dependencies[task.task_id])
+            predecessor = fifo_predecessor.get(task.task_id)
+            if predecessor is not None:
+                required.add(predecessor)
+            required_by_task[task.task_id] = required
+            remaining_dependencies[task.task_id] = len(required)
+            for dependency in required:
+                successors[dependency].append(task_index[task.task_id])
+        ready_indices = [
+            index for index, task in enumerate(tasks)
+            if remaining_dependencies[task.task_id] == 0
+        ]
+        heapify(ready_indices)
         self.synchronization.reset(program)
 
         pending: set[str] = set(task_by_id)
@@ -81,26 +100,25 @@ class DiscreteEventScheduler:
             self._check_wall_timeout(started_at, config.execution_timeout_s, pending)
             made_progress = False
             blocked_details: dict[str, str] = {}
+            next_pass: list[int] = []
 
             # Stable source order makes equal-cycle schedules reproducible.
-            for task in tasks:
+            # A task unlocked after its source position was passed waits until
+            # the next pass, exactly as in a full source-order scan.
+            while ready_indices:
+                index = heappop(ready_indices)
+                task = tasks[index]
                 if task.task_id not in pending:
                     continue
                 dependency_required = set(execution_dependencies[task.task_id])
-                required = set(dependency_required)
                 predecessor = fifo_predecessor.get(task.task_id)
-                if predecessor is not None:
-                    required.add(predecessor)
-                missing = sorted(required - completed.keys())
-                if missing:
-                    blocked_details[task.task_id] = "waiting for " + ", ".join(missing)
-                    continue
 
                 decision = self.synchronization.evaluate(task, completed_view)
                 if decision.blocked:
                     reason = decision.reason or "synchronization"
                     suffix = f": {decision.detail}" if decision.detail else ""
                     blocked_details[task.task_id] = f"blocked by {reason}{suffix}"
+                    next_pass.append(index)
                     continue
 
                 dependency_cycle = max(
@@ -184,11 +202,30 @@ class DiscreteEventScheduler:
                 pending.remove(task.task_id)
                 self.synchronization.on_scheduled(task, record)
                 made_progress = True
+                for successor_index in successors[task.task_id]:
+                    successor_id = tasks[successor_index].task_id
+                    remaining_dependencies[successor_id] -= 1
+                    if remaining_dependencies[successor_id] == 0:
+                        if successor_index > index:
+                            heappush(ready_indices, successor_index)
+                        else:
+                            next_pass.append(successor_index)
 
             if not made_progress:
                 if not config.deadlock_detect:
+                    ready_indices = next_pass
+                    heapify(ready_indices)
                     continue
-                details = "; ".join(f"{task_id}: {blocked_details.get(task_id, 'blocked')}" for task_id in sorted(pending))
+                for task in tasks:
+                    if task.task_id in pending and remaining_dependencies[task.task_id]:
+                        missing = sorted(required_by_task[task.task_id] - completed.keys())
+                        blocked_details[task.task_id] = "waiting for " + ", ".join(missing)
+                details = "; ".join(
+                    self._format_blocked_task(
+                        task_by_id[task_id], blocked_details.get(task_id, "blocked")
+                    )
+                    for task_id in sorted(pending)
+                )
                 cycle = self._wait_cycle(
                     pending,
                     tasks,
@@ -202,9 +239,16 @@ class DiscreteEventScheduler:
                     else "; wait-for graph has no cycle; all remaining tasks are blocked and no future event can fire"
                 )
                 history = self._recent_history(records, config.deadlock_history_limit)
-                raise SimulationDeadlockError(
-                    f"DEADLOCK (global no-progress): {len(pending)} blocked task(s): {details}{cycle_detail}; recent events: {history}"
+                diagnostic_hook = getattr(self.synchronization, "deadlock_diagnostics", None)
+                synchronization_state = (
+                    diagnostic_hook() if callable(diagnostic_hook) else "unavailable"
                 )
+                raise SimulationDeadlockError(
+                    f"DEADLOCK (global no-progress): {len(pending)} blocked task(s): {details}"
+                    f"{cycle_detail}; sync state: {synchronization_state}; recent events: {history}"
+                )
+            ready_indices = next_pass
+            heapify(ready_indices)
 
         if config.flag_balance_check != "off":
             audit = getattr(self.synchronization, "audit_flag_balance", None)
@@ -297,6 +341,29 @@ class DiscreteEventScheduler:
         if not recent:
             return "none"
         return ", ".join(f"{record.task_id}@{record.end_cycle}" for record in recent)
+
+    @staticmethod
+    def _format_blocked_task(task: Task, detail: str) -> str:
+        """Attach source and region context without assuming every task is memory work."""
+        context = []
+        span = task.metadata.get("span")
+        if span:
+            context.append(f"span={span}")
+        regions = []
+        for key in ("src", "dst"):
+            region = task.metadata.get(key)
+            if hasattr(region, "buffer") and hasattr(region, "scope"):
+                regions.append(f"{key}={region.buffer}:{region.scope.value}")
+        for key in ("src_regions", "dst_regions"):
+            values = task.metadata.get(key)
+            if isinstance(values, (tuple, list)):
+                for region in values:
+                    if hasattr(region, "buffer") and hasattr(region, "scope"):
+                        regions.append(f"{key}={region.buffer}:{region.scope.value}")
+        if regions:
+            context.append("regions=" + ",".join(dict.fromkeys(regions)))
+        suffix = f" [{'; '.join(context)}]" if context else ""
+        return f"{task.task_id}: {detail}{suffix}"
 
     @staticmethod
     def _validate_dependencies(tasks: tuple[Task, ...], task_by_id: Mapping[str, Task]) -> None:
