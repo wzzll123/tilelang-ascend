@@ -512,11 +512,6 @@ class FunctionalSimulator:
         if self.config.sync_only:
             self._execute_sync_only(task, operation)
             return
-        if operation == "fia_helper":
-            from .fia_helpers import execute_helper
-
-            execute_helper(self, task)
-            return
         if "copy" in operation or "datacopy" in operation or "data_copy" in operation:
             self._copy(task)
             return
@@ -677,7 +672,6 @@ class FunctionalSimulator:
             or operation in _UNARY_OPERATIONS
             or operation in _REDUCE_OPERATIONS
             or operation in _SYNC_ONLY_EXPLICIT_OPERATIONS
-            or operation == "fia_helper"
         )
         if not supported:
             raise UnsupportedSimOpError(f"sync-only execution is not implemented for {task.operation!r} (task {task.task_id!r})")
@@ -701,7 +695,7 @@ class FunctionalSimulator:
             view = self._resolve(region, task.core_id)
             initialized = True if region is pad_destination else sources_initialized
             view.allocation.mark_initialized(view, initialized)
-        if operation == "fia_helper" or task.metadata.get("scratch_clobber"):
+        if task.metadata.get("scratch_clobber"):
             scratch = task.metadata.get("scratch")
             if isinstance(scratch, BufferRegion):
                 view = self._resolve(scratch, task.core_id)

@@ -181,9 +181,6 @@ def classify_operation(operation: str, lane: Lane) -> tuple[Lane, Pipe, str]:
     normalized = operation.strip().lower()
     short = _short_operation(normalized)
 
-    if short == "fia_helper":
-        return _vector_lane(lane), Pipe.VECTOR, short
-
     if "shmem" in short:
         raise UnsupportedSimOpError(f"Ascend shmem operation {operation!r} is intentionally unsupported")
     if short == "copy_ub_to_ub_selected":
@@ -396,14 +393,6 @@ class _TirBridge:
                 "timing_calibration": self.timing_profile.calibration,
                 "source": "final-optimized-tir",
                 "loop_break_count": self.loop_break_count,
-                "timing_limitations": (
-                    (
-                        "Versioned FIA helpers preserve functional/synchronization contracts; "
-                        "their internal Vector instruction timing is not modeled.",
-                    )
-                    if any(task.operation == "fia_helper" for core in cores for task in core.tasks)
-                    else ()
-                ),
             },
         )
 
@@ -714,11 +703,6 @@ class _TirBridge:
 
     def _emit_call(self, call: Any, context: _Context) -> None:
         operation, arguments = self._call_operation(call)
-        if _short_operation(operation) == "src_code":
-            if context.lane not in {Lane.VECTOR_0, Lane.VECTOR_1}:
-                raise UnsupportedSimOpError("FIA opaque helper requires explicit Vector ownership")
-            self._emit_task("fia_helper", context, metadata=self._fia_helper_metadata(arguments, context))
-            return
         if operation == "tl.loop_break":
             raise _LoopBreak
         lowered_operation = operation
@@ -787,103 +771,6 @@ class _TirBridge:
                 self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
                 self.region_overlap_cache.clear()
                 self.memory_history_candidate_key_cache.clear()
-
-    def _fia_helper_metadata(self, arguments, context):
-        from .fia_helpers import helper_metadata, validate_contract
-
-        tags = [
-            (i, str(arg.value))
-            for i, arg in enumerate(arguments)
-            if isinstance(arg, self.tir.StringImm) and str(arg.value).startswith("sim.fia.")
-        ]
-        if len(tags) != 1:
-            raise UnsupportedSimOpError("opaque src_code requires one known versioned FIA contract")
-        index, tag = tags[0]
-        source = self._literal(arguments[0])
-        kind = validate_contract(tag, source)
-        version = 2 if tag.startswith("sim.fia.v2.") else 1
-        names = (
-            ("score", "maxv", "sums", "alpha", "denom", "scratch")
-            if kind.startswith("flash")
-            else ("score", "col")
-            if kind == "tail"
-            else ("dst", "alpha" if kind == "rescale" else "denom", "brcb")
-        )
-        original_count = 9 if kind.startswith("flash") else 5 if kind == "rescale" else 3 if kind == "tail" else 4
-        scalar_count = 2 if kind.startswith("flash") else 0 if kind in ("normalize", "normalize_divmul") else 1
-        banked = version == 2 and kind in ("flash_init", "flash_update", "tail")
-        if banked:
-            original_count += 1  # sm_bank keeps the raw source's scalar live.
-            scalar_count = 5 if kind.startswith("flash") else 3
-        if index != original_count or len(arguments) != index + 1 + scalar_count:
-            raise UnsupportedSimOpError(f"malformed {tag} argument count")
-        scalars = tuple(self._runtime_int(arg, context.environment) for arg in arguments[index + 1 :])
-        keywords = (
-            {"slot": scalars[0], "row": scalars[1]}
-            if kind.startswith("flash")
-            else {"slot": scalars[0]}
-            if kind == "rescale"
-            else {"valid": scalars[0]}
-            if kind == "tail"
-            else {}
-        )
-        rows, work, bank = 16, 49152, 0
-        if version == 2 and not banked:
-            keywords.update(version=2, work=8192)
-        if banked:
-            rows, work, bank = (scalars[2], scalars[3], scalars[4]) if kind.startswith("flash") else (scalars[1], 8192, scalars[2])
-            if rows not in (8, 16, 32) or work not in (8192, 16384) or bank not in (0, 1):
-                raise UnsupportedSimOpError(f"unsupported {tag} rows/work/bank")
-            keywords.update(rows=rows, work=work, version=version)
-            compact = "".join(source.split())
-            if kind.startswith("flash"):
-                update = "true" if kind == "flash_update" else "false"
-                expected = (
-                    f"fia_aligned::Flash<{update},{rows},{work}>(score[sm_bank*{rows * 512}],maxv,sums,alpha,denom,scratch,sm_slot,sm_row);"
-                )
-            else:
-                expected = f"fia_aligned::Tail<{keywords['valid']},{rows}>(score[sm_bank*{rows * 512}],tail_col);"
-            if compact != expected:
-                raise UnsupportedSimOpError("FIA v2 source and explicit scalar contract disagree")
-        shapes = {
-            "score": (rows, 512),
-            "maxv": (64,),
-            "sums": (192,),
-            "alpha": (192,),
-            "denom": (64,),
-            "scratch": (work,),
-            "dst": (64, 128),
-            "brcb": (64, 8),
-            "col": (512,),
-        }
-        regions = {}
-        for offset, name in enumerate(names, 1):
-            shape = shapes[name]
-            pointer = arguments[offset]
-            extent = self._access_ptr_extent(pointer, context)
-            required = 1
-            for value in shape:
-                required *= value
-            if not isinstance(extent, int) or extent < required:
-                raise UnsupportedSimOpError(f"{tag} requires a complete {name} pointer extent")
-            if name == "score" and banked and (extent not in (required, required * 2) or (bank + 1) * required > extent):
-                raise UnsupportedSimOpError("FIA v2 score bank exceeds its 1/2-bank allocation")
-            regions[name] = self._access_buffer_region(pointer, shape, context, physical_cols=shape[-1])
-            if name == "score" and banked and bank:
-                region = regions[name]
-                if region is None:
-                    raise UnsupportedSimOpError("FIA v2 score pointer cannot resolve to a buffer")
-                regions[name] = replace(region, byte_offset=region.byte_offset + bank * required * 4)
-        if kind == "tail" and version == 1 and f"<{keywords['valid']}>" not in source:
-            raise UnsupportedSimOpError("tail template and contract valid length disagree")
-        metadata = helper_metadata(kind, regions, **keywords)
-        if kind.startswith("flash"):
-            scratch = regions["scratch"]
-            for region in metadata["src_regions"] + metadata["dst_regions"]:
-                if self._regions_overlap(scratch, region, context.core_id):
-                    raise ProgramValidationError("FIA Flash scratch must not overlap input/output")
-        metadata.update(tir=str(source), arguments=(tag, *scalars))
-        return metadata
 
     def _emit_gemm_v0_trace_tasks(self, _operation: str, context: _Context, metadata: Mapping[str, Any]) -> None:
         details = metadata["gemm"]

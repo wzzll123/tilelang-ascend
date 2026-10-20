@@ -139,6 +139,24 @@ def test_manual_sync_intrinsics_preserve_pipe_flag_and_mode_metadata() -> None:
     assert tasks[3].pipe is Pipe.SCALAR
 
 
+@pytest.mark.parametrize("legacy_tag", [None, "sim.fia.v1.normalize"])
+def test_opaque_source_code_is_not_interpreted(legacy_tag) -> None:
+    t = tvm.tir
+    buffers = [
+        t.decl_buffer(shape, "float32", name=name, scope="shared.ub")
+        for name, shape in (("acc_o", (64, 128)), ("denom", (64,)), ("brcb", (64, 8)))
+    ]
+    arguments = [t.StringImm("fia_aligned::Normalize(acc_o,denom,brcb);"), *[buffer.access_ptr("rw") for buffer in buffers]]
+    if legacy_tag is not None:
+        arguments.append(t.StringImm(legacy_tag))
+    call = t.Call("handle", tvm.ir.Op.get("tl.ascend_src_code"), arguments)
+    body = t.AttrStmt(t.IntImm("int32", 1), "resource_scope", 1, t.Evaluate(call))
+    for buffer in buffers:
+        body = t.Allocate(buffer.data, buffer.dtype, buffer.shape, t.const(True, "bool"), body)
+    with pytest.raises(UnsupportedSimOpError, match="unsupported lowered simulator operation.*src_code"):
+        build_kernel_program(t.PrimFunc([], body), platform="A2")
+
+
 def test_sync_all_intrinsic_preserves_pto_resource_scope() -> None:
     sync = tvm.tir.call_extern("handle", "sync_all")
     cube = build_kernel_program(
