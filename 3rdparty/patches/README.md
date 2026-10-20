@@ -17,14 +17,6 @@ Files must be named `tvm_*.patch` to be picked up.
 
 ## Patches
 
-- **`tvm_slice_step_fix.patch`** — `Buffer.__getitem__` treats an explicit unit
-  step (`a:b:1`) the same as no step, so a runtime-dynamic slice such as
-  `buf[0, 0:idx]` takes the `BufferRegion` path instead of the `Ramp` path (whose
-  `int(lanes)` requires a compile-time-constant length and crashes on a dynamic
-  `idx`). The TVMScript evaluator auto-fills `step=1` for sliced call arguments,
-  which is what triggers the crash without this fix. Fixes dynamic `T.tile.fill`
-  (issue #1207). Upstream TVM fixed the same thing in a large refactor that cannot
-  be cherry-picked into the pinned commit.
 - **`tvm_backtrace_symbol_name_length.patch`** — `BacktraceSyminfoCallback`
   builds the demangling input from the NUL-terminated `symname` instead of
   `std::string(symname, symsize)`. libbacktrace's `symsize` is the size of the
@@ -35,9 +27,24 @@ Files must be named `tvm_*.patch` to be picked up.
   longer uses `symsize` here, but that code arrives only with the FFI migration
   and cannot be cherry-picked into the pinned commit.
 
+## Fixes already included in the pinned TVM
+
+The pinned commit `6dcf3f0d3169e693b3f5f0525556a40d23eaf703` already treats
+explicit unit-step slices (`a:b:1`) as ordinary `BufferRegion` slices. This
+supports dynamic stops without entering the constant-lane `Ramp` path. The old
+`tvm_slice_step_fix.patch` is therefore removed: its equivalent edit has different
+comments and cannot pass either the forward or reverse patch check on this pin.
+Do not reapply it or weaken the generic patch script's conflict checks.
+
+This Python slicing fix is independent of the Apache TVM `96b8257` interval
+relaxation backport, included earlier at `88f6cfaf4`. The latter fixes recursive
+arithmetic-analysis expansion in C++; it is not a replacement slice patch.
+
 ## Regenerating a patch after a submodule bump
 
     cd 3rdparty/tvm
     # apply the intended edit to the source file, then:
-    git diff -- python/tvm/tir/buffer.py > ../patches/tvm_slice_step_fix.patch
-    git checkout -- python/tvm/tir/buffer.py
+    git diff -- src/runtime/logging.cc > ../patches/tvm_backtrace_symbol_name_length.patch
+
+When a fix becomes part of the pinned commit, remove its obsolete patch and
+update the build-entry regression instead of retaining a redundant textual edit.
