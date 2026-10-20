@@ -74,3 +74,69 @@ establish that the original execution did not wait.
 `--json` emits plain JSON to stdout and errors to stderr. Output preserves the
 source scope/model metadata: a core-0 projection is not a full-grid validation,
 and a relative timing model is not a measured performance profile.
+
+## Source-fragment readiness
+
+`fragment_readiness` automatically checks `copy_gm_to_ub` reads against recorded
+GM writes (`dst` and `dst_regions`), without using `memory_dependencies` as
+synchronization. It intersects exact byte intervals from buffer name, byte
+offset, source dtype, shape and byte strides. Strided row gaps are not treated
+as written bytes. For each source byte it selects the latest completed writer,
+so old ring-slot contents and partially overwritten versions are not reused.
+
+The report distinguishes whole-source readiness from earlier partial readiness.
+Each milestone includes newly ready bytes, cumulative coverage, producer task
+IDs and byte intervals (at most 64 shown, with an explicit truncation flag).
+Candidates are ordered by consumer start time; `--top` limits displayed
+candidates, not the total count. `whole_copy_start_lag_cycles` is the gap after
+**all** source bytes are ready. `first_fragment_lead_cycles` is the interval
+before the existing copy starts during which its first fragment is ready;
+it is **not** a predicted latency reduction.
+
+This is a source-only opportunity detector, not a safe rescheduling proof. A
+candidate requires splitting the copy, per-fragment synchronization, checking
+destination reuse and pipe/control constraints, and preserving full-row
+dependencies of downstream reductions such as softmax. No automatic kernel
+rewrite or performance gain is claimed.
+
+Coverage is limited to concrete dense 1D or row-strided 2D regions of named GM
+buffers, with at most 4096 rows. Unknown layouts, symbolic offsets, padded reads
+whose valid extent differs from the source shape, and unknown writer regions
+are not optimistically analyzed. Read/write overlap or concurrently conflicting
+writers suppress candidates. External inputs or missing coverage produce
+`incomplete_source`, not an uninitialized-memory verdict. Missing writes and
+physical aliases under different buffer names cannot be inferred from the
+trace; status counts expose unsupported and incomplete cases.
+
+### Case 4 / 42 check (2026-10-20)
+
+Both complete restored-model core-0 traces automatically identify
+`c0-vector0-82` as the first candidate: it reads 16 x 512 FP32 values from `ws_s`
+at cycle 5448, while four FIX writes produce successive 128-column bands:
+
+| Producer | Ready cycle | Newly ready bytes | Cumulative coverage |
+| --- | ---: | ---: | ---: |
+| `c0-cube-31` | 2330 | 8192 | 25% |
+| `c0-cube-47` | 3368 | 8192 | 50% |
+| `c0-cube-63` | 4406 | 8192 | 75% |
+| `c0-cube-75` | 5443 | 8192 | 100% |
+
+Thus the whole-copy lag is only 5 model cycles; the first fragment is ready
+3118 cycles before the existing copy starts. Prefetching the first 128 columns
+is a protocol/splitting candidate, not permission to advance the full 512-column
+copy. The complete traces contain 320 / 624 candidate reads respectively
+(including separate Vector lanes and repeated iterations, not unique code sites).
+No synchronization, scheduler or timing-model behavior is changed by analysis.
+
+In the Docker experiment directory
+`/home/wenzhongzhen/benchmark/fia_tl_trace_opt_20261019`, inputs are
+`best_restored_pto_20261020_case{4,42}/trace_sim_cycles.json`; saved reports are
+`fragment_readiness_case{4,42}.json`. Reproduce with this repository's script:
+
+```bash
+python scripts/analyze_sim_trace.py "$TRACE_ROOT/best_restored_pto_20261020_case4/trace_sim_cycles.json" --json
+python scripts/analyze_sim_trace.py "$TRACE_ROOT/best_restored_pto_20261020_case42/trace_sim_cycles.json" --json
+```
+
+Set `TRACE_ROOT` to that experiment directory. Timings above are uncalibrated
+relative model cycles, not NPU measurements.

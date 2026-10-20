@@ -3,6 +3,7 @@
 """Standalone tests: no TileLang, TVM, NumPy or NPU runtime is required."""
 import importlib.util
 import json
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -315,6 +316,158 @@ class TraceAnalysisTests(unittest.TestCase):
                 text=True,
                 check=True)
             self.assertEqual(json.loads(process.stdout)["total_time"], 10)
+
+
+def region(buffer="ws", shape=(2, 8), offset=0, strides=(32, 4), dtype="float32"):
+    return dict(
+        buffer=buffer,
+        scope="gm",
+        shape=list(shape),
+        dtype=dtype,
+        byte_offset=offset,
+        strides_bytes=list(strides),
+        core_id=None)
+
+
+class FragmentReadinessTests(unittest.TestCase):
+
+    def analyze(self, events):
+        return tool.analyze_document({"traceEvents": events})["fragment_readiness"]
+
+    def fixture(self):
+        writes = [
+            event(
+                f"f{i}",
+                "fix",
+                i * 10,
+                i * 10 + 5,
+                name="copy_l0c_to_gm",
+                dst=region(shape=(2, 2), offset=i * 8)) for i in range(4)
+        ]
+        read = event("read", "mte2", 40, 45, lane="vector0", name="copy_gm_to_ub", src=region())
+        return writes, read
+
+    def test_four_column_fragments_not_whole_copy_early(self):
+        writes, read = self.fixture()
+        report = self.analyze(writes + [read])
+        row = report["candidates"][0]
+        self.assertEqual(row["source_bytes"], 64)
+        self.assertEqual(row["whole_source_ready_cycle"], 35)
+        self.assertEqual(row["whole_copy_start_lag_cycles"], 5)
+        self.assertEqual([m["cumulative_fraction"] for m in row["milestones"]], [.25, .5, .75, 1.])
+        self.assertEqual(row["milestones"][0]["producer_tasks"], ["f0"])
+        self.assertEqual(row["milestones"][0]["byte_intervals"], [[0, 8], [32, 40]])
+        self.assertFalse(row["legal_reschedule_proven"])
+
+    def test_holes_are_not_filled_by_bounding_box(self):
+        writes, read = self.fixture()
+        report = self.analyze(writes[:1] + [read])
+        self.assertEqual(report["candidate_count"], 0)
+        self.assertEqual(report["status_counts"]["incomplete_source"], 1)
+
+    def test_latest_ring_slot_write_wins(self):
+        writes, read = self.fixture()
+        writes += [event("new", "fix", 36, 39, dst=region())]
+        report = self.analyze(writes + [read])
+        self.assertEqual(report["candidate_count"], 0)
+        self.assertEqual(report["status_counts"]["single_ready_time"], 1)
+
+    def test_partial_overwrite_keeps_latest_version(self):
+        writes, read = self.fixture()
+        writes += [event("new", "fix", 36, 39, dst=region(shape=(2, 2), offset=0))]
+        row = self.analyze(writes + [read])["candidates"][0]
+        self.assertEqual(row["milestones"][-1]["producer_tasks"], ["new"])
+        self.assertEqual(row["milestones"][-1]["bytes"], 16)
+        self.assertNotIn("f0", str(row["milestones"]))
+
+    def test_inflight_or_concurrent_overwrite_is_not_ready(self):
+        for start, end in [(38, 43), (42, 44)]:
+            writes, read = self.fixture()
+            writes += [event("racing", "fix", start, end, dst=region())]
+            report = self.analyze(writes + [read])
+            self.assertEqual(report["candidate_count"], 0)
+            self.assertEqual(report["status_counts"]["overlapping_write"], 1)
+
+    def test_symbolic_or_layout_regions_are_unknown(self):
+        writes, read = self.fixture()
+        writes += [event("unknown", "fix", 36, 39, dst={**region(), "byte_offset": "dynamic"})]
+        report = self.analyze(writes + [read])
+        self.assertEqual(report["status_counts"]["unknown_writer_region"], 1)
+        read["args"]["src"]["strides_bytes"] = [32, 8]
+        report = self.analyze([read])
+        self.assertEqual(report["status_counts"]["unsupported_source_region"], 1)
+
+    def test_source_dtype_and_buffer_identity(self):
+        writes, read = self.fixture()
+        read["args"]["src"] = region(dtype="float16", strides=(32, 2))
+        row = self.analyze(writes + [read])["candidates"][0]
+        self.assertEqual(row["source_bytes"], 32)
+        read["args"]["src"]["buffer"] = "other"
+        self.assertEqual(self.analyze(writes + [read])["candidate_count"], 0)
+
+    def test_dst_regions_and_unsorted_trace(self):
+        writes, read = self.fixture()
+        for write in writes:
+            write["args"]["dst_regions"] = [write["args"].pop("dst")]
+        row = self.analyze([read] + list(reversed(writes)))["candidates"][0]
+        self.assertEqual(row["whole_source_ready_cycle"], 35)
+
+    def test_concurrent_completed_writers_are_ambiguous(self):
+        writes, read = self.fixture()
+        writes += [
+            event("racing", "mte3", 30, 37, lane="vector0", dst=region(shape=(2, 2), offset=24))
+        ]
+        report = self.analyze(writes + [read])
+        self.assertEqual(report["candidate_count"], 0)
+        self.assertEqual(report["status_counts"]["ambiguous_writer_order"], 1)
+
+    def test_region_validation_and_large_rows_fail_closed(self):
+        for r in [
+                region(shape=(5000, 8)),
+                region(offset=-1),
+                region(strides=(16, 4)),
+                region(dtype="int4")
+        ]:
+            self.assertIsNone(tool.region_intervals(r))
+        self.assertEqual(tool.region_intervals(region(shape=(8,), strides=(4,))), [(0, 32)])
+
+    def test_interval_subtraction_retains_gaps(self):
+        self.assertEqual(
+            tool.split_coverage([(0, 10), (20, 30)], [(2, 5), (8, 22)]),
+            ([(2, 5), (8, 10), (20, 22)], [(0, 2), (5, 8), (22, 30)]))
+
+    def test_padding_metadata_is_not_full_source_read(self):
+        writes, read = self.fixture()
+        read["args"]["copy"] = {"valid_cols": 3}
+        report = self.analyze(writes + [read])
+        self.assertEqual(report["status_counts"]["unsupported_source_region"], 1)
+
+    def test_fake_memory_edge_does_not_change_readiness(self):
+        writes, read = self.fixture()
+        before = self.analyze(writes + [read])
+        read["args"]["memory_dependencies"] = ["f3"]
+        self.assertEqual(self.analyze(writes + [read]), before)
+
+    def test_equal_ready_times_do_not_imply_streaming(self):
+        writes, read = self.fixture()
+        for write in writes:
+            write["args"]["cycle_begin"] = 0
+            write["args"]["cycle_end"] = 5
+        report = self.analyze(writes + [read])
+        self.assertEqual(report["status_counts"]["single_ready_time"], 1)
+
+    def test_interval_subtraction_matches_byte_set_oracle(self):
+        rng = random.Random(42)
+        for _ in range(100):
+            unions = [
+                tool.merge_intervals([tuple(sorted(rng.sample(range(32), 2)))
+                                      for _ in range(5)])
+                for _ in range(2)
+            ]
+            a, b = [{i for lo, hi in spans for i in range(lo, hi)} for spans in unions]
+            matched, rest = tool.split_coverage(*unions)
+            self.assertEqual({i for lo, hi in matched for i in range(lo, hi)}, a & b)
+            self.assertEqual({i for lo, hi in rest for i in range(lo, hi)}, a - b)
 
 
 if __name__ == "__main__":

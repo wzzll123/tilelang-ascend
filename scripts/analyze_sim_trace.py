@@ -24,6 +24,7 @@ import logging
 import math
 import re
 import sys
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
@@ -651,6 +652,227 @@ def analyze_waits(events: Sequence[TraceEvent], top: int = 10) -> dict[str, Any]
     }
 
 
+def region_intervals(region: Any) -> list[tuple[int, int]] | None:
+    """Exact byte coverage for concrete dense rows; never replace holes with a hull."""
+    if not isinstance(region, dict):
+        return None
+    shape, strides = region.get("shape"), region.get("strides_bytes")
+    offset = region.get("byte_offset")
+    match = re.fullmatch(r"(?:float|bfloat|int|uint)(8|16|32|64)", str(region.get("dtype")))
+    if not match or type(offset) is not int or offset < 0:
+        return None
+    width = int(match[1]) // 8
+    if not isinstance(shape, list) or not 1 <= len(shape) <= 2:
+        return None
+    if any(type(n) is not int or n <= 0 for n in shape):
+        return None
+    if strides is None and len(shape) == 1:
+        strides = [width]
+    if not isinstance(strides, list) or len(strides) != len(shape):
+        return None
+    if any(type(s) is not int or s <= 0 for s in strides) or strides[-1] != width:
+        return None
+    if len(shape) == 1:
+        return [(offset, offset + shape[0] * width)]
+    rows, cols = shape
+    if rows > 4096 or strides[0] < cols * width:
+        return None
+    return merge_intervals([
+        (offset + r * strides[0], offset + r * strides[0] + cols * width) for r in range(rows)
+    ])
+
+
+def split_coverage(remaining: list[tuple[int, int]],
+                   coverage: list[tuple[int, int]]) -> tuple[list, list]:
+    """Return exact intersection and difference in linear time on interval unions."""
+    matched, rest = [], []
+    j = 0
+    for lo, hi in remaining:
+        cursor = lo
+        while j < len(coverage) and coverage[j][1] <= lo:
+            j += 1
+        k = j
+        while k < len(coverage) and coverage[k][0] < hi:
+            a, b = coverage[k]
+            a, b = max(a, lo), min(b, hi)
+            if cursor < a:
+                rest.append((cursor, a))
+            matched.append((a, b))
+            cursor = b
+            k += 1
+        if cursor < hi:
+            rest.append((cursor, hi))
+    return matched, rest
+
+
+def gm_region_key(region: Any) -> tuple | None:
+    if (isinstance(region, dict) and region.get("scope") == "gm" and
+            isinstance(region.get("buffer"), str) and region["buffer"]):
+        return ("gm", region["buffer"])
+    return None
+
+
+def analyze_fragment_readiness(events: Sequence[TraceEvent], top: int = 10) -> dict[str, Any]:
+    """Source-only GM copy splitting candidates, NOT a legality or speedup proof.
+
+    Latest completed writes are selected per byte, including partial overwrites.
+    A read/write overlap or unknown writer region suppresses optimistic results.
+    Histories are indexed by buffer and completion time; work is per row interval,
+    not per byte. Physical aliases under different buffer names remain unknown.
+    """
+    writes = defaultdict(list)
+    unknown_writes = defaultdict(list)
+    for index, op in enumerate(events):
+        if not event_is_active(op, False, False):
+            continue
+        regions = op.args.get("dst_regions") or []
+        if isinstance(op.args.get("dst"), dict):
+            regions = [op.args["dst"], *regions]
+        seen = set()
+        for region in regions:
+            key = gm_region_key(region)
+            if key is None:
+                continue
+            spans = region_intervals(region)
+            if spans is None:
+                unknown_writes[key].append(op)
+            elif (key, tuple(spans)) not in seen:
+                writes[key].append((op.end, index, op, spans))
+                seen.add((key, tuple(spans)))
+    for history in writes.values():
+        history.sort(key=lambda item: (item[0], item[1]))
+    ends = {key: [item[0] for item in history] for key, history in writes.items()}
+    counts, candidates, examples = defaultdict(int), [], []
+    read_count = 0
+    for read in sorted(events, key=lambda e: (e.ts, str(e.args.get("task_id", "")))):
+        if read.opname != "copy_gm_to_ub" or not event_is_active(read, False, False):
+            continue
+        read_count += 1
+        src = read.args.get("src")
+        key, spans = gm_region_key(src), region_intervals(src)
+        status = None
+        if (key is None or spans is None or (len(src["shape"]) == 2 and any(
+                read.args.get("copy", {}).get(field, size) != size
+                for field, size in zip(("valid_rows", "valid_cols"), src["shape"])))):
+            status = "unsupported_source_region"
+        elif any(op.ts < read.end for op in unknown_writes[key]):
+            status = "unknown_writer_region"
+        history = writes.get(key, [])
+        stop = bisect_right(ends.get(key, []), read.ts)
+        if status is None:
+            for _, _, op, coverage in history[stop:]:
+                if op.ts < read.end and intersection_length(spans, coverage):
+                    status = "overlapping_write"
+                    break
+        remaining, fragments = spans, []
+        if status is None:
+            for pos in range(stop - 1, -1, -1):
+                _, _, op, coverage = history[pos]
+                if coverage[-1][1] <= remaining[0][0] or coverage[0][0] >= remaining[-1][1]:
+                    continue
+                matched, remaining = split_coverage(remaining, coverage)
+                if matched:
+                    fragments.append((op, matched))
+                if not remaining:
+                    break
+            if remaining:
+                status = "incomplete_source"
+        if status is None:
+            # Conflicting overlapping writers do not establish a unique version,
+            # even when both have completed before this consumer starts.
+            for writer, matched in fragments:
+                for _, _, other, coverage in history[:stop]:
+                    if (other is not writer and other.ts < writer.end and writer.ts < other.end and
+                            intersection_length(matched, coverage)):
+                        status = "ambiguous_writer_order"
+                        break
+                if status:
+                    break
+        if status is None:
+            by_time = defaultdict(list)
+            for op, matched in fragments:
+                by_time[op.end].append((op, matched))
+            if len(by_time) < 2:
+                status = "single_ready_time"
+            else:
+                status = "fragment_prefetch_candidate"
+                total = interval_length(spans)
+                cumulative, milestones = 0, []
+                for ready, group in sorted(by_time.items()):
+                    intervals = merge_intervals([span for _, part in group for span in part])
+                    size = interval_length(intervals)
+                    cumulative += size
+                    milestones.append({
+                        "ready_cycle":
+                            ready,
+                        "bytes":
+                            size,
+                        "cumulative_fraction":
+                            cumulative / total,
+                        "producer_tasks":
+                            sorted({str(op.args.get("task_id", "unknown")) for op, _ in group}),
+                        "byte_intervals": [list(span) for span in intervals[:64]],
+                        "interval_count":
+                            len(intervals),
+                        "intervals_truncated":
+                            len(intervals) > 64,
+                    })
+                candidates.append({
+                    "consumer_task":
+                        read.args.get("task_id"),
+                    "core_idx":
+                        read.core_idx,
+                    "lane":
+                        read.lane_name,
+                    "pipe":
+                        read.pipe_name,
+                    "source":
+                        src,
+                    "source_bytes":
+                        total,
+                    "copy_start_cycle":
+                        read.ts,
+                    "whole_source_ready_cycle":
+                        max(by_time),
+                    "whole_copy_start_lag_cycles":
+                        read.ts - max(by_time),
+                    "first_fragment_lead_cycles":
+                        read.ts - min(by_time),
+                    "milestones":
+                        milestones,
+                    "legal_reschedule_proven":
+                        False,
+                    "requires": [
+                        "split copy and per-fragment ready notification",
+                        "check destination reuse, pipe availability and control dependencies",
+                        "retain full-row dependencies for downstream reductions"
+                    ],
+                })
+        counts[status] += 1
+        if status != "fragment_prefetch_candidate" and len(examples) < top:
+            examples.append({"consumer_task": read.args.get("task_id"), "status": status})
+    return {
+        "status":
+            "available" if read_count else "unavailable",
+        "meaning":
+            "source-only candidate from observed byte coverage, not legal rescheduling, hardware readiness or predicted speedup",
+        "coverage_scope":
+            "named GM buffers; concrete dense 1D/strided 2D rows only; no physical alias inference or unrecorded writes",
+        "read_count":
+            read_count,
+        "status_counts":
+            dict(counts),
+        "candidate_count":
+            len(candidates),
+        "candidates":
+            candidates[:top],
+        "candidate_order":
+            "earliest consumer start first",
+        "other_examples":
+            examples,
+    }
+
+
 def analyze_document(document: dict[str, Any],
                      path: str = "",
                      group_by: str = "pipe",
@@ -668,6 +890,7 @@ def analyze_document(document: dict[str, Any],
                         core_rows)
     report["overlaps"] = compute_overlaps(events, makespan)
     report["waits"] = analyze_waits(events, top)
+    report["fragment_readiness"] = analyze_fragment_readiness(events, top)
     report["warnings"] = []
     active: defaultdict[tuple[int, str, str], list[tuple[float, float]]] = defaultdict(list)
     for event in events:
@@ -858,6 +1081,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"wait {row['blocked_task']} flag={row['flag_id']} [{row['start_cycle']}, {row['end_cycle']}): "
                     f"producers={','.join(str(p['task_id']) for p in row['producers']) or 'unresolved'}"
                 )
+            readiness = report["fragment_readiness"]
+            print("\nSource-fragment prefetch candidates (NOT proven legal moves or speedups)")
+            print(
+                f"Copy reads: {readiness['read_count']}; status counts: {readiness['status_counts']}"
+            )
+            for row in readiness["candidates"]:
+                print(f"{row['consumer_task']}: source={row['source']['buffer']} "
+                      f"bytes={row['source_bytes']} start={row['copy_start_cycle']} "
+                      f"whole-ready={row['whole_source_ready_cycle']} "
+                      f"whole-copy lag={row['whole_copy_start_lag_cycles']}")
+                for part in row["milestones"]:
+                    print(f"  ready={part['ready_cycle']}: +{part['bytes']} bytes "
+                          f"cumulative={format_percent(part['cumulative_fraction'])} "
+                          f"producers={','.join(part['producer_tasks'])}")
+                print("  Requires: " + "; ".join(row["requires"]))
             for warning in report["warnings"]:
                 print("Warning: " + warning)
         return 0
