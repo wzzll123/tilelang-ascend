@@ -18,7 +18,6 @@ All test cases are written and executed at the Developer Level.
 """
 
 pass_configs = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
@@ -473,6 +472,125 @@ def run_test_silu(M, N, block_M, block_N, dtype, target):
 def test_silu(dtype, target, shape):
     M, N = shape
     run_test_silu(M, N, 128, 128, dtype, target)
+
+
+def activation_inplace(op_name, N, dtype="float"):
+    op = {
+        "relu": T.tile.relu,
+    }[op_name]
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((N,), dtype),  # type: ignore
+        B: T.Tensor((N,), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, _):
+            a_ub = T.alloc_ub((N,), dtype)
+            T.copy(A, a_ub)
+            op(a_ub, a_ub)
+            T.copy(a_ub, B)
+
+    return main
+
+
+def leaky_relu_inplace(N, alpha, dtype="float"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((N,), dtype),  # type: ignore
+        B: T.Tensor((N,), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, _):
+            a_ub = T.alloc_ub((N,), dtype)
+            T.copy(A, a_ub)
+            T.tile.leaky_relu(a_ub, a_ub, alpha)
+            T.copy(a_ub, B)
+
+    return main
+
+
+def run_test_activation_inplace(func, golden, N, dtype, target):
+    compiled = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float32 if dtype == "float" else torch.float16
+    a = torch.randn(N, dtype=torch_dtype).npu()
+
+    torch.npu.synchronize()
+
+    b = compiled(a)
+
+    torch.testing.assert_close(b, golden(a), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", ["float", pytest.param("float16", marks=pytest.mark.low_priority)])
+@pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
+def test_relu_inplace(dtype, target):
+    run_test_activation_inplace(activation_inplace("relu", 256, dtype), torch.relu, 256, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["float", pytest.param("float16", marks=pytest.mark.low_priority)])
+@pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
+def test_leaky_relu_inplace(dtype, target):
+    run_test_activation_inplace(leaky_relu_inplace(256, 0.1, dtype), lambda a: torch.nn.functional.leaky_relu(a, 0.1), 256, dtype, target)
+
+
+def activation_out_of_place(op_name, N, dtype="float"):
+    op = {
+        "sigmoid": T.tile.sigmoid,
+        "silu": T.tile.silu,
+    }[op_name]
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((N,), dtype),  # type: ignore
+        B: T.Tensor((N,), dtype),  # type: ignore
+        C: T.Tensor((N,), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, _):
+            a_ub = T.alloc_ub((N,), dtype)
+            b_ub = T.alloc_ub((N,), dtype)
+            T.copy(A, a_ub)
+            op(b_ub, a_ub)
+            T.copy(b_ub, B)
+            T.copy(a_ub, C)
+
+    return main
+
+
+def run_test_src_after_call(func, golden, N, dtype, target):
+    """Check dst correctness and src contents after an out-of-place call.
+
+    AscendC preserves src; PTO rewrites src in place with 1 + exp(-src)
+    (documented backend limitation).
+    """
+    compiled = tilelang.compile(func, out_idx=None, pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float32 if dtype == "float" else torch.float16
+    a = torch.randn(N, dtype=torch_dtype).npu()
+    b = torch.zeros(N, dtype=torch_dtype).npu()
+    c = torch.zeros(N, dtype=torch_dtype).npu()
+
+    torch.npu.synchronize()
+
+    compiled(a, b, c)
+
+    torch.testing.assert_close(b, golden(a), rtol=1e-2, atol=1e-2)
+    if target == "pto":
+        expected_src = 1.0 + torch.exp(-a)
+    else:
+        expected_src = a
+    torch.testing.assert_close(c, expected_src, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", ["float", pytest.param("float16", marks=pytest.mark.low_priority)])
+@pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
+def test_sigmoid_src_after_call(dtype, target):
+    run_test_src_after_call(activation_out_of_place("sigmoid", 256, dtype), torch.sigmoid, 256, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["float", pytest.param("float16", marks=pytest.mark.low_priority)])
+@pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
+def test_silu_src_after_call(dtype, target):
+    run_test_src_after_call(activation_out_of_place("silu", 256, dtype), lambda a: a * torch.sigmoid(a), 256, dtype, target)
 
 
 def vec_mul_add_dst(M, N, block_M, block_N, dtype="float"):
@@ -2168,6 +2286,48 @@ def test_vec_div(dtype, target, shape):
     run_test_vec_div(M, N, 64, 128, dtype, target=target)
 
 
+def test_divs_fp16_preserves_reciprocal_precision():
+    @T.prim_func
+    def main(A: T.Tensor((128,), "float16"), B: T.Tensor((128,), "float16")):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((128,), "float16")
+            b_ub = T.alloc_ub((128,), "float16")
+            T.copy(A, a_ub)
+            T.tile.div(b_ub, a_ub, 65536.0)
+            T.copy(b_ub, B)
+
+    kernel = tilelang.compile(main, out_idx=[1], target="ascendc", pass_configs=pass_configs)
+    a = torch.full((128,), 65504.0, dtype=torch.float16).npu()
+    expected = (a.cpu().float() / 65536.0).half()
+    torch.testing.assert_close(kernel(a).cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "operation,scalar_value,input_value,expected_value",
+    [("div", 65536.0, 65504.0, 0.99951171875), ("sub", 3.5, 2.0, -1.5)],
+)
+def test_transformed_scalar_buffer_preserves_storage_dtype(operation, scalar_value, input_value, expected_value):
+    scalar_op = getattr(T.tile, operation)
+
+    @T.prim_func
+    def main(A: T.Tensor((128,), "float16"), S: T.Tensor((16,), "float32"), B: T.Tensor((128,), "float16")):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((128,), "float16")
+            s_ub = T.alloc_ub((16,), "float32")
+            b_ub = T.alloc_ub((128,), "float16")
+            T.copy(A, a_ub)
+            T.copy(S, s_ub)
+            scalar_op(b_ub, a_ub, s_ub[3])
+            T.copy(b_ub, B)
+
+    kernel = tilelang.compile(main, out_idx=[2], target="ascendc", pass_configs=pass_configs)
+    a = torch.full((128,), input_value, dtype=torch.float16).npu()
+    scalar = torch.zeros((16,), dtype=torch.float32)
+    scalar[3] = scalar_value
+    expected = torch.full((128,), expected_value, dtype=torch.float16)
+    torch.testing.assert_close(kernel(a, scalar.npu()).cpu(), expected, rtol=0, atol=0)
+
+
 def exp(M, N, block_M, block_N, dtype="float"):
     m_num = M // block_M
     n_num = N // block_N
@@ -3064,6 +3224,82 @@ def run_test_vec_max(M, N, block_M, block_N, dtype, target):
 def test_vec_max(dtype, target, shape):
     M, N = shape
     run_test_vec_max(M, N, 64, 128, dtype, target=target)
+
+
+def vec_max_row_region(dtype):
+    @T.prim_func
+    def main(
+        A: T.Tensor((4, 64), dtype),  # type: ignore
+        B: T.Tensor((4, 64), dtype),  # type: ignore
+        C: T.Tensor((4, 64), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, _):
+            a_ub = T.alloc_ub((4, 64), dtype)
+            b_ub = T.alloc_ub((4, 64), dtype)
+            c_ub = T.alloc_ub((4, 64), dtype)
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            T.tile.max(c_ub[1:3, :], a_ub[1:3, :], b_ub[1:3, :])
+            T.copy(c_ub, C)
+
+    return main
+
+
+def run_test_vec_max_row_region(dtype, target):
+    func = vec_max_row_region(dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=pass_configs, target=target)
+
+    torch_dtype = torch.float32 if dtype == "float" else torch.float16
+    a = torch.randn(4, 64, dtype=torch_dtype).npu()
+    b = torch.randn(4, 64, dtype=torch_dtype).npu()
+
+    torch.npu.synchronize()
+
+    c = func(a, b)
+
+    ref_c = torch.max(a, b)
+    torch.testing.assert_close(c[1:3, :], ref_c[1:3, :], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", ["float", "float16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_vec_max_row_region(dtype, target):
+    run_test_vec_max_row_region(dtype, target)
+
+
+def test_binary_op_region_validation():
+    dst = tir.decl_buffer((4, 64), "float32", scope="shared.ub")
+    src0 = tir.decl_buffer((4, 64), "float32", scope="shared.ub")
+    src1 = tir.decl_buffer((4, 64), "float32", scope="shared.ub")
+
+    # Flat-contiguous regions keep the linear vector semantics and are accepted.
+    whole = T.tile.max(dst[:, :], src0[:, :], src1[:, :])
+    assert int(whole.args[3]) == 4 * 64
+    rows = T.tile.max(dst[1:3, :], src0[1:3, :], src1[1:3, :])
+    assert int(rows.args[3]) == 2 * 64
+    single_row = T.tile.max(dst[2, :], src0[2, :], src1[2, :])
+    assert int(single_row.args[3]) == 64
+    row_window = T.tile.max(dst[2, 8:40], src0[2, 8:40], src1[2, 8:40])
+    assert int(row_window.args[3]) == 32
+
+    vec_dst = tir.decl_buffer((256,), "float32", scope="shared.ub")
+    vec_src0 = tir.decl_buffer((256,), "float32", scope="shared.ub")
+    vec_src1 = tir.decl_buffer((256,), "float32", scope="shared.ub")
+    span = T.tile.max(vec_dst[8:40], vec_src0[8:40], vec_src1[8:40])
+    assert int(span.args[3]) == 32
+
+    # Column-offset slices are rejected at trace time instead of silently
+    # producing wrong results (aligned offset) or aicore exception 507015
+    # (unaligned offset). See issue #1680.
+    column_window = r"must be contiguous when flattened"
+    with pytest.raises(ValueError, match=column_window):
+        T.tile.max(dst[:, 8:40], src0[:, 8:40], src1[:, 8:40])
+    with pytest.raises(ValueError, match=column_window):
+        T.tile.max(dst[:, 8:40], src0[:, 8:40], 1.0)
+    with pytest.raises(ValueError, match=column_window):
+        T.tile.max(dst, src0, src1[:, 8:40])
+    with pytest.raises(ValueError, match=column_window):
+        T.tile.add(dst[:, 8:40], src0[:, 8:40], src1[:, 8:40])
 
 
 def vec_maxs(M, N, block_M, block_N, scalar, dtype="float"):
@@ -4430,6 +4666,22 @@ def test_vec_subs(dtype, target, shape):
     M, N = shape
     scalar = 3.0 if dtype in ["float", "float16"] else 3
     run_test_vec_subs(M, N, 128, 256, scalar, dtype, target=target)
+
+
+def test_subs_int16_negates_before_scalar_conversion():
+    @T.prim_func
+    def main(A: T.Tensor((128,), "int16"), B: T.Tensor((128,), "int16")):
+        with T.Kernel(1, threads=1, is_npu=True):
+            a_ub = T.alloc_ub((128,), "int16")
+            b_ub = T.alloc_ub((128,), "int16")
+            T.copy(A, a_ub)
+            T.tile.sub(b_ub, a_ub, 32768.0)
+            T.copy(b_ub, B)
+
+    kernel = tilelang.compile(main, out_idx=[1], target="ascendc", pass_configs=pass_configs)
+    a = torch.zeros((128,), dtype=torch.int16).npu()
+    expected = torch.full((128,), -32768, dtype=torch.int16)
+    torch.testing.assert_close(kernel(a).cpu(), expected, rtol=0, atol=0)
 
 
 def transpose(M, N, block_M, block_N, dtype="int16"):

@@ -104,9 +104,10 @@ class ExecutionRecord:
 class ChromeTraceExporter:
     """Export execution records using the Chrome Trace Event Format."""
 
-    def __init__(self, platform: str, calibration: str) -> None:
+    def __init__(self, platform: str, calibration: str, *, timing_limitations: tuple[str, ...] = ()) -> None:
         self.platform = platform
         self.calibration = calibration
+        self.timing_limitations = timing_limitations
 
     def to_dict(
         self,
@@ -134,6 +135,7 @@ class ChromeTraceExporter:
                     "platform": self.platform,
                     "timestamp_unit": "simulator_cycle",
                     "calibration": self.calibration,
+                    "timing_limitations": list(self.timing_limitations),
                 },
             },
         ]

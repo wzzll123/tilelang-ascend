@@ -7,6 +7,10 @@ The wqbm bf16 epilogue narrows fp32 accumulators to bf16 in UB via
 len>``) and ``T.tile.cast(..., "CAST_RINT", ...)``.  NumPy has no native
 bfloat16, so the simulator maps it to ``ml_dtypes.bfloat16`` (RNE casts,
 verified bit-exact against torch.bfloat16).
+
+A2/A3 vector Add/Mul do not accept bf16 operands. Arithmetic tests explicitly
+widen to fp32 and round each result back to bf16; direct bf16 vector operations
+must be rejected by the same final lowering used for native compilation.
 """
 
 import numpy as np
@@ -129,18 +133,59 @@ def _bf16_arithmetic_kernel(platform):
             with T.Kernel(1, is_npu=True):
                 source_ub = T.alloc_ub([4, 32], "bfloat16")
                 scaled_ub = T.alloc_ub([4, 32], "bfloat16")
-                bias_ub = T.alloc_ub([4, 32], "bfloat16")
                 out_ub = T.alloc_ub([4, 32], "bfloat16")
+                source_f32 = T.alloc_ub([4, 32], "float32")
+                scaled_f32 = T.alloc_ub([4, 32], "float32")
+                out_f32 = T.alloc_ub([4, 32], "float32")
                 with T.Scope("V"):
                     T.copy(source, source_ub)
-                    T.copy(source, bias_ub)
-                    T.tile.mul(scaled_ub, source_ub, source_ub)
-                    T.tile.add(out_ub, scaled_ub, bias_ub)
+                    T.copy(source_ub, source_f32)
+                    T.tile.mul(scaled_f32, source_f32, source_f32)
+                    # Preserve torch bf16 multiplication's intermediate rounding.
+                    T.tile.cast(scaled_ub, scaled_f32, "CAST_RINT", 4 * 32)
+                    T.copy(scaled_ub, scaled_f32)
+                    T.tile.add(out_f32, scaled_f32, source_f32)
+                    T.tile.cast(out_ub, out_f32, "CAST_RINT", 4 * 32)
                     T.copy(out_ub, output)
 
         return main
 
     return kernel()
+
+
+@pytest.mark.parametrize("platform", ["A2", "A3"])
+@pytest.mark.parametrize("operation", ["mul", "add"])
+def test_direct_bfloat16_vector_arithmetic_is_rejected(platform, operation) -> None:
+    @tilelang.jit(
+        out_idx=[1],
+        simulator=True,
+        platform=platform,
+        pass_configs=PASS_CONFIGS,
+    )
+    def kernel():
+        @T.prim_func
+        def main(
+            source: T.Tensor([4, 32], "bfloat16"),
+            output: T.Tensor([4, 32], "bfloat16"),
+        ):
+            with T.Kernel(1, is_npu=True):
+                source_ub = T.alloc_ub([4, 32], "bfloat16")
+                out_ub = T.alloc_ub([4, 32], "bfloat16")
+                with T.Scope("V"):
+                    T.copy(source, source_ub)
+                    if operation == "mul":
+                        T.tile.mul(out_ub, source_ub, source_ub)
+                    else:
+                        T.tile.add(out_ub, source_ub, source_ub)
+                    T.copy(out_ub, output)
+
+        return main
+
+    with pytest.raises(
+        Exception,
+        match=rf"Unsupported AscendC Vector dtype bfloat16 for tl.ascend_{operation}",
+    ):
+        kernel()
 
 
 def test_copy_ub_to_ub_float32_to_bfloat16_narrowing() -> None:

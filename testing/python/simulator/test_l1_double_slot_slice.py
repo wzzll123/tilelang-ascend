@@ -70,6 +70,8 @@ def _double_slot_l1_kernel(platform):
                         T.set_flag("m", "mte1", 0)
                         T.wait_flag("m", "mte1", 0)
                         T.set_flag("mte1", "mte2", k % 2)
+                    T.set_flag("m", "fix", 0)
+                    T.wait_flag("m", "fix", 0)
                     T.copy(acc, output)
                     T.wait_flag("mte1", "mte2", 0)
                     T.wait_flag("mte1", "mte2", 1)

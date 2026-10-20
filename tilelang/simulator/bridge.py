@@ -182,6 +182,11 @@ def classify_operation(operation: str, lane: Lane) -> tuple[Lane, Pipe, str]:
 
     if "shmem" in short:
         raise UnsupportedSimOpError(f"Ascend shmem operation {operation!r} is intentionally unsupported")
+    if short == "copy_ub_to_ub_selected":
+        raise UnsupportedSimOpError(
+            "compiler-selected UB copy requires validated AscendVectorSemanticProjection "
+            "before simulator classification"
+        )
     if short in {
         "set_flag",
         "wait_flag",

@@ -157,6 +157,7 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target, platform: str) -> tvm.IRModule:
+    # Consume the shared lowering boundary unchanged for native and simulator parity.
     if target.model == "ascendc" or target.model == "auto":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_ascend")(device_mod, target, platform)
     elif target.model == "pto":
@@ -188,12 +189,12 @@ def lower_ascend_ir(
     target: str | Target = "auto",
     platform: str = "auto",
 ) -> tuple[tvm.IRModule, list[KernelParam]]:
-    """Lower an Ascend program to the final, simplified pre-codegen TIR.
+    """Lower an Ascend program to the final pre-codegen TIR.
 
     This is the authoritative lowering boundary shared by native compilation and
     alternate execution backends such as the CPU simulator.  Callers consuming
     this TIR therefore observe the same legalization, target optimization,
-    memory planning, synchronization insertion, and final simplification.
+    memory planning, synchronization insertion, and physical vector terminals.
     """
     from tilelang.utils.target import determine_platform
 
@@ -207,7 +208,11 @@ def lower_ascend_ir(
 
     mod = LowerAndLegalize(mod, target)
     mod = OptimizeForTarget(mod, target, platform)
-    mod = tir.transform.Simplify()(mod)
+    managed_vector_mask = target.model in {"ascendc", "auto"} and platform in {"A2", "A3"}
+    if not managed_vector_mask:
+        # OptimizeForTarget ends managed A2/A3 lowering with mask legalization.
+        # Its physical mask protocol must reach codegen without further rewrites.
+        mod = tir.transform.Simplify()(mod)
 
     func = mod.functions_items()[0][1]
     return mod, extrac_params(func)

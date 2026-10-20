@@ -44,6 +44,8 @@ def _symbolic_flag_kernel(platform):
                     a_l1: make_zn_layout(a_l1),
                     b_l1: make_zn_layout(b_l1),
                 })
+                a_l0 = T.alloc_L0A([16, 32], "float16")
+                b_l0 = T.alloc_L0B([32, 16], "float16")
                 acc = T.alloc_L0C([16, 16], "float32")
                 with T.Scope("C"):
                     # Pre-set both L1 slots so the first loads may proceed.
@@ -56,9 +58,18 @@ def _symbolic_flag_kernel(platform):
                         T.copy(right[k * 32:(k + 1) * 32, :], b_l1[k % 2, :, :])
                         T.set_flag("mte2", "mte1", k % 2)
                         T.wait_flag("mte2", "mte1", k % 2)
-                        T.gemm_v0(a_l1[k % 2, :, :], b_l1[k % 2, :, :], acc,
-                                  init=(k == 0))
+                        # Keep this test about symbolic event IDs, rather than
+                        # relying on a composite helper's hidden event protocol.
+                        T.copy(a_l1[k % 2, :, :], a_l0)
+                        T.copy(b_l1[k % 2, :, :], b_l0)
+                        T.set_flag("mte1", "m", 0)
+                        T.wait_flag("mte1", "m", 0)
+                        T.mma(a_l0, b_l0, acc, init=(k == 0))
+                        T.set_flag("m", "mte1", 0)
+                        T.wait_flag("m", "mte1", 0)
                         T.set_flag("mte1", "mte2", k % 2)
+                    T.set_flag("m", "fix", 0)
+                    T.wait_flag("m", "fix", 0)
                     T.copy(acc, output)
                     # Drain the pre-set slot flags.
                     T.wait_flag("mte1", "mte2", 0)
@@ -71,6 +82,14 @@ def _symbolic_flag_kernel(platform):
 
 def test_symbolic_local_flag_id_resolves(platform="A2"):
     ker = _symbolic_flag_kernel(platform)()
+    symbolic_slots = {
+        task.metadata["flag_id"]
+        for task in ker.get_simulator_ir().tasks
+        if task.operation in {"set_flag", "wait_flag"}
+        and task.metadata.get("src_pipe") == "mte1"
+        and task.metadata.get("dst_pipe") == "mte2"
+    }
+    assert symbolic_slots == {0, 1}
     left = np.random.randn(16, 64).astype(np.float16)
     right = np.random.randn(64, 16).astype(np.float16)
     out = ker(left, right)

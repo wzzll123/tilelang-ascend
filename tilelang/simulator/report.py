@@ -38,6 +38,7 @@ class PerformanceReport:
     stats: SimulationStats
     critical_path: Mapping[str, Any]
     schedule_records: tuple[ExecutionRecord, ...] = ()
+    timing_limitations: tuple[str, ...] = ()
 
     @classmethod
     def from_stats(
@@ -167,7 +168,7 @@ class PerformanceReport:
         )[:5]
         waits = self.stats.wait_cycles_by_reason
         major_stalls = sorted(waits, key=lambda reason: (-waits[reason], reason))[:5]
-        measured = self.calibration.startswith("measured-")
+        measured = self.calibration.startswith("measured-") and not self.timing_limitations
         return {
             "schema_version": REPORT_SCHEMA_VERSION,
             "platform": self.platform,
@@ -176,6 +177,7 @@ class PerformanceReport:
                 "calibration": self.calibration,
                 "estimator": self.timing_estimator,
                 "measured": measured,
+                "limitations": list(self.timing_limitations),
                 "interpretation": (
                     "measured hardware timing"
                     if measured
@@ -469,6 +471,7 @@ class PerformanceReport:
             ),
             f"timing={timing['calibration']}: {timing['interpretation']}",
         ]
+        lines.extend(f"timing limitation: {limitation}" for limitation in self.timing_limitations)
         resources = document["top_resources"]
         if resources:
             lines.append(

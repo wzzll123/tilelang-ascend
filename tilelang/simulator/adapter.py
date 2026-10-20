@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ class SimulatorKernelAdapter:
         self.workspace_idx = self._normalize_indices(workspace_idx, "workspace_idx")
         self.config = config
         self.program = program
+        self.timing_limitations = tuple(program.metadata.get("timing_limitations", ()))
         self.artifact = None
         self.dynamic_symbolic_map = self._dynamic_symbolic_map()
         self.last_schedule: ScheduleResult | None = None
@@ -110,6 +112,7 @@ class SimulatorKernelAdapter:
             exporter = ChromeTraceExporter(
                 self.config.platform,
                 self.config.timing_profile.calibration,
+                timing_limitations=self.timing_limitations,
             )
             timeline = self.last_execution.memory.local_memory_live_bytes(result.records) if self.last_execution is not None else ()
             self.last_trace = exporter.write(
@@ -117,16 +120,14 @@ class SimulatorKernelAdapter:
                 result.records,
                 local_memory_timeline=timeline,
             )
-        self.last_report = PerformanceReport.from_schedule(
-            result, self.config, trace_path=self.last_trace
-        )
+        self.last_report = PerformanceReport.from_schedule(result, self.config, trace_path=self.last_trace)
+        if self.timing_limitations:
+            self.last_report = replace(self.last_report, timing_limitations=self.timing_limitations)
 
     def performance_report(self) -> PerformanceReport:
         """Return the most recent compact simulator performance report."""
         if self.last_report is None:
-            raise SimulatorConfigError(
-                "no simulator schedule is available; call schedule() first"
-            )
+            raise SimulatorConfigError("no simulator schedule is available; call schedule() first")
         return self.last_report
 
     def get_kernel_source(self) -> str:
@@ -285,7 +286,7 @@ def create_simulator_adapter(
 
     try:
         from tilelang import tvm
-        from tilelang.engine.lower import lower_ascend_ir
+        from tilelang.engine.lower import _normalize_ascend_target, lower_ascend_ir
     except (ImportError, OSError) as error:
         raise UnsupportedSimOpError("creating a simulator adapter requires the TileLang TVM runtime") from error
 
@@ -295,11 +296,30 @@ def create_simulator_adapter(
             target=target,
             platform=config.platform,
         )
+        from tilelang.transform import AscendVectorSemanticProjection
+
+        semantic_mod = AscendVectorSemanticProjection(_normalize_ascend_target(target), config.platform)(optimized_mod)
     program = build_kernel_program(
-        optimized_mod,
+        semantic_mod,
         platform=config.platform,
         timing_profile=config.timing_profile,
     )
+    if any(
+        func.attrs is not None and func.attrs.get("tilelang.simulator_vector_semantic_projection", 0)
+        for _, func in semantic_mod.functions_items()
+    ):
+        program = replace(
+            program,
+            metadata={
+                **program.metadata,
+                "vector_semantic_projection": True,
+                "timing_limitations": (
+                    "Compiler-managed Vector mask setter timing is not modeled; "
+                    "the validated semantic projection preserves functional and synchronization behavior, "
+                    "not physical Vector instruction timing.",
+                ),
+            },
+        )
     return SimulatorKernelAdapter(
         optimized_mod=optimized_mod,
         params=params,

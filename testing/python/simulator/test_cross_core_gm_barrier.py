@@ -45,6 +45,7 @@ def _bare_bridge() -> _TirBridge:
         "WS": BufferSpec("WS", MemoryScope.WORKSPACE, (2, 64, 8), "float32"),
     }
     bridge.active_aliases = {}
+    bridge.region_overlap_cache = {}
     return bridge
 
 

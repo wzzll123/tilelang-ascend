@@ -3970,7 +3970,7 @@ def test_row_expand_orders_raw_against_producer() -> None:
 
 
 def test_row_expand_validates_rows_dtype_alignment_and_tag() -> None:
-    with pytest.raises(ProgramValidationError, match="256-byte"):
+    with pytest.raises(ProgramValidationError, match="physical row stride"):
         build_kernel_program(
             _row_expand_primfunc(dtype="float16", cols_override=32),
             platform="A2",

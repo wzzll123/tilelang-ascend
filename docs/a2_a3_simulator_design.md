@@ -90,10 +90,12 @@ UnrollLoop and TIR cleanup
 AscendMemoryPlanning
 AscendSyncInsert
 AscendSyncInsertVS
+AscendResourceScopeVerify
+AscendVectorInstructionSelection / AscendVectorMaskLegalize (A2/A3 AscendC)
 ```
 
-Therefore, the authoritative simulation input is the module **after `OptimizeForTarget` and a
-final `tir.transform.Simplify()`, but before `device_codegen`**. At this point software pipelines
+Therefore, the authoritative simulation input is the module **after `OptimizeForTarget`, but
+before `device_codegen`**. No TIR rewrite may follow Vector mask legalization. At this point software pipelines
 have been expanded, local memory has been planned, and both explicit and automatically inserted
 synchronization remain visible in TIR.
 
@@ -116,6 +118,15 @@ The bridge consumes TIR intrinsics and `call_extern` operations. It does not par
 Unknown operations must produce an error containing the TIR operation name, source span when
 available, platform, target model, and the current lane/pipe; silently skipping an operation is
 forbidden.
+
+For compiler-managed A2/A3 AscendC Vector terminals, the simulator first applies
+`AscendVectorSemanticProjection`: it uses the compiler's terminal schema to recover semantic
+calls, then requires selection and mask legalization to reconstruct the original body exactly.
+Missing or changed mask repairs and terminal payloads fail closed; this is not permission to
+ignore arbitrary mask operations. The projected copy retains ownership, memory regions, actual
+instruction order and synchronization, while the original final TIR remains available for
+inspection. Physical mask-setter timing is not modeled: SimIR, performance reports and exported
+traces explicitly carry `timing_limitations`, and such reports are not labeled measured timing.
 
 ## 4. Public API and JIT integration
 
