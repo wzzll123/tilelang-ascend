@@ -97,6 +97,7 @@ _VECTOR_OPS = frozenset(
         "sort",
         "sort32",
         "sqrt",
+        "tanh",
         "sub",
         "subs",
         "tail_binary",
@@ -180,6 +181,9 @@ def classify_operation(operation: str, lane: Lane) -> tuple[Lane, Pipe, str]:
     normalized = operation.strip().lower()
     short = _short_operation(normalized)
 
+    if short == "fia_helper":
+        return _vector_lane(lane), Pipe.VECTOR, short
+
     if "shmem" in short:
         raise UnsupportedSimOpError(f"Ascend shmem operation {operation!r} is intentionally unsupported")
     if short == "copy_ub_to_ub_selected":
@@ -230,7 +234,7 @@ def classify_operation(operation: str, lane: Lane) -> tuple[Lane, Pipe, str]:
     if short in {"scalar", "printf", "dump_tensor", "free_pipe"}:
         return lane, Pipe.SCALAR, short
     if normalized == "buffer_store":
-        return _vector_lane(lane), Pipe.VECTOR, normalized
+        return lane if lane is not Lane.CONTROL else Lane.VECTOR_0, Pipe.SCALAR, normalized
     raise UnsupportedSimOpError(f"unsupported lowered simulator operation: {operation!r}")
 
 
@@ -392,6 +396,14 @@ class _TirBridge:
                 "timing_calibration": self.timing_profile.calibration,
                 "source": "final-optimized-tir",
                 "loop_break_count": self.loop_break_count,
+                "timing_limitations": (
+                    (
+                        "Versioned FIA helpers preserve functional/synchronization contracts; "
+                        "their internal Vector instruction timing is not modeled.",
+                    )
+                    if any(task.operation == "fia_helper" for core in cores for task in core.tasks)
+                    else ()
+                ),
             },
         )
 
@@ -566,13 +578,68 @@ class _TirBridge:
                 self._emit_call(stmt.value, context)
                 return
         if isinstance(stmt, tir.BufferStore):
+            substitutions = {
+                var: tir.const(value, var.dtype)
+                for var, value in context.environment.items()
+                if isinstance(var, tir.Var) and isinstance(value, (int, float))
+            }
+            value = tir.stmt_functor.substitute(stmt.value, substitutions)
+            sources = []
+
+            def collect_load(node):
+                if isinstance(node, tir.BufferLoad):
+                    sources.append(self._scalar_buffer_region(node.buffer, node.indices, context))
+
+            tir.stmt_functor.post_order_visit(value, collect_load)
+            destination = self._scalar_buffer_region(stmt.buffer, stmt.indices, context)
             self._emit_task(
                 "buffer_store",
                 context,
-                metadata={"buffer": str(stmt.buffer.name), "tir": str(stmt)},
+                metadata={
+                    "buffer": str(stmt.buffer.name),
+                    "dst": destination,
+                    "src_regions": tuple(sources),
+                    "store_value": value,
+                    "scalar_store": True,
+                },
             )
             return
         raise UnsupportedSimOpError(f"unsupported final TIR statement {type(stmt).__name__} in {self.kernel_name}")
+
+    def _scalar_buffer_region(self, buffer, indices, context):
+        name = self.buffer_name_by_data_var.get(self._var_name(buffer.data))
+        if name is None:
+            raise UnsupportedSimOpError(f"scalar expression references unknown buffer {buffer.name}")
+        shape = tuple(self._require_int(extent, context.environment, "scalar buffer extent") for extent in buffer.shape)
+        strides = (
+            tuple(self._require_int(stride, context.environment, "scalar buffer stride") for stride in buffer.strides)
+            if buffer.strides
+            else tuple(
+                stride // dtype_size_bytes(str(buffer.dtype))
+                for stride in contiguous_strides_bytes(shape, dtype_size_bytes(str(buffer.dtype)))
+            )
+        )
+        if len(indices) != len(shape):
+            raise ProgramValidationError("scalar buffer index rank does not match its shape")
+        offset = self._runtime_int(buffer.elem_offset, context.environment)
+        if offset is None:
+            raise UnsupportedSimOpError("scalar buffer offset must be executable")
+        for index, extent, stride in zip(indices, shape, strides):
+            scalar = self._runtime_int(index, context.environment)
+            if scalar is None:
+                raise UnsupportedSimOpError("scalar buffer index must be executable")
+            if isinstance(scalar, int) and not 0 <= scalar < extent:
+                raise ProgramValidationError("scalar buffer index is outside its logical extent")
+            offset = _add_runtime_int(offset, _scale_runtime_int(scalar, stride))
+        spec = self.buffers[name]
+        return BufferRegion(
+            name,
+            spec.scope,
+            (1,),
+            str(buffer.dtype),
+            byte_offset=_scale_runtime_int(offset, dtype_size_bytes(str(buffer.dtype))),
+            core_id=None if spec.scope in {MemoryScope.GM, MemoryScope.WORKSPACE} else context.core_id,
+        )
 
     def _visit_attr(self, stmt: Any, context: _Context) -> None:
         key = str(stmt.attr_key)
@@ -647,6 +714,11 @@ class _TirBridge:
 
     def _emit_call(self, call: Any, context: _Context) -> None:
         operation, arguments = self._call_operation(call)
+        if _short_operation(operation) == "src_code":
+            if context.lane not in {Lane.VECTOR_0, Lane.VECTOR_1}:
+                raise UnsupportedSimOpError("FIA opaque helper requires explicit Vector ownership")
+            self._emit_task("fia_helper", context, metadata=self._fia_helper_metadata(arguments, context))
+            return
         if operation == "tl.loop_break":
             raise _LoopBreak
         lowered_operation = operation
@@ -715,6 +787,103 @@ class _TirBridge:
                 self.active_aliases[(destination.scope, owner, destination.buffer)] = source.buffer
                 self.region_overlap_cache.clear()
                 self.memory_history_candidate_key_cache.clear()
+
+    def _fia_helper_metadata(self, arguments, context):
+        from .fia_helpers import helper_metadata, validate_contract
+
+        tags = [
+            (i, str(arg.value))
+            for i, arg in enumerate(arguments)
+            if isinstance(arg, self.tir.StringImm) and str(arg.value).startswith("sim.fia.")
+        ]
+        if len(tags) != 1:
+            raise UnsupportedSimOpError("opaque src_code requires one known versioned FIA contract")
+        index, tag = tags[0]
+        source = self._literal(arguments[0])
+        kind = validate_contract(tag, source)
+        version = 2 if tag.startswith("sim.fia.v2.") else 1
+        names = (
+            ("score", "maxv", "sums", "alpha", "denom", "scratch")
+            if kind.startswith("flash")
+            else ("score", "col")
+            if kind == "tail"
+            else ("dst", "alpha" if kind == "rescale" else "denom", "brcb")
+        )
+        original_count = 9 if kind.startswith("flash") else 5 if kind == "rescale" else 3 if kind == "tail" else 4
+        scalar_count = 2 if kind.startswith("flash") else 0 if kind in ("normalize", "normalize_divmul") else 1
+        banked = version == 2 and kind in ("flash_init", "flash_update", "tail")
+        if banked:
+            original_count += 1  # sm_bank keeps the raw source's scalar live.
+            scalar_count = 5 if kind.startswith("flash") else 3
+        if index != original_count or len(arguments) != index + 1 + scalar_count:
+            raise UnsupportedSimOpError(f"malformed {tag} argument count")
+        scalars = tuple(self._runtime_int(arg, context.environment) for arg in arguments[index + 1 :])
+        keywords = (
+            {"slot": scalars[0], "row": scalars[1]}
+            if kind.startswith("flash")
+            else {"slot": scalars[0]}
+            if kind == "rescale"
+            else {"valid": scalars[0]}
+            if kind == "tail"
+            else {}
+        )
+        rows, work, bank = 16, 49152, 0
+        if version == 2 and not banked:
+            keywords.update(version=2, work=8192)
+        if banked:
+            rows, work, bank = (scalars[2], scalars[3], scalars[4]) if kind.startswith("flash") else (scalars[1], 8192, scalars[2])
+            if rows not in (8, 16, 32) or work not in (8192, 16384) or bank not in (0, 1):
+                raise UnsupportedSimOpError(f"unsupported {tag} rows/work/bank")
+            keywords.update(rows=rows, work=work, version=version)
+            compact = "".join(source.split())
+            if kind.startswith("flash"):
+                update = "true" if kind == "flash_update" else "false"
+                expected = (
+                    f"fia_aligned::Flash<{update},{rows},{work}>(score[sm_bank*{rows * 512}],maxv,sums,alpha,denom,scratch,sm_slot,sm_row);"
+                )
+            else:
+                expected = f"fia_aligned::Tail<{keywords['valid']},{rows}>(score[sm_bank*{rows * 512}],tail_col);"
+            if compact != expected:
+                raise UnsupportedSimOpError("FIA v2 source and explicit scalar contract disagree")
+        shapes = {
+            "score": (rows, 512),
+            "maxv": (64,),
+            "sums": (192,),
+            "alpha": (192,),
+            "denom": (64,),
+            "scratch": (work,),
+            "dst": (64, 128),
+            "brcb": (64, 8),
+            "col": (512,),
+        }
+        regions = {}
+        for offset, name in enumerate(names, 1):
+            shape = shapes[name]
+            pointer = arguments[offset]
+            extent = self._access_ptr_extent(pointer, context)
+            required = 1
+            for value in shape:
+                required *= value
+            if not isinstance(extent, int) or extent < required:
+                raise UnsupportedSimOpError(f"{tag} requires a complete {name} pointer extent")
+            if name == "score" and banked and (extent not in (required, required * 2) or (bank + 1) * required > extent):
+                raise UnsupportedSimOpError("FIA v2 score bank exceeds its 1/2-bank allocation")
+            regions[name] = self._access_buffer_region(pointer, shape, context, physical_cols=shape[-1])
+            if name == "score" and banked and bank:
+                region = regions[name]
+                if region is None:
+                    raise UnsupportedSimOpError("FIA v2 score pointer cannot resolve to a buffer")
+                regions[name] = replace(region, byte_offset=region.byte_offset + bank * required * 4)
+        if kind == "tail" and version == 1 and f"<{keywords['valid']}>" not in source:
+            raise UnsupportedSimOpError("tail template and contract valid length disagree")
+        metadata = helper_metadata(kind, regions, **keywords)
+        if kind.startswith("flash"):
+            scratch = regions["scratch"]
+            for region in metadata["src_regions"] + metadata["dst_regions"]:
+                if self._regions_overlap(scratch, region, context.core_id):
+                    raise ProgramValidationError("FIA Flash scratch must not overlap input/output")
+        metadata.update(tir=str(source), arguments=(tag, *scalars))
+        return metadata
 
     def _emit_gemm_v0_trace_tasks(self, _operation: str, context: _Context, metadata: Mapping[str, Any]) -> None:
         details = metadata["gemm"]
@@ -1037,6 +1206,8 @@ class _TirBridge:
             return self._atomic_add_l0c_metadata(operation, arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
+        if short == "tanh":
+            return self._tanh_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
             return self._block_reduce_metadata(short, arguments, context)
         if short in {"wholereducemax", "wholereducemin", "wholereducesum"}:
@@ -2465,6 +2636,35 @@ class _TirBridge:
         if not initialize:
             metadata["accumulator"] = destination
         return metadata
+
+    def _tanh_metadata(self, arguments, context):
+        if len(arguments) != 4:
+            raise UnsupportedSimOpError("tanh requires dst, src, uint8 scratch and count")
+        count = self._runtime_int(arguments[3], context.environment)
+        if count is None or (isinstance(count, int) and count <= 0):
+            raise UnsupportedSimOpError("tanh requires a positive executable count")
+        source = self._access_buffer_region(arguments[1], (count,), context)
+        destination = self._access_buffer_region(arguments[0], (count,), context)
+        scratch_extent = self._access_ptr_extent(arguments[2], context)
+        if not isinstance(scratch_extent, int) or scratch_extent <= 0:
+            raise ProgramValidationError("tanh scratch extent must be a positive static byte count")
+        scratch = self._access_buffer_region(arguments[2], (scratch_extent,), context)
+        if any(region is None for region in (source, destination, scratch)):
+            raise UnsupportedSimOpError("tanh operands must resolve to buffers")
+        if any(region.scope is not MemoryScope.UB for region in (source, destination, scratch)):
+            raise ProgramValidationError("tanh operands must use UB scope")
+        if source.dtype not in {"float16", "float32"} or destination.dtype != source.dtype or scratch.dtype != "uint8":
+            raise ProgramValidationError("tanh requires matching float16/float32 operands and uint8 scratch")
+        minimum_bytes = 1024 if source.dtype == "float16" else 256
+        if scratch_extent < minimum_bytes:
+            raise ProgramValidationError(f"tanh scratch requires at least {minimum_bytes} bytes for {source.dtype}")
+        if any(not isinstance(region.byte_offset, int) or region.byte_offset % 32 for region in (source, destination, scratch)):
+            raise ProgramValidationError("tanh operands must be 32-byte aligned")
+        if any(self._regions_overlap(scratch, region, context.core_id) for region in (source, destination)):
+            raise ProgramValidationError("tanh scratch must not overlap source or destination")
+        if self._regions_overlap(source, destination, context.core_id):
+            raise ProgramValidationError("tanh source and destination must not overlap")
+        return {"src": source, "dst": destination, "scratch": scratch, "scratch_clobber": True}
 
     def _reduce_metadata(
         self,
@@ -4465,6 +4665,8 @@ class _TirBridge:
             raise UnsupportedSimOpError(f"{error}; platform={self.platform}; span={span}; lane={context.lane.value}") from error
         if lane is not Lane.CONTROL:
             pipe = self._sync_task_pipe(normalized, metadata, pipe)
+        if normalized == "buffer_store" and metadata.get("scalar_store"):
+            pipe = Pipe.SCALAR
         task_id = f"c{context.core_id}-{lane.value}-{self.task_counter}"
         self.task_counter += 1
         task_metadata = dict(metadata)

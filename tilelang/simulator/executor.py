@@ -12,7 +12,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from .config import SimulatorConfig
-from .errors import ProgramValidationError, UnsupportedSimOpError
+from .errors import ProgramValidationError, UnsupportedSimOpError, UninitializedMemoryError
 from .layout import pack_matrix, unpack_matrix
 from .memory import MemoryRuntime, MemoryView, contiguous_strides_bytes, dtype_size_bytes
 from .program import (
@@ -76,6 +76,7 @@ _UNARY_OPERATIONS = {
     "silu": lambda value: value * np.exp(-np.logaddexp(0, -value)),
     "sin": np.sin,
     "cos": np.cos,
+    "tanh": np.tanh,
     "round": lambda value: np.copysign(np.floor(np.abs(value) + 0.5), value),
 }
 
@@ -438,21 +439,42 @@ class FunctionalSimulator:
             return literal
         if name == "BufferLoad":
             indices = tuple(int(self._evaluate_tir_scalar(index, core_id)) for index in expression.indices)
-            spec = next((item for item in self.program.buffers if item.name == str(expression.buffer.name)), None)
+            names = {str(expression.buffer.name), str(expression.buffer.data.name)}
+            spec = next((item for item in self.program.buffers if item.name in names), None)
             if spec is None:
                 raise UnsupportedSimOpError(f"dynamic if references unknown buffer {expression.buffer.name!s}")
+            shape = tuple(int(self._evaluate_tir_scalar(extent, core_id)) for extent in expression.buffer.shape)
+            if len(indices) != len(shape) or any(not 0 <= index < extent for index, extent in zip(indices, shape)):
+                raise ProgramValidationError("scalar buffer index is outside its logical extent")
+            itemsize = dtype_size_bytes(str(expression.buffer.dtype))
+            strides = (
+                tuple(int(self._evaluate_tir_scalar(stride, core_id)) * itemsize for stride in expression.buffer.strides)
+                if expression.buffer.strides
+                else contiguous_strides_bytes(shape, itemsize)
+            )
             region = BufferRegion(
                 spec.name,
                 spec.scope,
                 tuple(1 for _ in indices),
-                spec.dtype,
-                byte_offset=sum(
-                    index * stride for index, stride in zip(indices, contiguous_strides_bytes(spec.shape, dtype_size_bytes(spec.dtype)))
-                ),
+                str(expression.buffer.dtype),
+                byte_offset=int(self._evaluate_tir_scalar(expression.buffer.elem_offset, core_id)) * itemsize
+                + sum(index * stride for index, stride in zip(indices, strides)),
             )
+            if self.config.sync_only:
+                if spec.scope is not MemoryScope.LOCAL:
+                    raise UnsupportedSimOpError("sync-only scalar expression cannot read tensor numeric values")
+                view = self._resolve(region, core_id)
+                if not view.allocation.check_initialized(view):
+                    raise UninitializedMemoryError(f"scalar expression reads poison local buffer {spec.name!r}")
+                return np.frombuffer(view.allocation.read(view), dtype=_numpy_dtype(region.dtype))[0].item()
             return self.read(region, task_core_id=core_id).reshape(-1)[0].item()
         if name == "Cast":
-            return self._evaluate_tir_scalar(expression.value, core_id)
+            return np.asarray(self._evaluate_tir_scalar(expression.value, core_id), dtype=_numpy_dtype(str(expression.dtype))).item()
+        if name == "Var":
+            key = str(expression.name)
+            if key in self.bindings:
+                return self.bindings[key]
+            raise UnsupportedSimOpError(f"unbound scalar variable {key!r}")
         binary = {
             "EQ": lambda a, b: a == b,
             "NE": lambda a, b: a != b,
@@ -463,6 +485,11 @@ class FunctionalSimulator:
             "Add": lambda a, b: a + b,
             "Sub": lambda a, b: a - b,
             "Mul": lambda a, b: a * b,
+            "Div": lambda a, b: a / b,
+            "FloorDiv": lambda a, b: a // b,
+            "FloorMod": lambda a, b: a % b,
+            "Min": min,
+            "Max": max,
             "And": lambda a, b: bool(a) and bool(b),
             "Or": lambda a, b: bool(a) or bool(b),
         }
@@ -476,8 +503,19 @@ class FunctionalSimulator:
         if task.metadata.get("trace_only") is True:
             return
         operation = task.operation.lower()
+        if operation == "buffer_store":
+            if "store_value" not in task.metadata:
+                raise UnsupportedSimOpError("buffer_store requires an executable scalar value")
+            value = self._evaluate_tir_scalar(task.metadata["store_value"], task.core_id)
+            self.write(_operand(task, "dst"), np.asarray([value]), task_core_id=task.core_id)
+            return
         if self.config.sync_only:
             self._execute_sync_only(task, operation)
+            return
+        if operation == "fia_helper":
+            from .fia_helpers import execute_helper
+
+            execute_helper(self, task)
             return
         if "copy" in operation or "datacopy" in operation or "data_copy" in operation:
             self._copy(task)
@@ -639,6 +677,7 @@ class FunctionalSimulator:
             or operation in _UNARY_OPERATIONS
             or operation in _REDUCE_OPERATIONS
             or operation in _SYNC_ONLY_EXPLICIT_OPERATIONS
+            or operation == "fia_helper"
         )
         if not supported:
             raise UnsupportedSimOpError(f"sync-only execution is not implemented for {task.operation!r} (task {task.task_id!r})")
@@ -662,6 +701,11 @@ class FunctionalSimulator:
             view = self._resolve(region, task.core_id)
             initialized = True if region is pad_destination else sources_initialized
             view.allocation.mark_initialized(view, initialized)
+        if operation == "fia_helper" or task.metadata.get("scratch_clobber"):
+            scratch = task.metadata.get("scratch")
+            if isinstance(scratch, BufferRegion):
+                view = self._resolve(scratch, task.core_id)
+                view.allocation.mark_initialized(view, False)
 
     def _copy(self, task: Task) -> None:
         source = _operand(task, "src")
@@ -794,6 +838,9 @@ class FunctionalSimulator:
         values = self.read(source, task_core_id=task.core_id)
         result = _UNARY_OPERATIONS[operation](values)
         self.write(destination, result, task_core_id=task.core_id)
+        if task.metadata.get("scratch_clobber"):
+            view = self._resolve(_operand(task, "scratch"), task.core_id)
+            view.allocation.mark_initialized(view, False)
 
     def _axpy(self, task: Task) -> None:
         source = _operand(task, "lhs")

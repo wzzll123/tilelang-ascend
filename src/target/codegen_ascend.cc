@@ -3072,6 +3072,10 @@ bool CodeGenTileLangAscend::EmitVectorHelper(const ObjectRef &semantic_op,
     BilinearInterpolationCodegen(op);
   } else if (semantic_op.same_as(tl::ascend_sigmoid())) {
     SigmoidCodegen(op, "AscendC::Sigmoid");
+  } else if (semantic_op.same_as(tl::ascend_tanh())) {
+    // Default isReuseSource=false; the selected helper restores normal/full
+    // mask.
+    SigmoidCodegen(op, "AscendC::Tanh");
   } else if (semantic_op.same_as(tl::ascend_silu())) {
     SiluCodegen(op);
   } else if (semantic_op.same_as(tl::ascend_round())) {

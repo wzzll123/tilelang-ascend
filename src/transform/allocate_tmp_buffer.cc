@@ -750,6 +750,19 @@ WorkspaceSpec GetAscendCWorkspaceSpec(const CallNode *call,
   if (call->op.same_as(tl::ascend_sigmoid())) {
     return RequireWorkspace(byte_dtype, GetAccessPtrBytes(call->args[1]));
   }
+  if (call->op.same_as(tl::ascend_tanh())) {
+    const DataType dtype = GetAccessPtrDtype(call->args[1]);
+    ICHECK(dtype == DataType::Float(16) || dtype == DataType::Float(32))
+        << "Tanh only supports float16/float32, got " << dtype;
+    // SDK GetTanhMaxMinTmpSize: one float scratch stream for fp32,
+    // four input-byte equivalents for fp16, each with a 256-byte floor.
+    // Source: asc-devkit ec0f29df,
+    // impl/adv_api/tiling/math/tanh_tiling_impl.cpp.
+    const int64_t factor = dtype == DataType::Float(16) ? 4 : 1;
+    return RequireWorkspace(
+        byte_dtype,
+        factor * std::max<int64_t>(GetAccessPtrBytes(call->args[1]), 256));
+  }
   if (call->op.same_as(tl::ascend_reducesum_experiment()) ||
       call->op.same_as(tl::ascend_reducesum_mask_experiment())) {
     return RequireWorkspace(GetAccessPtrDtype(call->args[1]),
@@ -935,6 +948,13 @@ private:
   PrimExpr HandleExistingTmp(const CallNode *op,
                              int64_t tmp_buffer_param_offset,
                              const WorkspaceSpec &spec) {
+    if (op->op.same_as(tl::ascend_tanh())) {
+      const DataType dtype = GetAccessPtrDtype(op->args[1]);
+      const int64_t minimum = dtype == DataType::Float(16) ? 1024 : 256;
+      ICHECK_GE(GetAccessPtrBytes(op->args[tmp_buffer_param_offset]), minimum)
+          << "Tanh explicit workspace is too small; need at least " << minimum
+          << " bytes";
+    }
     if (GetAccessPtrBytes(op->args[tmp_buffer_param_offset]) == 0) {
       ICHECK(false) << GetOpName(op) << " explicit tmp arena for target "
                     << target_ << " is empty, but this backend path requires "

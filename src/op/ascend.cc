@@ -111,7 +111,8 @@ AscendCopy::AscendCopy(Array<PrimExpr> args, BufferMap vmap) : args_(args) {
     int n_active_src = 0;
     for (const auto &e : this->src_extents) {
       if (auto *imm = e.as<IntImmNode>()) {
-        if (imm->value == 1) continue;
+        if (imm->value == 1)
+          continue;
       }
       n_active_src++;
     }
@@ -276,10 +277,10 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     for (const auto &ext : dst->shape) {
       bt_len *= ext;
     }
-    auto bt_src_ptr = src.access_ptr(1, src->dtype, 1,
-                                     IntImm(DataType::Int(32), 0), bt_len);
-    auto bt_dst_ptr = dst.access_ptr(2, dst->dtype, 1,
-                                     IntImm(DataType::Int(32), 0), bt_len);
+    auto bt_src_ptr =
+        src.access_ptr(1, src->dtype, 1, IntImm(DataType::Int(32), 0), bt_len);
+    auto bt_dst_ptr =
+        dst.access_ptr(2, dst->dtype, 1, IntImm(DataType::Int(32), 0), bt_len);
     return Evaluate(
         Call(DataType::Handle(), builtin::call_extern(),
              {StringImm("tl::ascend::copy_l1_to_bt<" + get_dtype(dst) + ", " +
@@ -660,10 +661,11 @@ Stmt AscendCopy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
     new_args.push_back(dst->shape[dst->shape.size() - 1]);
     // leftPad (stencil shift-window halo) rides LAST so every positional index
-    // above (and AscendTailMaskPropagation's args[4..8] reads) is unchanged when
-    // it is absent. CopyCodegen detects it by comparing args.size() against the
-    // no-leftPad expectation (derived from the template's dim count) and emits
-    // it as the trailing copy_gm_to_ub argument only when present.
+    // above (and AscendTailMaskPropagation's args[4..8] reads) is unchanged
+    // when it is absent. CopyCodegen detects it by comparing args.size()
+    // against the no-leftPad expectation (derived from the template's dim
+    // count) and emits it as the trailing copy_gm_to_ub argument only when
+    // present.
     const auto *lp_imm = leftPad.as<IntImmNode>();
     if (!(lp_imm && lp_imm->value == 0)) {
       new_args.push_back(leftPad);
@@ -872,15 +874,15 @@ Stmt AscendAtomicAdd::Lower(const LowerArgs &T,
   // SetAtomicAdd() first converts the L0C value to the destination type DstT
   // (e.g. bf16), then performs the GM atomic add as DstT -- matching AscendC mm
   // enAtomic=1.  So the L0C->GM pair is validated exactly: fp32 L0C may write
-  // back to fp32/fp16/bf16 GM (SetAtomicAdd converts to DstT then adds as DstT),
-  // and int32 L0C (int8xint8 GEMM accumulator) may write back to int32 GM
-  // (Catlass/PTO both support int32->int32 L0C atomic writeback).  Anything
+  // back to fp32/fp16/bf16 GM (SetAtomicAdd converts to DstT then adds as
+  // DstT), and int32 L0C (int8xint8 GEMM accumulator) may write back to int32
+  // GM (Catlass/PTO both support int32->int32 L0C atomic writeback).  Anything
   // else is rejected because the AscendC/PTO backends only express these
   // supported conversions.  The UB branch keeps the exact src == dst dtype
   // check.
   if (src.scope() == "wmma.accumulator") {
     bool supported = false;
-    for (const auto& pair : {
+    for (const auto &pair : {
              std::make_pair(DataType::Float(32), DataType::Float(32)),
              std::make_pair(DataType::Float(32), DataType::Float(16)),
              std::make_pair(DataType::Float(32), DataType::BFloat(16)),
@@ -1536,8 +1538,14 @@ TIR_DEFINE_TL_BUILTIN(ascend_sigmoid)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(ascend_tanh)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(ascend_silu)
-    .set_num_inputs(-1)  // 3: (dst, src, size)；4: in-place 自动 tmp (dst, src, tmp, size)
+    .set_num_inputs(
+        -1) // 3: (dst, src, size)；4: in-place 自动 tmp (dst, src, tmp, size)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 

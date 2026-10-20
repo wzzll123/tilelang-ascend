@@ -313,7 +313,8 @@ def create_simulator_adapter(
             metadata={
                 **program.metadata,
                 "vector_semantic_projection": True,
-                "timing_limitations": (
+                "timing_limitations": tuple(program.metadata.get("timing_limitations", ()))
+                + (
                     "Compiler-managed Vector mask setter timing is not modeled; "
                     "the validated semantic projection preserves functional and synchronization behavior, "
                     "not physical Vector instruction timing.",

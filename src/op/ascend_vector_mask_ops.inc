@@ -117,9 +117,8 @@ TL_ASCEND_SEMANTIC_OP(ascend_axpy, "", 4, 4, kArityOnly)
 TL_ASCEND_PHYSICAL(ascend_axpy_raw, kNaturalNormal, kFloat16Float32, kAxpy,
                    kMaskSpec, kRawAxpy, "AscendC::Axpy")
 
-TL_ASCEND_SEMANTIC_HELPER(ascend_silu_self_contained_normal_full,
-                          ascend_silu, 3, 4, kArityOnly,
-                          kSelfContainedNormalFull)
+TL_ASCEND_SEMANTIC_HELPER(ascend_silu_self_contained_normal_full, ascend_silu,
+                          3, 4, kArityOnly, kSelfContainedNormalFull)
 TL_ASCEND_NORMAL_FULL_HELPER(ascend_mul_add_dst_self_contained_normal_full,
                              ascend_mul_add_dst, 4)
 TL_ASCEND_NEUTRAL_HELPER(ascend_compare_neutral, ascend_compare, 5)
@@ -143,8 +142,7 @@ TL_ASCEND_SEMANTIC_OP(ascend_reduce, "", 4, 6, kReduce)
 TL_ASCEND_PHYSICAL(ascend_reduce_narrow_raw_normal, kReduceNarrow,
                    kFloat16Float32, kReduce, kMask, kRawReduce,
                    "tl::ascend::reduce_narrow")
-TL_ASCEND_HELPER(ascend_reduce_fp32_v2, kReduceFp32V2,
-                 kNormalFullToNormalFull)
+TL_ASCEND_HELPER(ascend_reduce_fp32_v2, kReduceFp32V2, kNormalFullToNormalFull)
 TL_ASCEND_HELPER(ascend_reduce_advanced_composite, kReduceComposite,
                  kCompositeNormalFullUnknown)
 
@@ -194,6 +192,8 @@ TL_ASCEND_FIXED_HELPER(ascend_bilinear_interpolation_self_contained,
                        kSelfContainedNormalExplicit)
 TL_ASCEND_NORMAL_FULL_HELPER(ascend_sigmoid_self_contained_normal_full,
                              ascend_sigmoid, 4)
+TL_ASCEND_NORMAL_FULL_HELPER(ascend_tanh_self_contained_normal_full,
+                             ascend_tanh, 4)
 
 TL_ASCEND_CLAMP_OP(ascend_clamp_max, 5, kRawClampMaxMin, "AscendC::Mins")
 TL_ASCEND_CLAMP_OP(ascend_clamp_min, 5, kRawClampMaxMin, "AscendC::Maxs")

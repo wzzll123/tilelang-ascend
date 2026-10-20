@@ -56,8 +56,8 @@ private:
   // GM->UB stencil shift-window left halo width (default 0 = plain load, valid
   // region at the destination base). When > 0 the W valid samples land at
   // destination column offset leftPad and the left halo dst[0:leftPad] is
-  // zero-filled via DataCopyPad's leftPadding. Opt-in (only present in args when
-  // the DSL caller passes left_pad explicitly), so an existing copy is
+  // zero-filled via DataCopyPad's leftPadding. Opt-in (only present in args
+  // when the DSL caller passes left_pad explicitly), so an existing copy is
   // byte-identical.
   PrimExpr leftPad;
 };
@@ -245,6 +245,8 @@ TVM_DLL const Op &ascend_use_swizzle();
 TVM_DLL const Op &ascend_mma();
 
 TVM_DLL const Op &ascend_sigmoid();
+
+TVM_DLL const Op &ascend_tanh();
 
 TVM_DLL const Op &ascend_silu();
 
