@@ -76,7 +76,6 @@ _UNARY_OPERATIONS = {
     "silu": lambda value: value * np.exp(-np.logaddexp(0, -value)),
     "sin": np.sin,
     "cos": np.cos,
-    "tanh": np.tanh,
     "round": lambda value: np.copysign(np.floor(np.abs(value) + 0.5), value),
 }
 
@@ -695,11 +694,6 @@ class FunctionalSimulator:
             view = self._resolve(region, task.core_id)
             initialized = True if region is pad_destination else sources_initialized
             view.allocation.mark_initialized(view, initialized)
-        if task.metadata.get("scratch_clobber"):
-            scratch = task.metadata.get("scratch")
-            if isinstance(scratch, BufferRegion):
-                view = self._resolve(scratch, task.core_id)
-                view.allocation.mark_initialized(view, False)
 
     def _copy(self, task: Task) -> None:
         source = _operand(task, "src")
@@ -832,9 +826,6 @@ class FunctionalSimulator:
         values = self.read(source, task_core_id=task.core_id)
         result = _UNARY_OPERATIONS[operation](values)
         self.write(destination, result, task_core_id=task.core_id)
-        if task.metadata.get("scratch_clobber"):
-            view = self._resolve(_operand(task, "scratch"), task.core_id)
-            view.allocation.mark_initialized(view, False)
 
     def _axpy(self, task: Task) -> None:
         source = _operand(task, "lhs")

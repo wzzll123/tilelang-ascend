@@ -97,7 +97,6 @@ _VECTOR_OPS = frozenset(
         "sort",
         "sort32",
         "sqrt",
-        "tanh",
         "sub",
         "subs",
         "tail_binary",
@@ -1093,8 +1092,6 @@ class _TirBridge:
             return self._atomic_add_l0c_metadata(operation, arguments, context)
         if short == "reduce":
             return self._reduce_metadata(arguments, context)
-        if short == "tanh":
-            return self._tanh_metadata(arguments, context)
         if short in {"block_reduce_max", "block_reduce_min", "block_reduce_sum"}:
             return self._block_reduce_metadata(short, arguments, context)
         if short in {"wholereducemax", "wholereducemin", "wholereducesum"}:
@@ -2523,35 +2520,6 @@ class _TirBridge:
         if not initialize:
             metadata["accumulator"] = destination
         return metadata
-
-    def _tanh_metadata(self, arguments, context):
-        if len(arguments) != 4:
-            raise UnsupportedSimOpError("tanh requires dst, src, uint8 scratch and count")
-        count = self._runtime_int(arguments[3], context.environment)
-        if count is None or (isinstance(count, int) and count <= 0):
-            raise UnsupportedSimOpError("tanh requires a positive executable count")
-        source = self._access_buffer_region(arguments[1], (count,), context)
-        destination = self._access_buffer_region(arguments[0], (count,), context)
-        scratch_extent = self._access_ptr_extent(arguments[2], context)
-        if not isinstance(scratch_extent, int) or scratch_extent <= 0:
-            raise ProgramValidationError("tanh scratch extent must be a positive static byte count")
-        scratch = self._access_buffer_region(arguments[2], (scratch_extent,), context)
-        if any(region is None for region in (source, destination, scratch)):
-            raise UnsupportedSimOpError("tanh operands must resolve to buffers")
-        if any(region.scope is not MemoryScope.UB for region in (source, destination, scratch)):
-            raise ProgramValidationError("tanh operands must use UB scope")
-        if source.dtype not in {"float16", "float32"} or destination.dtype != source.dtype or scratch.dtype != "uint8":
-            raise ProgramValidationError("tanh requires matching float16/float32 operands and uint8 scratch")
-        minimum_bytes = 1024 if source.dtype == "float16" else 256
-        if scratch_extent < minimum_bytes:
-            raise ProgramValidationError(f"tanh scratch requires at least {minimum_bytes} bytes for {source.dtype}")
-        if any(not isinstance(region.byte_offset, int) or region.byte_offset % 32 for region in (source, destination, scratch)):
-            raise ProgramValidationError("tanh operands must be 32-byte aligned")
-        if any(self._regions_overlap(scratch, region, context.core_id) for region in (source, destination)):
-            raise ProgramValidationError("tanh scratch must not overlap source or destination")
-        if self._regions_overlap(source, destination, context.core_id):
-            raise ProgramValidationError("tanh source and destination must not overlap")
-        return {"src": source, "dst": destination, "scratch": scratch, "scratch_clobber": True}
 
     def _reduce_metadata(
         self,

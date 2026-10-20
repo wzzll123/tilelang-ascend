@@ -446,62 +446,6 @@ void ValidateSemanticAbi(const ResolvedSemanticCall &resolved,
   LOG(FATAL) << "Unknown semantic Vector ABI recipe";
 }
 
-void ValidateTanh(const Array<PrimExpr> &args) {
-  ICHECK_EQ(args.size(), 4U) << "Malformed Tanh ABI";
-  const DataType dtype = VectorAccessPtrDtype(args[0]);
-  ICHECK(dtype == DataType::Float(16) || dtype == DataType::Float(32))
-      << "Tanh only supports float16/float32";
-  ICHECK_EQ(VectorAccessPtrDtype(args[1]), dtype)
-      << "Tanh source and destination must have the same dtype";
-  ICHECK_EQ(VectorAccessPtrDtype(args[2]), DataType::UInt(8))
-      << "Tanh lowered workspace must be uint8";
-  const auto *count = args[3].as<IntImmNode>();
-  ICHECK(count && count->value > 0 &&
-         count->value <= std::numeric_limits<uint32_t>::max())
-      << "Tanh count must be a positive static uint32 value";
-  arith::Analyzer analyzer;
-  Array<PrimExpr> starts;
-  Array<PrimExpr> lengths;
-  for (size_t i = 0; i < 3; ++i) {
-    ICHECK(IsAccessPtr(args[i])) << "Tanh expects UB access_ptr operands";
-    const auto *ptr = args[i].as<CallNode>();
-    const auto *var = ptr->args[1].as<VarNode>();
-    const auto *annotation =
-        var ? var->type_annotation.as<PointerTypeNode>() : nullptr;
-    ICHECK(annotation && annotation->storage_scope == "shared.ub")
-        << "Tanh operands and workspace must be UB buffers";
-    const int64_t bytes = VectorAccessPtrDtype(args[i]).bytes();
-    const PrimExpr start = analyzer.Simplify(
-        ptr->args[2] * make_const(ptr->args[2].dtype(), bytes));
-    ICHECK(analyzer.CanProve(floormod(start, 32) == 0))
-        << "Tanh operand byte offset must be 32-byte aligned";
-    const PrimExpr length =
-        i == 2 ? ptr->args[3] : args[3] * make_const(args[3].dtype(), bytes);
-    ICHECK(analyzer.CanProve(
-        ptr->args[3] * make_const(ptr->args[3].dtype(), bytes) >= length))
-        << "Tanh operand extent is smaller than its count";
-    starts.push_back(start);
-    lengths.push_back(length);
-  }
-  const auto *scratch = args[2].as<CallNode>();
-  const int64_t minimum = dtype == DataType::Float(16) ? 1024 : 256;
-  ICHECK(analyzer.CanProve(scratch->args[3] >=
-                           make_const(scratch->args[3].dtype(), minimum)))
-      << "Tanh explicit workspace is too small; need at least " << minimum
-      << " bytes";
-  for (size_t i = 0; i < 3; ++i) {
-    for (size_t j = i + 1; j < 3; ++j) {
-      const auto *a = args[i].as<CallNode>();
-      const auto *b = args[j].as<CallNode>();
-      if (a->args[1].same_as(b->args[1])) {
-        ICHECK(analyzer.CanProve(starts[i] + lengths[i] <= starts[j]) ||
-               analyzer.CanProve(starts[j] + lengths[j] <= starts[i]))
-            << "Tanh source, destination, and workspace must not overlap";
-      }
-    }
-  }
-}
-
 void ValidateSelectedDType(const ResolvedSemanticCall &resolved,
                            const Array<PrimExpr> &args) {
   DataType dtype = VectorDType(args);
@@ -513,9 +457,6 @@ void ValidateSelectedDType(const ResolvedSemanticCall &resolved,
       << resolved.semantic->base->name
       << "; compiler-managed mask selection has no fallback codegen.";
   ValidateTerminalBufferDTypes(resolved, args);
-  if (resolved.semantic->base.same_as(ascend_tanh())) {
-    ValidateTanh(args);
-  }
   if (resolved.semantic->base.same_as(ascend_gather())) {
     ICHECK_GE(args.size(), 3U);
     ValidateSameBufferDTypes(resolved, args, {0, 1});

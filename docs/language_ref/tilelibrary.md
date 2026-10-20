@@ -64,7 +64,7 @@ Temporary workspace arenas
 
 The public APIs using the generic arena contract expose keyword-only
 `tmp=None`. They include the three reduce APIs and `T.tile.broadcast`, `sort`,
-`merge_sort`, `topk`, `gather_mask`, `select`, `gather`, `sigmoid`, `tanh`, `sin`,
+`merge_sort`, `topk`, `gather_mask`, `select`, `gather`, `sigmoid`, `sin`,
 `cos`, `pow`, `bitwise_xor`, `clamp`, `clamp_max`, `clamp_min`, `round`, the
 deprecated `bilinear_interpolation`, `reduce_sum_experiment`, and
 `reduce_sum_mask_experiment`. PTO does not support `bilinear_interpolation`,

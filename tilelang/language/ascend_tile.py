@@ -1390,48 +1390,6 @@ def sigmoid(
     return _call_intrin_with_optional_tmp("sigmoid", [dst_ptr, src_ptr, size], 2, tmp)
 
 
-def tanh(
-    dst: Buffer | BufferRegion,
-    src: Buffer | BufferRegion,
-    *,
-    tmp: Buffer | BufferRegion | None = None,
-):
-    """Elementwise Tanh for non-overlapping, contiguous A2/A3 UB tensors.
-
-    Source and destination must have the same float16/float32 dtype and size.
-    ``tmp`` is an optional independent UB scratch arena, not input data. The
-    AscendC backend supplies the SDK's maximum temporary size when omitted;
-    explicit arenas must satisfy its minimum (1024 bytes for half, 256 for float).
-    Source reuse and the PTO backend are not supported. Same-storage operands
-    are rejected conservatively, including disjoint views of the same buffer.
-    """
-    dst_buf = dst.buffer if isinstance(dst, BufferRegion) else dst
-    src_buf = src.buffer if isinstance(src, BufferRegion) else src
-    if dst_buf.dtype not in {"float16", "float32"}:
-        raise ValueError("Tanh supports only float16 and float32 operands")
-    if dst_buf.dtype != src_buf.dtype:
-        raise ValueError("Tanh source and destination must have the same dtype")
-    if dst_buf.scope() != "shared.ub" or src_buf.scope() != "shared.ub":
-        raise ValueError("Tanh operands must be UB buffers")
-    if _same_ub_storage(dst, src):
-        raise ValueError("Tanh source and destination must not overlap")
-    if tmp is not None and (_same_ub_storage(tmp, src) or _same_ub_storage(tmp, dst)):
-        raise ValueError("Tanh temporary buffer must not overlap source or destination")
-    if isinstance(dst, BufferRegion):
-        dst_ptr, dst_extent = _handle_buffer_region(dst, "w")
-        size = math.prod(dst_extent)
-    else:
-        dst_ptr, size = dst.access_ptr("w"), math.prod(dst.shape)
-    if isinstance(src, BufferRegion):
-        src_ptr, src_extent = _handle_buffer_region(src, "r")
-        src_size = math.prod(src_extent)
-    else:
-        src_ptr, src_size = src.access_ptr("r"), math.prod(src.shape)
-    if not _const_equal(size, src_size):
-        raise ValueError("Tanh source and destination must have the same element count")
-    return _call_intrin_with_optional_tmp("tanh", [dst_ptr, src_ptr, size], 2, tmp)
-
-
 def silu(dst: Buffer | BufferRegion, src: Buffer | BufferRegion):
     """Performs element-wise SiLU (Swish) activation: dst[i] = src[i] * sigmoid(src[i]).
 
