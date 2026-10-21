@@ -1,10 +1,13 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-"""A2/A3 topology and explicitly uncalibrated timing profiles."""
+"""A2/A3 topology, measured tile costs and explicitly labeled fallbacks."""
 
+from __future__ import annotations
+
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping, Tuple
+from typing import Any
 
 from .errors import SimulatorConfigError
 
@@ -21,8 +24,8 @@ class DeviceProfile:
     cube_core_count: int
     vector_core_count: int
     vector_lanes_per_cube: int
-    cube_pipes: Tuple[str, ...] = ("mte2", "mte1", "m", "fix")
-    vector_pipes: Tuple[str, ...] = ("mte2", "v", "mte3")
+    cube_pipes: tuple[str, ...] = ("mte2", "mte1", "m", "fix")
+    vector_pipes: tuple[str, ...] = ("mte2", "v", "mte3")
     calibration: str = "uncalibrated"
 
 
@@ -31,8 +34,8 @@ class TimingProfile:
     """Parameter table for a discrete-event scheduler.
 
     Explicit operation costs override the selected estimator.  The default simulator profile
-    uses PTO's documented fallback formulas and labels their provenance; it does not claim
-    measured A2/A3 hardware latency.
+    uses measured A2 tile costs where supported and labels uncalibrated fallbacks.
+    A3 remains uncalibrated; a measured profile is not a cycle-exact hardware model.
     """
 
     platform: str
@@ -54,8 +57,12 @@ class TimingProfile:
             normalized[str(name)] = int(cycles)
         object.__setattr__(self, "operation_cycles", MappingProxyType(normalized))
         object.__setattr__(self, "platform", normalize_platform(self.platform))
-        if self.estimator not in {"fixed", "pto-fallback"}:
-            raise SimulatorConfigError("timing estimator must be one of: fixed, pto-fallback")
+        if self.estimator not in {"fixed", "pto-fallback", "pypto-fast", "measured-linear"}:
+            raise SimulatorConfigError(
+                "timing estimator must be one of: fixed, pto-fallback, pypto-fast, measured-linear")
+        if self.estimator == "measured-linear" and type(
+                self).estimate_task is TimingProfile.estimate_task:
+            raise SimulatorConfigError("measured-linear requires a measured calibration profile")
 
     def estimate_cycles(self, operation: str) -> int:
         """Return a configured cost or the visibly uncalibrated fallback cost."""
@@ -77,6 +84,25 @@ class TimingProfile:
         configured = self.operation_cycles.get(operation)
         if configured is not None:
             return configured
+        if self.estimator == "pypto-fast":
+            from .pypto_timing import estimate_task
+
+            if operation in {
+                    "set_flag",
+                    "wait_flag",
+                    "auto_set_flag",
+                    "auto_wait_flag",
+                    "set_cross_flag",
+                    "wait_cross_flag",
+                    "auto_set_cross_flag",
+                    "auto_wait_cross_flag",
+                    "pipe_barrier",
+                    "barrier_all",
+                    "sync_all",
+            }:
+                return 1
+            cycles = estimate_task(operation, pipe, metadata)
+            return self.fallback_cycles if cycles is None else max(1, cycles)
         if self.estimator != "pto-fallback":
             return self.fallback_cycles
 
@@ -87,9 +113,16 @@ class TimingProfile:
         normalized_pipe = pipe.strip().lower()
         normalized_operation = operation.strip().lower()
         if normalized_operation in {
-            "set_flag", "wait_flag", "auto_set_flag", "auto_wait_flag",
-            "set_cross_flag", "wait_cross_flag", "auto_set_cross_flag",
-            "auto_wait_cross_flag", "pipe_barrier", "barrier_all",
+                "set_flag",
+                "wait_flag",
+                "auto_set_flag",
+                "auto_wait_flag",
+                "set_cross_flag",
+                "wait_cross_flag",
+                "auto_set_cross_flag",
+                "auto_wait_cross_flag",
+                "pipe_barrier",
+                "barrier_all",
         }:
             return 1
         if normalized_pipe == "m":
@@ -120,7 +153,8 @@ def _timing_elements(metadata: Mapping[str, Any]) -> int | None:
                 return transfer_bytes // itemsize
     for key in ("dst", "src"):
         shape = getattr(metadata.get(key), "shape", None)
-        if isinstance(shape, tuple) and all(isinstance(extent, int) and extent >= 0 for extent in shape):
+        if isinstance(shape, tuple) and all(
+                isinstance(extent, int) and extent >= 0 for extent in shape):
             elements = 1
             for extent in shape:
                 elements *= extent
@@ -129,9 +163,17 @@ def _timing_elements(metadata: Mapping[str, Any]) -> int | None:
 
 
 _DTYPE_BYTES = {
-    "float16": 2, "half": 2, "bfloat16": 2, "float32": 4,
-    "float": 4, "int8": 1, "uint8": 1, "int16": 2, "uint16": 2,
-    "int32": 4, "uint32": 4,
+    "float16": 2,
+    "half": 2,
+    "bfloat16": 2,
+    "float32": 4,
+    "float": 4,
+    "int8": 1,
+    "uint8": 1,
+    "int16": 2,
+    "uint16": 2,
+    "int32": 4,
+    "uint32": 4,
 }
 
 
@@ -165,10 +207,8 @@ def _ceil_div(value: int, divisor: int) -> int:
 
 
 _DEVICE_PROFILES = {
-    "A2": DeviceProfile("A2", cube_core_count=20, vector_core_count=40,
-                        vector_lanes_per_cube=2),
-    "A3": DeviceProfile("A3", cube_core_count=20, vector_core_count=40,
-                        vector_lanes_per_cube=2),
+    "A2": DeviceProfile("A2", cube_core_count=20, vector_core_count=40, vector_lanes_per_cube=2),
+    "A3": DeviceProfile("A3", cube_core_count=20, vector_core_count=40, vector_lanes_per_cube=2),
 }
 
 
@@ -178,8 +218,7 @@ def normalize_platform(platform: str) -> str:
     if normalized not in _DEVICE_PROFILES:
         supported = ", ".join(sorted(_DEVICE_PROFILES))
         raise SimulatorConfigError(
-            f"unsupported simulator platform {platform!r}; supported platforms: {supported}"
-        )
+            f"unsupported simulator platform {platform!r}; supported platforms: {supported}")
     return normalized
 
 
@@ -189,8 +228,17 @@ def get_device_profile(platform: str) -> DeviceProfile:
 
 
 def default_timing_profile(platform: str) -> TimingProfile:
-    """Return the single default PTO-derived relative timing profile."""
-    return pto_fallback_timing_profile(platform)
+    """Prefer measured A2 families; keep unsupported/A3 costs visibly uncalibrated."""
+    platform = normalize_platform(platform)
+    if platform == "A2":
+        from .measured_a2 import default_a2_timing_profile
+
+        return default_a2_timing_profile()
+    return TimingProfile(
+        platform=platform,
+        calibration="pypto-fast-derived-uncalibrated-49587f3",
+        estimator="pypto-fast",
+    )
 
 
 def pto_fallback_timing_profile(platform: str) -> TimingProfile:

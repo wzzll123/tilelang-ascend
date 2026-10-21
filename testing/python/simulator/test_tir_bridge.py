@@ -5170,7 +5170,14 @@ def test_real_tir_vector_add_builds_dependencies_and_executes_end_to_end() -> No
     # scheduler therefore keeps its independent MTE2/Vector/MTE3 pipes free
     # to overlap; the functional interpreter separately evaluates the full
     # dataflow DAG to obtain the numeric result above.
-    assert result.schedule.stats.makespan_cycles == 6
+    # Keep this a scheduling assertion, independent of the selected cost table:
+    # the two loads serialize on MTE2, but no inferred memory edge may serialize
+    # MTE2, Vector and MTE3 with one another.
+    assert result.schedule.stats.makespan_cycles == max(
+        load_x.duration_cycles + load_y.duration_cycles,
+        add.duration_cycles,
+        store.duration_cycles,
+    )
 
 
 def test_symbolic_extent_and_affine_offsets_bind_at_runtime() -> None:

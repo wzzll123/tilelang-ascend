@@ -138,6 +138,18 @@ def validate_memory_synchronization(
                 producer_index = index_by_id[producer.task_id]
                 if producer_index >= consumer_index:
                     continue
+                # Validated UnitFlag edges are real fences,
+                # unlike inferred memory_dependencies. Pipe FIFO also orders
+                # earlier operations before each hardware predecessor.
+                hardware = consumer.metadata.get("unit_flag_dependencies", ())
+                if any(
+                    predecessor in task_by_id
+                    and task_by_id[predecessor].pipe == producer.pipe
+                    and task_by_id[predecessor].lane == producer.lane
+                    and producer_index <= index_by_id[predecessor] < consumer_index
+                    for predecessor in hardware
+                ):
+                    continue
                 if _has_full_barrier_between(
                     barrier_indices, producer_index + 1, consumer_index
                 ) or _has_local_flag_fence_between(

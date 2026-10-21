@@ -2347,60 +2347,90 @@ class _TirBridge:
         return metadata
 
     def _validate_unit_flag_pairs(self) -> None:
-        """Validate the hardware MMA-to-fixpipe unitFlag handshake per core."""
+        """Track the documented 512B L0C readable/writable bits per core.
+
+        MMA 2 waits for writable without publishing; MMA 3 publishes readable.
+        FIX 3 waits for readable and returns writable. Geometry is physical
+        blocks, not one MMA width versus one FIX width. Scheduling is still
+        tile-atomic: these edges conservatively wait for whole operations.
+        """
         for core_id, tasks in self.tasks.items():
-            releases: list[tuple[int, Task]] = []
-            consumed: set[str] = set()
+            # (allocation, block) -> (ready writer index, previous clearing FIX)
+            states = {}
+
+            def blocks(region):
+                if not isinstance(region, BufferRegion) or not _region_is_contiguous(region):
+                    raise UnsupportedSimOpError("unitFlag requires concrete contiguous L0C regions")
+                bounds = _region_bounds(region)
+                if bounds is None:
+                    raise UnsupportedSimOpError("unitFlag requires static L0C byte bounds")
+                name = self._resolve_active_alias(region, core_id)
+                address = self.buffers[name].address
+                allocation = ("address",) if address is not None else ("buffer", name)
+                base = address or 0
+                begin, end = base + bounds[0], base + bounds[1]
+                if begin % 512 or end % 512:
+                    raise UnsupportedSimOpError("unitFlag L0C regions must span complete 512B blocks")
+                return [(allocation, block) for block in range(begin // 512, end // 512)]
+
+            def annotate(index, *, role, hardware=(), peers=()):
+                task = tasks[index]
+                metadata = dict(task.metadata)
+                edges = tuple(sorted(set(metadata.get("hardware_dependencies", ())).union(hardware)))
+                pair_ids = tuple(sorted(set(metadata.get("unit_flag_pairs", ())).union(peers)))
+                metadata.update(unit_flag_role=role, hardware_dependencies=edges)
+                metadata["unit_flag_dependencies"] = tuple(sorted(
+                    set(metadata.get("unit_flag_dependencies", ())).union(hardware)
+                ))
+                if pair_ids:
+                    metadata["unit_flag_pairs"] = pair_ids
+                    metadata["unit_flag_pair"] = pair_ids[0]
+                tasks[index] = replace(
+                    task, metadata=metadata,
+                    dependencies=tuple(sorted(set(task.dependencies).union(edges))),
+                )
+
             for index, task in enumerate(tasks):
-                mma = task.metadata.get("mma")
-                copy = task.metadata.get("copy")
-                if isinstance(mma, Mapping) and mma.get("unit_flag") == 3:
-                    releases.append((index, task))
-                    continue
-                if not (isinstance(copy, Mapping) and copy.get("unit_flag") == 3 and task.operation == "copy_l0c_to_gm"):
-                    continue
-                source = task.metadata.get("src")
-                candidates = [
-                    (release_index, release)
-                    for release_index, release in releases
-                    if release.task_id not in consumed
-                    and release.task_id in task.dependencies
-                    and isinstance(source, BufferRegion)
-                    and isinstance(release.metadata.get("dst"), BufferRegion)
-                    and self._regions_overlap(source, release.metadata["dst"], core_id)
-                ]
-                if not candidates:
-                    raise ProgramValidationError(
-                        f"unitFlag=0b11 fixpipe requires a preceding paired MMA on the same L0C region (task {task.task_id})"
-                    )
-                release_index, release = candidates[-1]
-                mma_cols = release.metadata["mma"]["n_actual"]
-                fix_cols = copy["destination_shape"][1]
-                if mma_cols != fix_cols:
-                    raise ProgramValidationError(
-                        f"paired MMA/fixpipe unitFlag column counts disagree: mma n_actual={mma_cols}, fixpipe validN={fix_cols}"
-                    )
-                consumed.add(release.task_id)
-                release_metadata = dict(release.metadata)
-                release_metadata.update(
-                    {
-                        "unit_flag_role": "release",
-                        "unit_flag_pair": task.task_id,
-                    }
-                )
-                tasks[release_index] = replace(release, metadata=release_metadata)
-                task_metadata = dict(task.metadata)
-                task_metadata.update(
-                    {
-                        "unit_flag_role": "consume",
-                        "unit_flag_pair": release.task_id,
-                    }
-                )
-                tasks[index] = replace(task, metadata=task_metadata)
-            unmatched = [task.task_id for _, task in releases if task.task_id not in consumed]
+                mma, copy = task.metadata.get("mma"), task.metadata.get("copy")
+                if isinstance(mma, Mapping) and mma.get("unit_flag") in {2, 3}:
+                    touched = blocks(task.metadata.get("dst"))
+                    predecessors = set()
+                    for block in touched:
+                        writer, clear = states.get(block, (None, None))
+                        if writer is not None:
+                            raise ProgramValidationError(
+                                "unitFlag MMA overwrites readable L0C before a following paired fixpipe"
+                            )
+                        if clear is not None:
+                            predecessors.add(tasks[clear].task_id)
+                    release = mma["unit_flag"] == 3
+                    annotate(index, role="release" if release else "hold", hardware=predecessors)
+                    for block in touched:
+                        _, clear = states.get(block, (None, None))
+                        states[block] = (index if release else None, clear)
+                elif (task.operation == "copy_l0c_to_gm" and isinstance(copy, Mapping)
+                      and copy.get("unit_flag") == 3):
+                    touched = blocks(task.metadata.get("src"))
+                    writers = set()
+                    for block in touched:
+                        writer, _ = states.get(block, (None, None))
+                        if writer is None:
+                            raise ProgramValidationError(
+                                "unitFlag fixpipe requires a preceding paired MMA for every L0C block; "
+                                "column counts disagree or data was already consumed"
+                            )
+                        writers.add(writer)
+                    producers = tuple(tasks[writer].task_id for writer in sorted(writers))
+                    annotate(index, role="consume", hardware=producers, peers=producers)
+                    for writer in sorted(writers):
+                        annotate(writer, role="release", peers=(task.task_id,))
+                    for block in touched:
+                        states[block] = (None, index)
+            unmatched = {tasks[writer].task_id for writer, _ in states.values() if writer is not None}
             if unmatched:
                 raise ProgramValidationError(
-                    "unitFlag=0b11 MMA requires a following paired fixpipe; unmatched tasks: " + ", ".join(unmatched)
+                    "unitFlag MMA requires a following paired fixpipe; unmatched tasks: "
+                    + ", ".join(sorted(unmatched))
                 )
 
     def _gemm_v0_metadata(
@@ -4564,17 +4594,20 @@ class _TirBridge:
         if hardware_dependencies:
             task_metadata["hardware_dependencies"] = tuple(sorted(hardware_dependencies))
         dependencies = tuple(sorted(set(memory_dependencies).union(extra_dependencies)))
+        estimate = getattr(self.timing_profile, "estimate_task_with_source", None)
+        if estimate is not None:
+            duration, timing_source = estimate(timing_key, pipe=pipe.value, metadata=task_metadata)
+            task_metadata["timing_source"] = timing_source
+        else:
+            duration = self.timing_profile.estimate_task(
+                timing_key, pipe=pipe.value, metadata=task_metadata)
         task = Task(
             task_id,
             normalized,
             context.core_id,
             lane,
             pipe,
-            self.timing_profile.estimate_task(
-                timing_key,
-                pipe=pipe.value,
-                metadata=task_metadata,
-            ),
+            duration,
             dependencies=dependencies,
             metadata=task_metadata,
         )

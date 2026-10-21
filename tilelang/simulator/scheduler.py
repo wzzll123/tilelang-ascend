@@ -91,7 +91,10 @@ class DiscreteEventScheduler:
                 predecessor = fifo_predecessor.get(task.task_id)
                 if predecessor is not None:
                     required.add(predecessor)
-                missing = sorted(required - completed.keys())
+                # Subtracting dict_keys scans the entire completed dictionary
+                # for every task. Required edges are small: membership probes
+                # preserve the exact order/semantics without quadratic work.
+                missing = sorted(task_id for task_id in required if task_id not in completed)
                 if missing:
                     blocked_details[task.task_id] = "waiting for " + ", ".join(missing)
                     continue
